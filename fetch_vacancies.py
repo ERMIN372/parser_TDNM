@@ -2,7 +2,7 @@
 import time, argparse, requests, pandas as pd, re, urllib.parse
 from typing import List, Dict, Any, Tuple, Optional
 
-# bs4 для gorodrabot.ru (опционально)
+# ----- optional bs4 for gorodrabot -----
 try:
     from bs4 import BeautifulSoup
     _HAS_BS4 = True
@@ -10,7 +10,7 @@ except ImportError:
     BeautifulSoup = None
     _HAS_BS4 = False
 
-HEADERS = {"User-Agent": "job-analytics-script/1.1"}
+HEADERS = {"User-Agent": "job-analytics/1.2"}
 
 TEMPLATE_COLS = [
     "Должность","Работодатель","ЗП от (т.р.)","ЗП до (т.р.)",
@@ -18,17 +18,54 @@ TEMPLATE_COLS = [
     "Требуемый\nопыт","Труд-во","График","Частота \nвыплат","Льготы","Обязаности","Ссылка"
 ]
 
-# ---------- РОЛЕВОЙ ФИЛЬТР ПО НАЗВАНИЮ ----------
+# ================= РОЛЕВЫЕ ФИЛЬТРЫ ПО ЗАГОЛОВКУ =================
 FILTERS = {
-    "оператор доставки": {
-        "inc": [r"\bоператор\W{0,3}достав", r"\bоператор заказов\b",
-                r"\bдиспетчер[- ]?достав", r"\bкоординатор достав",
-                r"\bоператор пункта выдачи\b", r"\bсборщик заказов\b"],
-        "exc": [r"\bаттракци", r"\bкассир\b", r"\bстанк", r"\bоператор пункта выдачи\b",
-                r"\bоператор пвз\b", r"\bсборщик заказов\b",
-                r"\bcall[- ]?центр\b", r"\bофициант\b", r"\bбармен\b"]
-    }
+    "оператор_доставки": {
+        "inc": [
+            r"\bоператор\W{0,3}достав",           # оператор доставки, оператор по доставке
+            r"\bоператор заказов\b",
+            r"\bдиспетчер[- ]?достав",
+            r"\bкоординатор достав",
+            r"\bоператор (?:пвз|пункта выдачи)\b",
+            r"\bпункт выдачи\b",
+            r"\bсборщик заказов\b"
+        ],
+        "exc": [
+            r"\bаттракци", r"\bкассир\b", r"\bстанк", r"\bпродаж",
+            r"\bcall[- ]?центр\b", r"\bофициант\b", r"\bбармен\b"
+        ]
+    },
+    "повар_холодного_цеха": {
+        "inc": [
+            r"\bповар\b.*\bхолодн\w*\b",
+            r"\bповар холодного цеха\b",
+            r"\bхолодный цех\b"
+        ],
+        "exc": [
+            r"\bаттракци", r"\bкассир\b", r"\bстанк",
+            r"\bcall[- ]?центр\b", r"\bофициант\b", r"\bбармен\b"
+        ]
+    },
+     "кассир": {
+            "inc": [
+                r"\bкассир\b",
+                r"\bстарший\s+кассир\b",
+                r"\bпродавец[- ]кассир\b",
+                r"\bкассир[- ]консультант\b",
+                r"\bкассир[- ]смены\b",
+            ],
+            "exc": [
+                r"\bбариста\b",                 # срежет «бариста-кассир»
+                r"\bадминистратор\b",
+                r"\bбухгалтер\w*\b",
+                r"\bоператор\b",                # операторы не нужны
+                r"\bcall[- ]?центр\b",
+                r"\bофициант\b", r"\bбармен\b", r"\bповар\b",
+                r"\bаттракци", r"\bпродавец\b"
+            ],
+        },
 }
+
 def _compile_filters(role: str):
     cfg = FILTERS.get(role, {})
     inc = cfg.get("inc", [r".*"])
@@ -36,44 +73,32 @@ def _compile_filters(role: str):
     INC = re.compile("|".join(inc), re.I)
     EXC = re.compile("|".join(exc), re.I) if exc else None
     return INC, EXC
+
 def keep_by_title(title: str, INC, EXC) -> bool:
     t = title or ""
     if EXC and EXC.search(t): return False
     return bool(INC.search(t))
 
-# ---------- УТИЛИТЫ ПАРСИНГА ТЕКСТА ----------
+# ================= УТИЛИТЫ ПАРСИНГА ТЕКСТА =================
 def _strip_html(s: Optional[str]) -> str:
     if not s: return ""
     s = re.sub(r"<[^>]+>", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
-def _num(s: str) -> Optional[float]:
-    if not s: return None
-    d = re.sub(r"[^\d]", "", s)
-    return float(d) if d else None
-
-HOUR_PATS = [
-    r"(\d[\d\s]{2,})\s*(?:₽|руб)\s*(?:/|за)?\s*час",
-    r"часовая\s*ставка\s*(\d[\d\s]{2,})",
-]
-SHIFT12_PATS = [
-    r"(\d[\d\s]{3,})\s*(?:₽|руб).{0,25}(?:смен[аы]|12\s*час)",
-    r"за\s*смену\s*12\s*час\w*\s*(\d[\d\s]{3,})\s*(?:₽|руб)",
-]
-def parse_hour_shift(text: str) -> Tuple[Optional[float], Optional[float]]:
+def extract_comp(text: str) -> Tuple[Optional[float], Optional[float]]:
+    """Возвращает (hour, shift12). Если есть часовая — всегда считаем смену 12ч."""
     t = (text or "").lower()
-    hour = None; shift = None
-    for p in HOUR_PATS:
-        m = re.search(p, t, flags=re.I)
-        if m:
-            v = _num(m.group(1))
-            if v: hour = v; break
-    for p in SHIFT12_PATS:
-        m = re.search(p, t, flags=re.I)
-        if m:
-            v = _num(m.group(1))
-            if v: shift = v; break
-    if hour and not shift: shift = hour * 12
+    def num(m): return float(re.sub(r"[^\d]","", m.group(1))) if m else None
+    m_hour  = re.search(r"(\d[\d\s]{2,})\s*(?:₽|руб)\s*(?:/|за)?\s*час", t, re.I)
+    m_shift = re.search(r"(\d[\d\s]{3,})\s*(?:₽|руб).{0,25}(?:смен[аы]|12\s*час)", t, re.I)
+    hour  = num(m_hour)
+    shift = num(m_shift)
+    # защита от ложных срабатываний «час» рядом с «месяц»
+    if hour:
+        span = m_hour.span()
+        win = t[max(0,span[0]-20):min(len(t), span[1]+20)]
+        if re.search(r"(мес|месяц|год)", win): hour = None
+    if hour and not shift: shift = hour * 12.0
     if shift and not hour: hour = shift / 12.0
     return hour, shift
 
@@ -97,43 +122,34 @@ def extract_schedule(text: str) -> Optional[str]:
 def extract_pay_frequency(text: str) -> Optional[str]:
     if not text: return None
     t = text.lower()
-    if any(k in t for k in ["еженедел", "каждую неделю", "раз в неделю", "weekly"]):
-        return "Еженедельно"
-    if any(k in t for k in ["2 раза в месяц", "два раза в месяц", "аванс", "аванс+зарплата"]):
-        return "2 раза в месяц"
-    if any(k in t for k in ["ежемесяч", "раз в месяц", "monthly"]):
-        return "Ежемесячно"
+    if re.search(r"еженедел|каждую неделю|раз в неделю|weekly", t): return "Еженедельно"
+    if re.search(r"2 раза в месяц|два раза в месяц|аванс", t):     return "2 раза в месяц"
+    if re.search(r"ежемесяч|раз в месяц|monthly", t):               return "Ежемесячно"
     return None
 
 def extract_employment_type(text: str, employment_name: Optional[str] = None) -> Optional[str]:
     t = (text or "").lower()
     e = (employment_name or "").lower()
-    if any(k in t for k in ["гпх", "гражданско-правов", "самозанят", "подряд", "аутстаф"]):
-        return "ГПХ"
-    if any(k in t for k in ["по тк", "трудов", "официальн", "оформление по тк", "белая зп"]):
-        return "ТК"
-    if any(k in e for k in ["полная", "частичная", "полный", "частичный"]):
-        return "ТК"
+    if re.search(r"гпх|гражданско-правов|самозанят|подряд|аутстаф", t): return "ГПХ"
+    if re.search(r"по тк|трудов|официальн|оформление по тк|белая зп", t): return "ТК"
+    if re.search(r"полная|частичная|полный|частичный", e): return "ТК"
     return None
 
 SECTION_HEADS = ["обязанности","что делать","чем предстоит заниматься","задачи"]
 NEXT_HEADS = ["требования","условия","мы предлагаем","о компании","график","контакты","оформление","что мы предлагаем"]
 def extract_responsibilities(html_or_text: str, fallback: Optional[str] = None) -> Optional[str]:
-    text = _strip_html(html_or_text)
-    low = text.lower()
+    text = _strip_html(html_or_text); low = text.lower()
     start = None
     for h in SECTION_HEADS:
         for sep in (":"," :","\n"):
             i = low.find(h + sep)
             if i != -1:
-                start = i + len(h) + len(sep)
-                break
+                start = i + len(h) + len(sep); break
         if start is not None: break
     if start is None:
         lines = [l.strip(" -•—\t") for l in text.splitlines() if l.strip().startswith(("—","-","•"))]
         return ("; ".join([l for l in lines if l])[:3000] or fallback or (text[:3000] if text else None))
-    tail = text[start:]
-    end = len(tail); low_tail = tail.lower()
+    tail = text[start:]; end = len(tail); low_tail = tail.lower()
     for nh in NEXT_HEADS:
         for sep in (":","\n"):
             j = low_tail.find(nh + sep)
@@ -154,12 +170,13 @@ def pick_benefits(text: str) -> Optional[str]:
             seen.add(kw); out.append(kw.upper() if kw=="дмс" else kw)
     return ", ".join(out) if out else None
 
-# ---------- HH.RU ----------
-def hh_search(query: str, area: int, pages: int, per_page: int, pause: float) -> List[Dict[str, Any]]:
+# =================== HH.RU ===================
+def hh_search(query: str, area: int, pages: int, per_page: int, pause: float, search_in: str) -> List[Dict[str, Any]]:
     items=[]
     for page in range(pages):
-        p={"text":query,"area":area,"page":page,"per_page":per_page,
-           "only_with_salary":"false","search_field":"name"}  # искать только в названии
+        p={"text":query,"area":area,"page":page,"per_page":per_page,"only_with_salary":"false"}
+        if search_in in ("name","description","company_name","everything"):
+            p["search_field"]=search_in
         r=requests.get("https://api.hh.ru/vacancies", params=p, headers=HEADERS, timeout=20)
         if r.status_code!=200: break
         data=r.json(); items+=data.get("items",[])
@@ -194,7 +211,7 @@ def map_hh(items: List[Dict[str, Any]], pause_detail: float=0.2) -> List[Dict[st
         descr_html = det.get("description") or ""
         descr_txt = _strip_html(descr_html) or short
 
-        hour, shift = parse_hour_shift(descr_txt)
+        hour, shift = extract_comp(descr_txt)
         graph = extract_schedule(descr_txt) or sched_src
         pay   = extract_pay_frequency(descr_txt)
         employ = extract_employment_type(descr_txt, employment_name=empl_src)
@@ -220,15 +237,14 @@ def map_hh(items: List[Dict[str, Any]], pause_detail: float=0.2) -> List[Dict[st
         time.sleep(pause_detail)
     return rows
 
-# ---------- gorodrabot.ru ----------
+# =================== gorodrabot.ru ===================
 def _text(node) -> str:
     return re.sub(r"\s+"," ", node.get_text(strip=True)) if node else ""
 
 def gorodrabot_search(query: str, city: str, pages: int, pause: float) -> List[Dict[str, Any]]:
     if not _HAS_BS4: return []
     items=[]
-    q = urllib.parse.quote(query)
-    c = urllib.parse.quote(city)
+    q = urllib.parse.quote(query); c = urllib.parse.quote(city)
     for p in range(1, pages+1):
         url = f"https://gorodrabot.ru/{q}?l={c}&p={p}"
         try:
@@ -246,8 +262,9 @@ def gorodrabot_search(query: str, city: str, pages: int, pause: float) -> List[D
                 sal_raw = _text(cont.select_one(".salary, .vacancy-salary, [class*='salary']"))
                 desc = _text(cont.select_one(".description, .vacancy-description, [class*='desc']"))
 
-                items.append({"title": title, "employer": emp or None, "salary_raw": sal_raw or None,
-                              "desc": desc or None, "url": link})
+                items.append({"title": title, "employer": emp or None,
+                              "salary_raw": sal_raw or None, "desc": desc or None,
+                              "url": link})
         except Exception:
             break
         time.sleep(pause)
@@ -255,6 +272,7 @@ def gorodrabot_search(query: str, city: str, pages: int, pause: float) -> List[D
 
 def _rub_to_tr(s: Optional[str]) -> Tuple[Optional[float],Optional[float]]:
     if not s: return None, None
+    # только суммы рядом с ₽/руб и >= 1000
     sums = re.findall(r"(\d[\d\s]{3,})\s*(?:₽|руб)", s.lower())
     vals=[]
     for part in sums:
@@ -264,15 +282,12 @@ def _rub_to_tr(s: Optional[str]) -> Tuple[Optional[float],Optional[float]]:
     if not vals: return None, None
     return round(min(vals)/1000.0,1), round(max(vals)/1000.0,1)
 
-def _hour_from_text(s: Optional[str]) -> Tuple[Optional[float],Optional[float]]:
-    return parse_hour_shift(s or "")
-
 def map_gorodrabot(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     mapped=[]
     for r in rows:
         combo = ((r.get("salary_raw") or "") + " " + (r.get("desc") or ""))
         sal_from, sal_to = _rub_to_tr(r.get("salary_raw"))
-        hour, shift = _hour_from_text(combo)
+        hour, shift = extract_comp(combo)
         graph = extract_schedule(combo)
         pay   = extract_pay_frequency(combo)
         duties = extract_responsibilities(r.get("desc") or "", fallback=None)
@@ -295,7 +310,7 @@ def map_gorodrabot(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         })
     return mapped
 
-# ---------- СВОД И ВЫВОД ----------
+# =================== СВОД И ВЫВОД ===================
 def to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     for c in TEMPLATE_COLS:
@@ -309,25 +324,29 @@ def to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 def main():
     ap = argparse.ArgumentParser(description="Парсер вакансий: hh.ru + gorodrabot.ru")
     ap.add_argument("--query", required=True)
-    ap.add_argument("--area", type=int, default=1)      # hh.ru регион
-    ap.add_argument("--city", default="Москва")         # gorodrabot город
-    ap.add_argument("--role", default="повар", help="роль фильтра: 'повар' | 'оператор_доставки' и т.п.")
+    ap.add_argument("--area", type=int, default=1)                   # hh регион (1=Москва)
+    ap.add_argument("--city", default="Москва")                      # gorodrabot город
+    ap.add_argument("--role", default="повар", help="ключ из FILTERS")
     ap.add_argument("--pages", type=int, default=3)
-    ap.add_argument("--per_page", type=int, default=50) # hh.ru
+    ap.add_argument("--per_page", type=int, default=50)
     ap.add_argument("--pause", type=float, default=0.6)
+    ap.add_argument("--search_in", default="name", help="name|description|company_name|everything")
     ap.add_argument("--out_csv", required=True)
     a = ap.parse_args()
 
     INC_RE, EXC_RE = _compile_filters(a.role)
 
-    # hh.ru
-    hh_items = hh_search(a.query, a.area, a.pages, a.per_page, a.pause)
-    rows = map_hh(hh_items)
+    # HH
+    hh_items = hh_search(a.query, a.area, a.pages, a.per_page, a.pause, a.search_in)
+    rows_hh = map_hh(hh_items)
 
-    # gorodrabot.ru
+    # GorodRabot
+    rows_gr = []
     if _HAS_BS4:
         gr_items = gorodrabot_search(a.query, a.city, a.pages, a.pause)
-        rows += map_gorodrabot(gr_items)
+        rows_gr = map_gorodrabot(gr_items)
+
+    rows = rows_hh + rows_gr
 
     # фильтр по заголовку
     rows = [r for r in rows if keep_by_title(str(r.get("Должность","")), INC_RE, EXC_RE)]
