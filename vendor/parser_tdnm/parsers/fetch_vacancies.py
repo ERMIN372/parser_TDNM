@@ -1,8 +1,8 @@
 # parsers/fetch_vacancies.py
-import time, argparse, requests, pandas as pd, re, urllib.parse
+import time, argparse, requests, pandas as pd, re, urllib.parse, html
 from typing import List, Dict, Any, Tuple, Optional
 
-# ----- optional bs4 for gorodrabot -----
+# ---- optional bs4 for HTML (hh + gorodrabot) ----
 try:
     from bs4 import BeautifulSoup
     _HAS_BS4 = True
@@ -10,7 +10,10 @@ except ImportError:
     BeautifulSoup = None
     _HAS_BS4 = False
 
-HEADERS = {"User-Agent": "job-analytics/1.2"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept-Language": "ru-RU,ru;q=0.9"
+}
 
 TEMPLATE_COLS = [
     "Должность","Работодатель","ЗП от (т.р.)","ЗП до (т.р.)",
@@ -18,52 +21,81 @@ TEMPLATE_COLS = [
     "Требуемый\nопыт","Труд-во","График","Частота \nвыплат","Льготы","Обязаности","Ссылка"
 ]
 
-# ================= РОЛЕВЫЕ ФИЛЬТРЫ ПО ЗАГОЛОВКУ =================
+# ================= РОЛЕВЫЕ ФИЛЬТРЫ ПО НАЗВАНИЮ =================
 FILTERS = {
+    "повар": {
+        "inc": [r"\bповар\b", r"\bшеф-?повар\b", r"\bсу-?шеф\b",
+                r"\bпиццамейкер\b", r"\bсушист\b", r"\bкондитер\b", r"\bпекар\b"],
+        "exc": [r"\bаттракци", r"\bкол-?центр\b", r"\bcall[- ]?центр\b",
+                r"\bпродаж", r"\bкассир\b", r"\bстанк", r"\bазс\b", r"\bзаправк"]
+    },
+    "повар_холодного_цеха": {
+        "inc": [r"\bповар\b.*\bхолодн\w*\b", r"\bповар холодного цеха\b", r"\bхолодный цех\b"],
+        "exc": [r"\bаттракци", r"\bкассир\b", r"\bстанк", r"\bcall[- ]?центр\b", r"\bофициант\b", r"\bбармен\b"]
+    },
+    "повар_горячего_цеха": {
+        "inc": [r"\bповар\b.*\bгоряч\w*\b", r"\bповар горячего цеха\b", r"\bгорячий цех\b"],
+        "exc": [r"\bаттракци", r"\bкассир\b", r"\bстанк", r"\bcall[- ]?центр\b", r"\bофициант\b", r"\bбармен\b"]
+    },
     "оператор_доставки": {
         "inc": [
-            r"\bоператор\W{0,3}достав",           # оператор доставки, оператор по доставке
-            r"\bоператор заказов\b",
-            r"\bдиспетчер[- ]?достав",
-            r"\bкоординатор достав",
-            r"\bоператор (?:пвз|пункта выдачи)\b",
-            r"\bпункт выдачи\b",
+            r"\bоператор\W{0,3}достав", r"\bоператор заказов\b",
+            r"\bдиспетчер[- ]?достав", r"\bкоординатор достав",
+            r"\bоператор (?:пвз|пункта выдачи)\b", r"\bпункт выдачи\b",
             r"\bсборщик заказов\b"
         ],
         "exc": [
-            r"\bаттракци", r"\bкассир\b", r"\bстанк", r"\bпродаж",
+            r"\bаттракци", r"\bкассир\b", r"\bпродаж", r"\bстанк",
             r"\bcall[- ]?центр\b", r"\bофициант\b", r"\bбармен\b"
         ]
     },
-    "повар_холодного_цеха": {
+    "кассир": {
         "inc": [
-            r"\bповар\b.*\bхолодн\w*\b",
-            r"\bповар холодного цеха\b",
-            r"\bхолодный цех\b"
+            r"\bкассир\b", r"\bстарший\s+кассир\b",
+            r"\bкассир[- ]операционист\b", r"\bпродавец[- ]кассир\b",
+            r"\bкассир[- ]консультант\b", r"\bкассир[- ]смены\b",
         ],
         "exc": [
-            r"\bаттракци", r"\bкассир\b", r"\bстанк",
-            r"\bcall[- ]?центр\b", r"\bофициант\b", r"\bбармен\b"
-        ]
+            r"\bбариста\b", r"\bадминистратор\b", r"\bбухгалтер\w*\b",
+            r"\bоператор\b", r"\bcall[- ]?центр\b",
+            r"\bофициант\b", r"\bбармен\b", r"\bповар\b",
+            r"^(?=.*продавец[- ]?консультант)(?!.*кассир).*$",
+        ],
     },
-     "кассир": {
-            "inc": [
-                r"\bкассир\b",
-                r"\bстарший\s+кассир\b",
-                r"\bпродавец[- ]кассир\b",
-                r"\bкассир[- ]консультант\b",
-                r"\bкассир[- ]смены\b",
-            ],
-            "exc": [
-                r"\bбариста\b",                 # срежет «бариста-кассир»
-                r"\bадминистратор\b",
-                r"\bбухгалтер\w*\b",
-                r"\bоператор\b",                # операторы не нужны
-                r"\bcall[- ]?центр\b",
-                r"\bофициант\b", r"\bбармен\b", r"\bповар\b",
-                r"\bаттракци", r"\bпродавец\b"
-            ],
-        },
+    "менеджер_разработки_продукта": {
+        "inc": [
+            r"\bменеджер\b.*\bразработк\w*\b.*\bпродукт",
+            r"\bменеджер\b.*\bразработк\w*\b.*\bменю\b",
+            r"\bменеджер\b.*\bблюд\w*\b",
+            r"\bменеджер\s*r\W?&\W?d\b",
+            r"\bproduct\s*development\b",
+        ],
+        "exc": [
+            r"\bпродакт\b", r"\bproduct\s*manager\b",
+            r"\bIT\b|\bайти\b|\bdigital\b|\bsoftware\b|\bприложен|\bПО\b",
+        ],
+    },
+    "бариста": {
+        "inc": [
+            r"\bбариста\b",
+            r"\bстарший\s+бариста\b",
+            r"\bbarista\b",
+            r"\bкофе[йи]\w*\s*мастер\b",   # кофемастер, кофейный мастер
+        ],
+        "exc": [
+            r"\bофициант\b",
+            r"\bповар\b",
+            r"\bбармен\b",
+            r"\bкассир\b",
+            r"\bадминистратор\b",
+            r"\bоператор\b",
+            r"\bcall[- ]?центр\b",
+            r"\bпромоутер\b",
+            r"\bкурьер\b",
+            r"\bпродаж",                   # менеджер по продажам и пр.
+            r"\bаттракци",                 # мусор из парков
+        ],
+    }
 }
 
 def _compile_filters(role: str):
@@ -86,14 +118,13 @@ def _strip_html(s: Optional[str]) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 def extract_comp(text: str) -> Tuple[Optional[float], Optional[float]]:
-    """Возвращает (hour, shift12). Если есть часовая — всегда считаем смену 12ч."""
+    """Вернёт (hour, shift12). Если есть почасовая — смена 12ч считается всегда."""
     t = (text or "").lower()
     def num(m): return float(re.sub(r"[^\d]","", m.group(1))) if m else None
     m_hour  = re.search(r"(\d[\d\s]{2,})\s*(?:₽|руб)\s*(?:/|за)?\s*час", t, re.I)
     m_shift = re.search(r"(\d[\d\s]{3,})\s*(?:₽|руб).{0,25}(?:смен[аы]|12\s*час)", t, re.I)
     hour  = num(m_hour)
     shift = num(m_shift)
-    # защита от ложных срабатываний «час» рядом с «месяц»
     if hour:
         span = m_hour.span()
         win = t[max(0,span[0]-20):min(len(t), span[1]+20)]
@@ -102,22 +133,75 @@ def extract_comp(text: str) -> Tuple[Optional[float], Optional[float]]:
     if shift and not hour: hour = shift / 12.0
     return hour, shift
 
-SCHEDULE_REGEX = re.compile(
-    r"\b([1-7])\s*[/\-–]\s*([1-7])\b|сутки\s*через\s*\d+|день\s*через\s*\d+|вахт\w+",
-    re.I
-)
-def extract_schedule(text: str) -> Optional[str]:
-    if not text: return None
+# строго: только числовые графики
+NUM_WORD = {"сутки":1,"день":1,"один":1,"одна":1,"два":2,"две":2,"три":3,"четыре":4,"пять":5,"шесть":6,"семь":7}
+SCHED_NUM_RE = re.compile(r"\b([1-9]\d?)\s*[/\-–xх×]\s*([1-9]\d?)\b", re.I)
+def _words_pair(t: str) -> Optional[str]:
+    m = re.search(rf"\b({'|'.join(NUM_WORD)})\s+через\s+({'|'.join(NUM_WORD)})\b", t, re.I)
+    if not m: return None
+    a = NUM_WORD.get(m.group(1).lower()); b = NUM_WORD.get(m.group(2).lower())
+    if a and b: return f"{a}/{b}"
+    return None
+
+def extract_schedule_strict(text: str, sched_src: Optional[str]=None) -> Optional[str]:
+    t = (text or "") + " " + (sched_src or "")
+    t = t.lower().replace("–","-").replace("х","x")
     vals = []
-    for m in SCHEDULE_REGEX.finditer(text):
-        v = m.group(0).lower().replace("–","-").strip()
-        mm = re.match(r"^\s*([1-7])\s*[-–/]\s*([1-7])\s*$", v)
-        vals.append(f"{mm.group(1)}/{mm.group(2)}" if mm else v)
+    for m in SCHED_NUM_RE.finditer(t):
+        vals.append(f"{int(m.group(1))}/{int(m.group(2))}")
+    wp = _words_pair(t)
+    if wp: vals.append(wp)
+    # вахта 15/15
+    for m in re.finditer(r"\bвахт\w*\s*([1-9]\d?)\s*[/\-–xх×]\s*([1-9]\d?)\b", t, re.I):
+        vals.append(f"{int(m.group(1))}/{int(m.group(2))}")
     out, seen = [], set()
     for v in vals:
         if v not in seen:
             seen.add(v); out.append(v)
     return ", ".join(out) if out else None
+
+# добор графика и часов из HTML hh
+def _extract_schedule_from_html(url: str, timeout: float = 15.0) -> Tuple[Optional[str], Optional[float]]:
+    if not (_HAS_BS4 and isinstance(url,str) and url.startswith("http")):
+        return None, None
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        if r.status_code != 200:
+            return None, None
+        soup = BeautifulSoup(r.text, "lxml")
+
+        txts = []
+        for sel in [
+            "[data-qa='vacancy-view-employment-mode']",
+            "[data-qa='vacancy-view-raw__schedule']",
+            "[data-qa='vacancy-view-raw__workingschedule']",
+            "[data-qa='vacancy-view-employment-type']",
+            "[data-qa='vacancy-view-raw__main-info']",
+            "[data-qa='vacancy-view-employment-mode-item']",
+        ]:
+            for el in soup.select(sel):
+                txts.append(el.get_text(" ", strip=True))
+
+        for label in soup.find_all(string=re.compile(r"(График|График работы|Рабочие часы|Смена)", re.I)):
+            parent = getattr(label, "parent", None)
+            s = " ".join(parent.stripped_strings) if parent else str(label)
+            txts.append(s)
+
+        blob = " | ".join(txts).lower()
+        blob = html.unescape(blob).replace("–","-").replace("х","x")
+
+        graph = None
+        m = SCHED_NUM_RE.search(blob)
+        if m: graph = f"{int(m.group(1))}/{int(m.group(2))}"
+        if not graph:
+            graph = _words_pair(blob)
+
+        mh = re.search(r"(?:длительность|рабочие\s*часы|смена)\D{0,12}(\d{1,2})\s*час", blob)
+        hours = float(mh.group(1)) if mh else None
+
+        return graph, hours
+    except Exception:
+        return None, None
 
 def extract_pay_frequency(text: str) -> Optional[str]:
     if not text: return None
@@ -128,8 +212,7 @@ def extract_pay_frequency(text: str) -> Optional[str]:
     return None
 
 def extract_employment_type(text: str, employment_name: Optional[str] = None) -> Optional[str]:
-    t = (text or "").lower()
-    e = (employment_name or "").lower()
+    t = (text or "").lower(); e = (employment_name or "").lower()
     if re.search(r"гпх|гражданско-правов|самозанят|подряд|аутстаф", t): return "ГПХ"
     if re.search(r"по тк|трудов|официальн|оформление по тк|белая зп", t): return "ТК"
     if re.search(r"полная|частичная|полный|частичный", e): return "ТК"
@@ -158,6 +241,36 @@ def extract_responsibilities(html_or_text: str, fallback: Optional[str] = None) 
     lines = [re.sub(r"^[\s\-•—]+", "", l).strip() for l in body.splitlines()]
     lines = [l for l in lines if l]
     return ("; ".join(lines)[:3000]) if lines else fallback
+
+def extract_shift_len(text: str) -> Optional[tuple]:
+    """
+    Возвращает одну из форм:
+      - ("text", "'8-12")  # строка для Excel, чтобы не превратилось в дату
+      - ("num", 12.0)      # если в тексте явно одна длина смены (12 часов)
+      - None               # если ничего не нашли
+    """
+    t = (text or "").lower().replace("–", "-")
+    # 8-12, 10-11 и т.п. (с/без слова "час")
+    m = re.search(r"\b(\d{1,2})\s*-\s*(\d{1,2})(?:\s*час\w*)?\b", t)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if 1 <= a <= 24 and 1 <= b <= 24:
+            return ("text", f"'{a}-{b}")
+    # "с 8 до 12 часов"
+    m = re.search(r"\bс\s*(\d{1,2})\s*до\s*(\d{1,2})\s*час", t)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if 1 <= a <= 24 and 1 <= b <= 24:
+            return ("text", f"'{a}-{b}")
+    # "12-часовая смена", "смена 12 часов"
+    m = re.search(r"\b(\d{1,2})\s*[- ]?\s*час(?:овая)?\b|\bсмена\s*(\d{1,2})\s*час", t)
+    if m:
+        v = m.group(1) or m.group(2)
+        h = float(v)
+        if 1 <= h <= 24:
+            return ("num", h)
+    return None
+
 
 BENEFITS = ["дмс","медицинская страховка","страхование","питание","бесплатное питание","корпоративное питание",
             "форма","униформа","спецодежда","премии","бонус","бонусы","подарки","скидки","обучение",
@@ -188,20 +301,22 @@ def hh_details(vac_id: str) -> dict:
     r=requests.get(f"https://api.hh.ru/vacancies/{vac_id}", headers=HEADERS, timeout=20)
     return r.json() if r.status_code==200 else {}
 
-def map_hh(items: List[Dict[str, Any]], pause_detail: float=0.2) -> List[Dict[str, Any]]:
-    rows=[]
+def map_hh(items: List[Dict[str, Any]], pause_detail: float = 0.2) -> List[Dict[str, Any]]:
+    rows = []
     for v in items:
         vid = v.get("id")
         name = v.get("name")
         employer = (v.get("employer") or {}).get("name")
         url = v.get("alternate_url") or v.get("url")
+
         salary = v.get("salary") or {}
         cur = salary.get("currency") or "RUR"
-        to_tr = lambda x: round(x/1000.0,1) if (x is not None and x > 0 and cur=="RUR") else None
+        to_tr = lambda x: round(x / 1000.0, 1) if (x is not None and x > 0 and cur == "RUR") else None
 
         exp = (v.get("experience") or {}).get("name")
         empl_src = (v.get("employment") or {}).get("name")
-        sched_src = (v.get("schedule") or {}).get("name")
+        sched_src = (v.get("schedule") or {}).get("name")  # используем как текст-источник, не доверяем «гибкий»
+
         snip = v.get("snippet") or {}
         resp_snip = snip.get("responsibility") or ""
         reqs_snip = snip.get("requirement") or ""
@@ -212,7 +327,31 @@ def map_hh(items: List[Dict[str, Any]], pause_detail: float=0.2) -> List[Dict[st
         descr_txt = _strip_html(descr_html) or short
 
         hour, shift = extract_comp(descr_txt)
-        graph = extract_schedule(descr_txt) or sched_src
+        graph = extract_schedule_strict(descr_txt, sched_src=None)  # собирает ВСЕ варианты, напр. "5/2, 4/3"
+
+        # длительность смены из текста
+        sl = extract_shift_len(descr_txt)
+        if sl:
+            if sl[0] == "text":
+                shift_len = sl[1]  # "'8-12"
+            else:
+                shift_len = sl[1]  # 12.0
+        else:
+            shift_len = 12.0 if (hour or shift) else None
+
+        # HTML-добор (только если не нашли)
+        if (not graph or shift_len is None) and isinstance(url, str) and url.startswith("http"):
+            g_html, hours_html = _extract_schedule_from_html(url)
+            if not graph and g_html:
+                graph = g_html  # вернёт "5/2, 4/3" если оба найдены
+            if shift_len is None and hours_html:
+                shift_len = float(hours_html)
+
+
+
+        # итоговые значения
+        shift12_out = shift if shift is not None else (hour * 12.0 if hour else None)
+
         pay   = extract_pay_frequency(descr_txt)
         employ = extract_employment_type(descr_txt, employment_name=empl_src)
         duties = extract_responsibilities(descr_html or descr_txt, fallback=resp_snip or reqs_snip)
@@ -223,9 +362,9 @@ def map_hh(items: List[Dict[str, Any]], pause_detail: float=0.2) -> List[Dict[st
             "Работодатель": employer,
             "ЗП от (т.р.)": to_tr(salary.get("from")),
             "ЗП до (т.р.)": to_tr(salary.get("to")),
-            "Средний совокупный доход при графике 2/2 по 12 часов": shift,
+            "Средний совокупный доход при графике 2/2 по 12 часов": shift12_out,
             "В час": hour,
-            "Длительность \nсмены": 12 if (hour or shift) else None,
+            "Длительность \nсмены": shift_len,
             "Требуемый\nопыт": exp or None,
             "Труд-во": employ,
             "График": graph,
@@ -272,7 +411,6 @@ def gorodrabot_search(query: str, city: str, pages: int, pause: float) -> List[D
 
 def _rub_to_tr(s: Optional[str]) -> Tuple[Optional[float],Optional[float]]:
     if not s: return None, None
-    # только суммы рядом с ₽/руб и >= 1000
     sums = re.findall(r"(\d[\d\s]{3,})\s*(?:₽|руб)", s.lower())
     vals=[]
     for part in sums:
@@ -282,22 +420,26 @@ def _rub_to_tr(s: Optional[str]) -> Tuple[Optional[float],Optional[float]]:
     if not vals: return None, None
     return round(min(vals)/1000.0,1), round(max(vals)/1000.0,1)
 
-def map_gorodrabot(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    mapped=[]
-    for r in rows:
-        combo = ((r.get("salary_raw") or "") + " " + (r.get("desc") or ""))
-        sal_from, sal_to = _rub_to_tr(r.get("salary_raw"))
+def map_gorodrabot(rows_in: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    mapped = []
+    for r in rows_in:
+        desc = r.get("desc") or ""
+        sal_raw = r.get("salary_raw") or ""
+        combo = f"{sal_raw} {desc}"
+
+        sal_from, sal_to = _rub_to_tr(sal_raw)
         hour, shift = extract_comp(combo)
-        graph = extract_schedule(combo)
-        pay   = extract_pay_frequency(combo)
-        duties = extract_responsibilities(r.get("desc") or "", fallback=None)
-        bens = pick_benefits(r.get("desc") or "")
+        graph = extract_schedule_strict(combo, sched_src=None)
+        pay = extract_pay_frequency(combo)
+        duties = extract_responsibilities(desc, fallback=None)
+        bens = pick_benefits(desc)
+
         mapped.append({
             "Должность": r.get("title"),
             "Работодатель": r.get("employer"),
             "ЗП от (т.р.)": sal_from,
             "ЗП до (т.р.)": sal_to,
-            "Средний совокупный доход при графике 2/2 по 12 часов": shift,
+            "Средний совокупный доход при графике 2/2 по 12 часов": (shift if shift is not None else (hour*12.0 if hour else None)),
             "В час": hour,
             "Длительность \nсмены": 12 if (hour or shift) else None,
             "Требуемый\nопыт": None,
@@ -322,7 +464,7 @@ def to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     return df
 
 def main():
-    ap = argparse.ArgumentParser(description="Парсер вакансий: hh.ru + gorodrabot.ru")
+    ap = argparse.ArgumentParser(description="Парсер вакансий: hh.ru + gorodrabot.ru (строгий график)")
     ap.add_argument("--query", required=True)
     ap.add_argument("--area", type=int, default=1)                   # hh регион (1=Москва)
     ap.add_argument("--city", default="Москва")                      # gorodrabot город
