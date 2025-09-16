@@ -6,4 +6,7 @@ localPort = 8090
 externalPort = 80
 
 [nix]
-packages = ["glibcLocales", "xcodebuild", "zlib"]
+packages = ["glibcLocales", "xcodebuild", "zlib", "mailutils"]
+
+[agent]
+expertMode = true
