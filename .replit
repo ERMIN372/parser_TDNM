@@ -1,0 +1,9 @@
+run="./repl.deploy --standalone ./start.sh"
+modules = ["python-3.11"]
+
+[[ports]]
+localPort = 8090
+externalPort = 80
+
+[nix]
+packages = ["glibcLocales", "xcodebuild", "zlib"]
