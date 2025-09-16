@@ -3,6 +3,7 @@ from aiogram import types, Dispatcher
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InputFile, ReplyKeyboardRemove
+from app.run import SEM
 
 from ..services import parser_adapter
 
@@ -10,6 +11,10 @@ from ..services import parser_adapter
 class ParseForm(StatesGroup):
     waiting_query = State()
     waiting_city = State()
+
+
+async with SEM:
+    path = await parser_adapter.run_report(message.from_user.id, query, city)
 
 
 async def cmd_parse(message: types.Message, state: FSMContext):
