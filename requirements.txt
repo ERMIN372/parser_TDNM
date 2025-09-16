@@ -11,3 +11,4 @@ beautifulsoup4==4.12.3
 lxml==5.2.2
 XlsxWriter==3.2.0
 peewee==3.17.5
+yookassa==3.1.0
