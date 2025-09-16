@@ -1,6 +1,17 @@
 # parsers/fetch_vacancies.py
-import time, argparse, requests, pandas as pd, re, urllib.parse, html
+import time, argparse, pandas as pd, re, urllib.parse, html
 from typing import List, Dict, Any, Tuple, Optional
+
+try:  # pragma: no cover - зависимость должна ставиться вместе с ботом
+    import requests
+except ImportError:  # pragma: no cover
+    class _RequestsStub:
+        def get(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError(
+                "requests package is required for network fetching. Install dependencies."
+            )
+
+    requests = _RequestsStub()  # type: ignore[assignment]
 
 # ---- optional bs4 for HTML (hh + gorodrabot) ----
 try:
@@ -468,23 +479,28 @@ def main():
     ap.add_argument("--query", required=True)
     ap.add_argument("--area", type=int, default=1)                   # hh регион (1=Москва)
     ap.add_argument("--city", default="Москва")                      # gorodrabot город
-    ap.add_argument("--role", default="повар", help="ключ из FILTERS")
+    ap.add_argument("--role", default=None, help="ключ из FILTERS")
     ap.add_argument("--pages", type=int, default=3)
-    ap.add_argument("--per_page", type=int, default=50)
+    ap.add_argument("--per-page", dest="per_page", type=int, default=50)
+    ap.add_argument("--per_page", dest="per_page", type=int, help="alias", metavar="N")
     ap.add_argument("--pause", type=float, default=0.6)
-    ap.add_argument("--search_in", default="name", help="name|description|company_name|everything")
+    ap.add_argument("--search-in", dest="search_in", default="name",
+                    help="name|description|company_name|everything")
+    ap.add_argument("--search_in", dest="search_in", help="alias")
+    ap.add_argument("--site", choices=["hh", "gorodrabot", "both"], default="both")
     ap.add_argument("--out_csv", required=True)
     a = ap.parse_args()
 
-    INC_RE, EXC_RE = _compile_filters(a.role)
+    INC_RE, EXC_RE = _compile_filters(a.role or "")
 
-    # HH
-    hh_items = hh_search(a.query, a.area, a.pages, a.per_page, a.pause, a.search_in)
-    rows_hh = map_hh(hh_items)
+    rows_hh = []
+    if a.site in ("hh", "both"):
+        hh_items = hh_search(a.query, a.area, a.pages, a.per_page, a.pause, a.search_in)
+        rows_hh = map_hh(hh_items)
 
     # GorodRabot
     rows_gr = []
-    if _HAS_BS4:
+    if _HAS_BS4 and a.site in ("gorodrabot", "both"):
         gr_items = gorodrabot_search(a.query, a.city, a.pages, a.pause)
         rows_gr = map_gorodrabot(gr_items)
 
