@@ -79,7 +79,8 @@ async def _run_parser(message: types.Message, query: str, city: str, overrides: 
         )
     except Exception as e:  # pragma: no cover - log path
         logging.exception("parser failed")
-        await message.answer("Не удалось, попробуйте позже.")
+        err_text = str(e).strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
+        await message.answer(err_text)
         return
     if path.exists():
         await message.answer_document(InputFile(path))

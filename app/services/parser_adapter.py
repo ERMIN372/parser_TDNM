@@ -9,6 +9,37 @@ DEFAULT_PAGES = int(os.getenv("PARSER_PAGES", "1"))
 PER_PAGE = int(os.getenv("PARSER_PER_PAGE", "20"))
 DEFAULT_SITE = os.getenv("PARSER_SITE", "hh")
 DEFAULT_PAUSE = float(os.getenv("PARSER_PAUSE", "0.6"))
+AREA_ENV = os.getenv("PARSER_AREA", "").strip()
+
+CITY_AREA_MAP: dict[str, str] = {
+    "москва": "1",
+    "moscow": "1",
+    "санкт-петербург": "2",
+    "санкт петербург": "2",
+    "петербург": "2",
+    "спб": "2",
+    "spb": "2",
+}
+
+
+def _normalize_city(value: str) -> str:
+    return value.strip().lower().replace("ё", "е")
+
+
+def _resolve_area(city: str) -> str | None:
+    if AREA_ENV:
+        return AREA_ENV
+    norm_city = _normalize_city(city)
+    return CITY_AREA_MAP.get(norm_city)
+
+
+def _last_lines(text: str, limit: int) -> str:
+    if limit <= 0:
+        return text
+    lines = text.splitlines()
+    if len(lines) <= limit:
+        return "\n".join(lines)
+    return "\n".join(lines[-limit:])
 
 
 async def run_report(
@@ -37,15 +68,20 @@ async def run_report(
         "--query", query,
         "--city", city,
         "--pages", str(pages),
-        "--per-page", str(per_page),
+        "--per_page", str(per_page),
         "--pause", f"{pause}",
         "--site", site,
         "--formats", "xlsx",
         "--output", str(target),
         "--output-dir", str(user_dir),
     ]
-    if role:
-        cmd += ["--role", role]
+    area_id = _resolve_area(city)
+    if area_id:
+        cmd += ["--area", str(area_id)]
+
+    effective_role = role or query
+    if effective_role:
+        cmd += ["--role", effective_role]
 
     t0 = time.time()
     log.info("Running parser: %s", " ".join(shlex.quote(c) for c in cmd))
@@ -62,21 +98,23 @@ async def run_report(
 
         proc = await asyncio.to_thread(_run)
     except subprocess.TimeoutExpired:
-        log.error("Parser timeout")
-        raise RuntimeError("Превышено время ожидания парсера")
+        log.error("Parser timeout after %.1fs", TIMEOUT)
+        raise RuntimeError("Не удалось получить отчёт: парсер превысил таймаут. Попробуйте позже")
 
     dt = time.time() - t0
     stdout = proc.stdout or ""
     stderr = proc.stderr or ""
 
     if proc.returncode != 0:
+        tail_stdout = _last_lines(stdout, 120)
+        tail_stderr = _last_lines(stderr, 120)
         log.error(
-            "Parser failed rc=%s\nSTDOUT:\n%s\nSTDERR:\n%s",
+            "Parser failed rc=%s\nSTDOUT (tail):\n%s\nSTDERR (tail):\n%s",
             proc.returncode,
-            stdout,
-            stderr,
+            tail_stdout,
+            tail_stderr,
         )
-        raise RuntimeError("Парсер завершился с ошибкой")
+        raise RuntimeError("Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже")
 
     reported_paths: list[pathlib.Path] = []
     for line in stdout.splitlines():
