@@ -252,6 +252,96 @@ async def preview_report(
     return _try_api()
 
 
+async def preview_rows(
+    user_id: int,
+    query: str,
+    city: str,
+    *,
+    area: Optional[int] = None,
+    include: Iterable[str] | str | None = None,
+    exclude: Iterable[str] | str | None = None,
+) -> List[dict[str, str]]:
+    """Возвращает первые строки превью в виде списка словарей."""
+
+    def _norm(val) -> str:
+        if val is None:
+            return ""
+        return str(val).strip()
+
+    def _norm_salary(val) -> str:
+        if isinstance(val, dict):
+            text = val.get("text")
+            if text:
+                return _norm(text)
+            fr = val.get("from")
+            to = val.get("to")
+            currency = val.get("currency")
+            if fr and to:
+                base = f"{fr}–{to}"
+            elif fr:
+                base = f"от {fr}"
+            elif to:
+                base = f"до {to}"
+            else:
+                base = ""
+            if base and currency:
+                return f"{base} {currency}".strip()
+            return base
+        return _norm(val)
+
+    rows_raw = await preview_report(
+        user_id,
+        query,
+        city,
+        area=area,
+        include=include,
+        exclude=exclude,
+    )
+
+    if not rows_raw:
+        return []
+
+    rows_out: List[dict[str, str]] = []
+    for item in rows_raw:
+        if isinstance(item, dict):
+            title = _norm(
+                item.get("title")
+                or item.get("name")
+                or item.get("vacancy")
+                or item.get("position")
+            )
+            employer = item.get("employer") or {}
+            if not isinstance(employer, dict):
+                employer = {"name": employer}
+            company = _norm(
+                item.get("company")
+                or item.get("employer_name")
+                or employer.get("name")
+            )
+            salary = _norm_salary(item.get("salary"))
+            link = _norm(item.get("link") or item.get("url") or item.get("alternate_url"))
+        elif isinstance(item, (list, tuple)):
+            parts = list(item) + ["", "", ""]
+            title = _norm(parts[0])
+            company = _norm(parts[1])
+            link = _norm(parts[2])
+            salary = _norm(parts[3])
+        else:
+            title = _norm(item)
+            company = ""
+            link = ""
+            salary = ""
+
+        rows_out.append({
+            "title": title,
+            "company": company,
+            "salary": salary,
+            "link": link,
+        })
+
+    return rows_out
+
+
 async def run_report(
     user_id: int,
     query: str,

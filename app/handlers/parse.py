@@ -397,7 +397,12 @@ async def cb_preview(call: types.CallbackQuery):
 
     try:
         rows = await parser_adapter.preview_rows(
-            title, city, area_id=area_id, include=include, exclude=exclude
+            uid,
+            title,
+            city,
+            area=area_id,
+            include=include,
+            exclude=exclude,
         )
     except Exception:
         logging.exception("preview failed")
