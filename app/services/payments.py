@@ -91,7 +91,7 @@ def create_payment(user_id: int, pack: str, bot_username: str | None = None) -> 
         },
         # Чек (фискализация) опускаем в MVP — зависит от настроек магазина
     }
-    p = Payment.create(body, idempotence_key=idem)
+    p = Payment.create(body, idempotency_key=idem)
     # Сохраним pending в нашей БД
     payment = repo.create_payment(user_id, pack, amount_cop, "RUB", payload=p.id)
     log.info("YooKassa create: id=%s pack=%s amount=%s", p.id, pack, amount_cop)
