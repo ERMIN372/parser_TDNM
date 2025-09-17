@@ -70,9 +70,26 @@ def _split_kw(s: str) -> List[str]:
     return [p.strip() for p in s.replace(";", ",").split(",") if p.strip()]
 
 
-async def _run_parser_bypass_validation(message: types.Message, query: str, city: str, overrides: dict):
+def _resolve_requester_id(message: types.Message, uid: int | None = None) -> int:
+    if uid is not None:
+        return uid
+    if getattr(message, "chat", None) is not None:
+        return message.chat.id
+    if getattr(message, "from_user", None) is not None:
+        return message.from_user.id
+    raise ValueError("Cannot determine requester id")
+
+
+async def _run_parser_bypass_validation(
+    message: types.Message,
+    query: str,
+    city: str,
+    overrides: dict,
+    *,
+    uid: int | None = None,
+):
     """Запуск парсера без доп. проверок (по кнопке «Всё равно искать»)."""
-    uid = message.from_user.id
+    uid = _resolve_requester_id(message, uid)
     if not set_busy(uid):
         await message.answer(BUSY_TEXT)
         return
@@ -99,9 +116,18 @@ async def _run_parser_bypass_validation(message: types.Message, query: str, city
         await message.answer("Отчёт не найден. Проверьте логи.")
 
 
-async def _run_with_amount(message: types.Message, title: str, city: str, area_id: int, overrides: dict, total: int):
+async def _run_with_amount(
+    message: types.Message,
+    title: str,
+    city: str,
+    area_id: int,
+    overrides: dict,
+    total: int,
+    *,
+    uid: int | None = None,
+):
     """Считает pages/per_page под нужный объём total и запускает парсер с блокировкой пользователя."""
-    uid = message.from_user.id
+    uid = _resolve_requester_id(message, uid)
     if not set_busy(uid):
         await message.answer(BUSY_TEXT)
         return
@@ -147,9 +173,17 @@ async def _run_with_amount(message: types.Message, title: str, city: str, area_i
 
 
 # ---------- core ----------
-async def _run_parser(message: types.Message, query: str, city: str, overrides: dict[str, object]):
+async def _run_parser(
+    message: types.Message,
+    query: str,
+    city: str,
+    overrides: dict[str, object],
+    *,
+    uid: int | None = None,
+):
     # если пользователь занят — мягко отшьём сразу
-    if is_busy(message.from_user.id):
+    requester_id = _resolve_requester_id(message, uid)
+    if is_busy(requester_id):
         await message.answer(BUSY_TEXT)
         return
 
@@ -161,7 +195,7 @@ async def _run_parser(message: types.Message, query: str, city: str, overrides: 
             InlineKeyboardButton("✅ Всё равно искать (списать 1 кредит)", callback_data="parse_force"),
             InlineKeyboardButton("✏️ Исправить запрос", callback_data="parse_fix"),
         )
-        _WARN_CACHE[message.from_user.id] = (query, city, overrides)
+        _WARN_CACHE[requester_id] = (query, city, overrides)
         await message.answer(
             bad_msg
             + "\n\nЕсли ты уверен(а) — могу всё равно запустить поиск. "
@@ -173,8 +207,7 @@ async def _run_parser(message: types.Message, query: str, city: str, overrides: 
 
     # 2) Если юзер сам задал pages/per_page — запускаем без шага объёма (и блокируем пользователя)
     if "pages" in overrides or "per_page" in overrides:
-        uid = message.from_user.id
-        if not set_busy(uid):
+        if not set_busy(requester_id):
             await message.answer(BUSY_TEXT)
             return
         try:
@@ -182,7 +215,7 @@ async def _run_parser(message: types.Message, query: str, city: str, overrides: 
             if "area" not in overrides:
                 overrides["area"] = area_id
             path = await parser_adapter.run_report(
-                uid,
+                requester_id,
                 norm_title,
                 city,
                 role=norm_title,
@@ -194,7 +227,7 @@ async def _run_parser(message: types.Message, query: str, city: str, overrides: 
             await message.answer(err_text)
             return
         finally:
-            clear_busy(uid)
+            clear_busy(requester_id)
 
         if path.exists():
             await message.answer_document(InputFile(path))
@@ -215,7 +248,7 @@ async def _run_parser(message: types.Message, query: str, city: str, overrides: 
     # предпросмотр первых 5 — лёгкий запрос; тоже с блокировкой
     kb.row(InlineKeyboardButton("👀 Превью (5)", callback_data="preview:5"))
 
-    _PENDING_QTY[message.from_user.id] = (norm_title, city, area_id, overrides, max_total)
+    _PENDING_QTY[requester_id] = (norm_title, city, area_id, overrides, max_total)
     await message.answer("Выбери объём выгрузки:", reply_markup=kb)
 
 
@@ -293,7 +326,7 @@ async def cb_kw_no(call: types.CallbackQuery, state: FSMContext):
     query = data.get("query")
     city = data.get("city")
     await state.finish()
-    await _run_parser(call.message, query, city, {})  # без уточнений
+    await _run_parser(call.message, query, city, {}, uid=call.from_user.id)  # без уточнений
 
 
 async def process_kw_include(message: types.Message, state: FSMContext):
@@ -340,7 +373,7 @@ async def cb_parse_force(call: types.CallbackQuery, state: FSMContext):
         await state.finish()
     except Exception:
         pass
-    await _run_parser_bypass_validation(call.message, query, city, overrides)
+    await _run_parser_bypass_validation(call.message, query, city, overrides, uid=call.from_user.id)
 
 
 async def cb_parse_fix(call: types.CallbackQuery):
@@ -377,7 +410,7 @@ async def cb_qty(call: types.CallbackQuery):
 
     # фикс: после старта выгрузки «забываем» pending, чтобы старые кнопки не плодили ошибки
     _PENDING_QTY.pop(call.from_user.id, None)
-    await _run_with_amount(call.message, title, city, area_id, overrides, total)
+    await _run_with_amount(call.message, title, city, area_id, overrides, total, uid=call.from_user.id)
 
 
 async def cb_preview(call: types.CallbackQuery):
