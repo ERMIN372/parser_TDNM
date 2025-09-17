@@ -7,7 +7,7 @@ from typing import List, Tuple
 
 from aiogram import types, Dispatcher
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputFile
-from aiogram.utils.exceptions import BotBlocked, ChatNotFound, RetryAfter
+from aiogram.utils.exceptions import BotBlocked, ChatNotFound, RetryAfter, MessageNotModified
 from pathlib import Path
 
 from app.storage import repo
@@ -29,6 +29,13 @@ def _kb_admin_home() -> InlineKeyboardMarkup:
     )
     kb.add(InlineKeyboardButton("💾 Бэкап БД", callback_data="admin_backup"))
     return kb
+
+async def _safe_edit_text(message: types.Message, text: str, **kwargs) -> None:
+    try:
+        await message.edit_text(text, **kwargs)
+    except MessageNotModified:
+        pass
+
 
 def _users_page(page: int, q: str | None = None) -> Tuple[str, InlineKeyboardMarkup]:
     total = repo.count_users(q)
@@ -92,7 +99,7 @@ async def admin_home(message: types.Message):
 
 async def cb_admin_home(call: types.CallbackQuery):
     if not _guard(call.from_user.id): return
-    await call.message.edit_text("🛠 Админ-панель", reply_markup=_kb_admin_home())
+    await _safe_edit_text(call.message, "🛠 Админ-панель", reply_markup=_kb_admin_home())
     await call.answer()
 
 # -------- список пользователей --------
@@ -101,7 +108,7 @@ async def cb_users(call: types.CallbackQuery):
     _, payload = call.data.split(":")
     page = int(payload)
     text, kb = _users_page(page)
-    await call.message.edit_text(text, reply_markup=kb)
+    await _safe_edit_text(call.message, text, reply_markup=kb)
     await call.answer()
 
 # -------- карточка пользователя --------
@@ -111,7 +118,7 @@ async def cb_user(call: types.CallbackQuery):
     u = repo.get_user(int(uid))
     if not u:
         await call.answer("Пользователь не найден", show_alert=True); return
-    await call.message.edit_text(_user_card_text(u), reply_markup=_kb_user(u), parse_mode="HTML")
+    await _safe_edit_text(call.message, _user_card_text(u), reply_markup=_kb_user(u), parse_mode="HTML")
     await call.answer()
 
 # -------- действия: безлимит/кредиты --------
@@ -122,7 +129,7 @@ async def cb_unlim(call: types.CallbackQuery):
     until = repo.set_unlimited(uid, days)
     await call.answer("Выдан безлимит", show_alert=False)
     u = repo.get_user(uid)
-    await call.message.edit_text(_user_card_text(u), reply_markup=_kb_user(u), parse_mode="HTML")
+    await _safe_edit_text(call.message, _user_card_text(u), reply_markup=_kb_user(u), parse_mode="HTML")
 
 async def cb_credit(call: types.CallbackQuery):
     if not _guard(call.from_user.id): return
@@ -131,7 +138,7 @@ async def cb_credit(call: types.CallbackQuery):
     bal = repo.add_credits(uid, n)
     await call.answer(f"+{n} кредит(ов). Баланс: {bal}", show_alert=False)
     u = repo.get_user(uid)
-    await call.message.edit_text(_user_card_text(u), reply_markup=_kb_user(u), parse_mode="HTML")
+    await _safe_edit_text(call.message, _user_card_text(u), reply_markup=_kb_user(u), parse_mode="HTML")
 
 # -------- рассылки --------
 async def cb_cast_menu(call: types.CallbackQuery):
@@ -142,7 +149,11 @@ async def cb_cast_menu(call: types.CallbackQuery):
         InlineKeyboardButton("🔔 Точечно (по ID)", callback_data="admin_cast_prompt"),
         InlineKeyboardButton("⬅️ Назад", callback_data="admin_home"),
     )
-    await call.message.edit_text("Рассылка:\n— отправь текст ответом на это сообщение\n— или используй точечную по ID", reply_markup=kb)
+    await _safe_edit_text(
+        call.message,
+        "Рассылка:\n— отправь текст ответом на это сообщение\n— или используй точечную по ID",
+        reply_markup=kb,
+    )
     await call.answer()
 
 # 0) точечная из карточки пользователя (КНОПКА, которая не работала)
@@ -155,7 +166,7 @@ async def cb_cast_user(call: types.CallbackQuery):
         "Ответь на это сообщение текстом — мы перешлём его пользователю.\n"
         "Отмена: /cancel"
     )
-    await call.message.edit_text(prompt, parse_mode="HTML")
+    await _safe_edit_text(call.message, prompt, parse_mode="HTML")
     await call.answer()
 
 # ловим ответ на «точечная рассылка пользователю <uid>»
@@ -192,7 +203,10 @@ async def catch_reply_cast_user(message: types.Message):
 async def cb_cast_all(call: types.CallbackQuery):
     if not _guard(call.from_user.id): return
     await call.answer("Пришли текст рассылки ответом на это сообщение.")
-    await call.message.edit_text("Ответь на это сообщение текстом для рассылки всем пользователям.\nОтмена: /cancel")
+    await _safe_edit_text(
+        call.message,
+        "Ответь на это сообщение текстом для рассылки всем пользователям.\nОтмена: /cancel",
+    )
 
 async def catch_reply_broadcast_all(message: types.Message):
     if not _guard(message.from_user.id): return
@@ -222,11 +236,12 @@ async def catch_reply_broadcast_all(message: types.Message):
 # 2) точечно / по ID через команду
 async def cb_cast_prompt(call: types.CallbackQuery):
     if not _guard(call.from_user.id): return
-    await call.message.edit_text(
+    await _safe_edit_text(
+        call.message,
         "Пришли в чат команду:\n<code>/cast &lt;id1,id2,...&gt; текст</code>\n"
         "Пример: <code>/cast 123,456 Обновили бота — теперь быстрее!</code>\n"
         "Отмена: /cancel",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     await call.answer()
 
