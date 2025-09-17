@@ -1,6 +1,5 @@
 from __future__ import annotations
 import os
-import re
 import asyncio
 from datetime import datetime
 from typing import List, Tuple
@@ -35,6 +34,10 @@ async def _safe_edit_text(message: types.Message, text: str, **kwargs) -> None:
         await message.edit_text(text, **kwargs)
     except MessageNotModified:
         pass
+
+
+# message_id -> целевой user_id для точечной рассылки
+_CAST_TARGETS: dict[int, int] = {}
 
 
 def _users_page(page: int, q: str | None = None) -> Tuple[str, InlineKeyboardMarkup]:
@@ -167,19 +170,16 @@ async def cb_cast_user(call: types.CallbackQuery):
         "Отмена: /cancel"
     )
     await _safe_edit_text(call.message, prompt, parse_mode="HTML")
+    _CAST_TARGETS[call.message.message_id] = uid
     await call.answer()
 
 # ловим ответ на «точечная рассылка пользователю <uid>»
 async def catch_reply_cast_user(message: types.Message):
     if not _guard(message.from_user.id): return
     if not message.reply_to_message: return
-    src = (message.reply_to_message.text or "") + (message.reply_to_message.caption or "")
-    if "Точечная рассылка пользователю" not in src:
+    uid = _CAST_TARGETS.get(message.reply_to_message.message_id)
+    if uid is None:
         return
-    m = re.search(r"(\d+)", src)
-    if not m:
-        return
-    uid = int(m.group(1))
     text = message.html_text or message.text or ""
     if not text.strip():
         await message.reply("Пустое сообщение, нечего отправлять.")
@@ -198,6 +198,8 @@ async def catch_reply_cast_user(message: types.Message):
             await message.reply("❌ Повторная попытка не удалась.")
     except Exception as e:
         await message.reply(f"❌ Ошибка отправки: {e}")
+    finally:
+        _CAST_TARGETS.pop(message.reply_to_message.message_id, None)
 
 # 1) ответом на сообщение → всем
 async def cb_cast_all(call: types.CallbackQuery):
