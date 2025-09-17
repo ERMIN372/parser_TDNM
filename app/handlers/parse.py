@@ -19,6 +19,7 @@ from ..middlewares.busy import is_busy, set_busy, clear_busy, BUSY_TEXT
 
 from ..services import parser_adapter
 from ..services import validator  # валидация запроса
+from ..services.quota import check_and_consume
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,33 @@ log = logging.getLogger(__name__)
 _WARN_CACHE: Dict[int, Tuple[str, str, dict]] = {}
 # Кеш шага выбора объёма: user_id -> (norm_title, city, area_id, overrides, max_total)
 _PENDING_QTY: Dict[int, Tuple[str, str, int, dict, int]] = {}
+
+
+async def _ensure_quota(
+    message: types.Message,
+    uid: int,
+    *,
+    user: types.User | None = None,
+) -> bool:
+    """Проверяет и списывает лимит перед запуском выгрузки."""
+
+    person = user or getattr(message, "from_user", None)
+    username = getattr(person, "username", None) if person else None
+    full_name = getattr(person, "full_name", None) if person else None
+
+    decision = check_and_consume(uid, username, full_name)
+    if not decision.allowed:
+        await message.answer(decision.message or "Лимит исчерпан — попробуйте позже 🙏")
+        return False
+
+    if decision.mode == "paid":
+        await message.answer(f"💳 Списан 1 кредит. Осталось: {decision.credits}")
+    elif decision.mode == "free" and decision.free_left == 0:
+        await message.answer(
+            "Бесплатные запросы в этом месяце закончились — дальше будут списываться кредиты."
+        )
+
+    return True
 
 # верхний лимит для «Всё»
 MAX_EXPORT = int(os.getenv("MAX_EXPORT", "500"))
@@ -87,6 +115,7 @@ async def _run_parser_bypass_validation(
     overrides: dict,
     *,
     uid: int | None = None,
+    user: types.User | None = None,
 ):
     """Запуск парсера без доп. проверок (по кнопке «Всё равно искать»)."""
     uid = _resolve_requester_id(message, uid)
@@ -94,6 +123,8 @@ async def _run_parser_bypass_validation(
         await message.answer(BUSY_TEXT)
         return
     try:
+        if not await _ensure_quota(message, uid, user=user):
+            return
         await message.answer("Окей, запускаю поиск. Это может занять 1–2 минуты…")
         path = await parser_adapter.run_report(
             uid,
@@ -125,6 +156,7 @@ async def _run_with_amount(
     total: int,
     *,
     uid: int | None = None,
+    user: types.User | None = None,
 ):
     """Считает pages/per_page под нужный объём total и запускает парсер с блокировкой пользователя."""
     uid = _resolve_requester_id(message, uid)
@@ -148,7 +180,12 @@ async def _run_with_amount(
     else:
         timeout = None
 
-    await message.answer(f"Окей, выгружаю ~{min(total, per_page*pages)} вакансий… это может занять несколько минут.")
+    if not await _ensure_quota(message, uid, user=user):
+        return
+
+    await message.answer(
+        f"Окей, выгружаю ~{min(total, per_page*pages)} вакансий… это может занять несколько минут."
+    )
     try:
         path = await parser_adapter.run_report(
             uid,
@@ -180,6 +217,7 @@ async def _run_parser(
     overrides: dict[str, object],
     *,
     uid: int | None = None,
+    user: types.User | None = None,
 ):
     # если пользователь занят — мягко отшьём сразу
     requester_id = _resolve_requester_id(message, uid)
@@ -211,6 +249,8 @@ async def _run_parser(
             await message.answer(BUSY_TEXT)
             return
         try:
+            if not await _ensure_quota(message, requester_id, user=user):
+                return
             await message.answer("Собираю вакансии, это может занять несколько минут…")
             if "area" not in overrides:
                 overrides["area"] = area_id
@@ -326,7 +366,14 @@ async def cb_kw_no(call: types.CallbackQuery, state: FSMContext):
     query = data.get("query")
     city = data.get("city")
     await state.finish()
-    await _run_parser(call.message, query, city, {}, uid=call.from_user.id)  # без уточнений
+    await _run_parser(
+        call.message,
+        query,
+        city,
+        {},
+        uid=call.from_user.id,
+        user=call.from_user,
+    )  # без уточнений
 
 
 async def process_kw_include(message: types.Message, state: FSMContext):
@@ -373,7 +420,14 @@ async def cb_parse_force(call: types.CallbackQuery, state: FSMContext):
         await state.finish()
     except Exception:
         pass
-    await _run_parser_bypass_validation(call.message, query, city, overrides, uid=call.from_user.id)
+    await _run_parser_bypass_validation(
+        call.message,
+        query,
+        city,
+        overrides,
+        uid=call.from_user.id,
+        user=call.from_user,
+    )
 
 
 async def cb_parse_fix(call: types.CallbackQuery):
@@ -410,7 +464,16 @@ async def cb_qty(call: types.CallbackQuery):
 
     # фикс: после старта выгрузки «забываем» pending, чтобы старые кнопки не плодили ошибки
     _PENDING_QTY.pop(call.from_user.id, None)
-    await _run_with_amount(call.message, title, city, area_id, overrides, total, uid=call.from_user.id)
+    await _run_with_amount(
+        call.message,
+        title,
+        city,
+        area_id,
+        overrides,
+        total,
+        uid=call.from_user.id,
+        user=call.from_user,
+    )
 
 
 async def cb_preview(call: types.CallbackQuery):
