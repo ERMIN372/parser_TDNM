@@ -3,6 +3,8 @@ import os
 from aiogram import types, Dispatcher
 from aiogram.types import InputFile  # <- для баннера
 from app import keyboards
+from aiogram.dispatcher import FSMContext
+
 
 # Админы и лимиты
 ADMINS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "").split(",") if x.isdigit()}
@@ -89,16 +91,35 @@ async def cmd_advanced(message: types.Message):
     await message.reply(text, disable_web_page_preview=True)
 
 
-# ---------- показать меню по слову «Меню» ----------
+# -------- показать меню по слову «Меню» --------
 async def show_menu(message: types.Message):
     kb = keyboards.main_kb(is_admin=_is_admin(message.from_user.id))
     await message.reply("Меню 👇", reply_markup=kb)
 
+# опционально /cancel — сбросить текущий диалог
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    await state.finish()
+    kb = keyboards.main_kb(is_admin=_is_admin(message.from_user.id))
+    await message.reply("Окей, сбросил диалог. Нажми кнопки ниже или /start.", reply_markup=kb)
 
 def register(dp: Dispatcher):
-    dp.register_message_handler(cmd_start, commands=["start"])
-    dp.register_message_handler(cmd_help, commands=["help"])
-    dp.register_message_handler(cmd_advanced, commands=["advanced"])
-    dp.register_message_handler(show_menu, lambda m: m.text and m.text.lower() in {"меню", "menu"})
-    # реакции на кнопки меню
-    dp.register_message_handler(cmd_help, lambda m: m.text in {"ℹ️ Помощь", "Помощь"}, state="*")
+    # команды должны работать из любого состояния
+    dp.register_message_handler(cmd_start,    commands=["start"],    state="*")
+    dp.register_message_handler(cmd_help,     commands=["help"],     state="*")
+    dp.register_message_handler(cmd_advanced, commands=["advanced"], state="*")
+    dp.register_message_handler(cmd_cancel,   commands=["cancel"],   state="*")
+
+    # показать меню по слову (тоже в любом состоянии)
+    dp.register_message_handler(
+        show_menu,
+        lambda m: (m.text or "").lower() in {"меню", "menu", "🏠 меню"},
+        state="*",
+    )
+
+    # реакции на кнопки меню (помощь) — из любого состояния
+    dp.register_message_handler(
+        cmd_help,
+        lambda m: (m.text or "").strip() in {"ℹ️ Помощь", "Помощь"},
+        state="*",
+    )
+

@@ -7,6 +7,7 @@ import aiohttp
 import uvicorn
 from aiogram import Bot, Dispatcher, executor
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from .middlewares.busy import BusyMiddleware
 
 from .config import settings
 from .handlers import (
@@ -18,6 +19,11 @@ from .handlers import (
 )
 from . import webhook
 from .storage.db import init_db
+
+bot = Bot(token=settings.TELEGRAM_BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher(bot, storage=MemoryStorage())
+
+dp.middleware.setup(BusyMiddleware())  # ← ВАЖНО: глобальная блокировка
 
 # ---------- логирование ----------
 logging.basicConfig(level=logging.INFO)
