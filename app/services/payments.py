@@ -41,13 +41,21 @@ def _apply_effect(user_id: int, pack: str) -> str:
         return f"Включён безлимит до {until:%Y-%m-%d %H:%M} UTC"
     return "Ок"
 
+_configured = False
+
+
 def _cfg():
+    global _configured
+    if _configured:
+        return
+
     shop_id = os.getenv("YOOKASSA_SHOP_ID")
     secret = os.getenv("YOOKASSA_SECRET_KEY")
     if not shop_id or not secret:
         raise RuntimeError("Платёжная система не настроена (YOOKASSA_SHOP_ID/YOOKASSA_SECRET_KEY).")
-    Configuration.account_id = shop_id
-    Configuration.secret_key = secret
+
+    Configuration.configure(account_id=shop_id, secret_key=secret)
+    _configured = True
 
 def create_payment(user_id: int, pack: str, bot_username: str | None = None) -> Tuple[str, str]:
     """
@@ -76,6 +84,11 @@ def create_payment(user_id: int, pack: str, bot_username: str | None = None) -> 
         "capture": True,
         "description": description,
         "confirmation": {"type": "redirect", "return_url": return_url},
+        "metadata": {
+            "user_id": user_id,
+            "pack": pack,
+            "internal_payment_id": idem,
+        },
         # Чек (фискализация) опускаем в MVP — зависит от настроек магазина
     }
     p = Payment.create(body, idempotence_key=idem)
