@@ -19,7 +19,13 @@ def _is_admin(user_id: int) -> bool:
 
 
 # ---------- /start ----------
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
+    try:
+        await state.finish()
+    except Exception:
+        # на случай, если состояния нет или не инициализировано
+        pass
+
     kb = keyboards.main_kb(is_admin=_is_admin(message.from_user.id))
 
     # 1) Пробуем отправить баннер (если файл есть) с коротким капшеном
