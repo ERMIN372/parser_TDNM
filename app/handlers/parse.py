@@ -20,6 +20,8 @@ from ..middlewares.busy import is_busy, set_busy, clear_busy, BUSY_TEXT
 from ..services import parser_adapter
 from ..services import validator  # валидация запроса
 from ..services.quota import check_and_consume
+from app import keyboards
+from app.utils.admins import is_admin
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +45,10 @@ async def _ensure_quota(
 
     decision = check_and_consume(uid, username, full_name)
     if not decision.allowed:
-        await message.answer(decision.message or "Лимит исчерпан — попробуйте позже 🙏")
+        await message.answer(
+            decision.message or "Лимит исчерпан — попробуйте позже 🙏",
+            reply_markup=_main_menu_kb(message, user=user),
+        )
         return False
 
     if decision.mode == "paid":
@@ -108,6 +113,12 @@ def _resolve_requester_id(message: types.Message, uid: int | None = None) -> int
     raise ValueError("Cannot determine requester id")
 
 
+def _main_menu_kb(message: types.Message, *, user: types.User | None = None):
+    person = user or getattr(message, "from_user", None)
+    user_id = getattr(person, "id", None)
+    return keyboards.main_kb(is_admin=is_admin(user_id))
+
+
 async def _run_parser_bypass_validation(
     message: types.Message,
     query: str,
@@ -136,15 +147,15 @@ async def _run_parser_bypass_validation(
     except Exception as e:  # pragma: no cover
         logging.exception("parser failed")
         err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
-        await message.answer(err_text)
+        await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
         return
     finally:
         clear_busy(uid)
 
     if path.exists():
-        await message.answer_document(InputFile(path))
+        await message.answer_document(InputFile(path), reply_markup=_main_menu_kb(message, user=user))
     else:
-        await message.answer("Отчёт не найден. Проверьте логи.")
+        await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
 
 
 async def _run_with_amount(
@@ -198,15 +209,15 @@ async def _run_with_amount(
     except Exception as e:
         logging.exception("parser failed")
         err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
-        await message.answer(err_text)
+        await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
         return
     finally:
         clear_busy(uid)
 
     if path.exists():
-        await message.answer_document(InputFile(path))
+        await message.answer_document(InputFile(path), reply_markup=_main_menu_kb(message, user=user))
     else:
-        await message.answer("Отчёт не найден. Проверьте логи.")
+        await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
 
 
 # ---------- core ----------
@@ -264,15 +275,15 @@ async def _run_parser(
         except Exception as e:
             logging.exception("parser failed")
             err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
-            await message.answer(err_text)
+            await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
             return
         finally:
             clear_busy(requester_id)
 
         if path.exists():
-            await message.answer_document(InputFile(path))
+            await message.answer_document(InputFile(path), reply_markup=_main_menu_kb(message, user=user))
         else:
-            await message.answer("Отчёт не найден. Проверьте логи.")
+            await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
         return
 
     # 3) Шаг выбора объёма (число найденных НЕ показываем)

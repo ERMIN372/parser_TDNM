@@ -4,18 +4,14 @@ from aiogram import types, Dispatcher
 from aiogram.types import InputFile  # <- для баннера
 from app import keyboards
 from aiogram.dispatcher import FSMContext
+from app.utils.admins import is_admin
 
 
 # Админы и лимиты
-ADMINS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 FREE_PER_MONTH = int(os.getenv("FREE_PER_MONTH", "3"))
 
 # Путь к баннеру (можно переопределить в .env: START_BANNER_PATH=assets/start_banner_1x1.png)
 BANNER_PATH = os.getenv("START_BANNER_PATH", "assets/start_banner_1x1.png")
-
-
-def _is_admin(user_id: int) -> bool:
-    return user_id in ADMINS
 
 
 # ---------- /start ----------
@@ -26,7 +22,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         # на случай, если состояния нет или не инициализировано
         pass
 
-    kb = keyboards.main_kb(is_admin=_is_admin(message.from_user.id))
+    kb = keyboards.main_kb(is_admin=is_admin(message.from_user.id))
 
     # 1) Пробуем отправить баннер (если файл есть) с коротким капшеном
     try:
@@ -99,13 +95,13 @@ async def cmd_advanced(message: types.Message):
 
 # -------- показать меню по слову «Меню» --------
 async def show_menu(message: types.Message):
-    kb = keyboards.main_kb(is_admin=_is_admin(message.from_user.id))
+    kb = keyboards.main_kb(is_admin=is_admin(message.from_user.id))
     await message.reply("Меню 👇", reply_markup=kb)
 
 # опционально /cancel — сбросить текущий диалог
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.finish()
-    kb = keyboards.main_kb(is_admin=_is_admin(message.from_user.id))
+    kb = keyboards.main_kb(is_admin=is_admin(message.from_user.id))
     await message.reply("Окей, сбросил диалог. Нажми кнопки ниже или /start.", reply_markup=kb)
 
 def register(dp: Dispatcher):

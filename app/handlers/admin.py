@@ -1,5 +1,4 @@
 from __future__ import annotations
-import os
 import asyncio
 from datetime import datetime
 from typing import List, Tuple
@@ -12,10 +11,10 @@ from pathlib import Path
 from app.storage import repo
 from app.storage.models import User
 from app.utils.backup import make_sqlite_backup
+from app.utils.admins import is_admin
 
 # --- доступ ---
-ADMINS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").replace(" ", "").split(",") if x.isdigit()}
-def _guard(uid: int) -> bool: return uid in ADMINS
+def _guard(uid: int) -> bool: return is_admin(uid)
 
 # --- пагинация ---
 PAGE_SIZE = 10
