@@ -19,6 +19,7 @@ from ..middlewares.busy import is_busy, set_busy, clear_busy, BUSY_TEXT
 
 from ..services import parser_adapter
 from ..services import validator  # валидация запроса
+from ..services.mini_analytics import register_context, render_mini_analytics
 from ..services.quota import check_and_consume
 from app import keyboards
 from app.utils.admins import is_admin
@@ -103,6 +104,20 @@ def _split_kw(s: str) -> List[str]:
     return [p.strip() for p in s.replace(";", ",").split(",") if p.strip()]
 
 
+def _ensure_str_list(values) -> list[str]:
+    if not values:
+        return []
+    if isinstance(values, str):
+        val = values.strip()
+        return [val] if val else []
+    result = []
+    for item in values:
+        text = str(item).strip()
+        if text:
+            result.append(text)
+    return result
+
+
 def _resolve_requester_id(message: types.Message, uid: int | None = None) -> int:
     if uid is not None:
         return uid
@@ -117,6 +132,29 @@ def _main_menu_kb(message: types.Message, *, user: types.User | None = None):
     person = user or getattr(message, "from_user", None)
     user_id = getattr(person, "id", None)
     return keyboards.main_kb(is_admin=is_admin(user_id))
+
+
+async def _send_report_with_analytics(
+    message: types.Message,
+    path,
+    *,
+    title: str,
+    city: str,
+    approx_total: int | None = None,
+    include=None,
+    exclude=None,
+    reply_markup=None,
+) -> None:
+    register_context(path, title=title, city=city)
+    await message.answer_document(InputFile(path), reply_markup=reply_markup)
+    text = render_mini_analytics(
+        path,
+        approx_total=approx_total,
+        include=_ensure_str_list(include),
+        exclude=_ensure_str_list(exclude),
+    )
+    if text:
+        await message.answer(text, disable_web_page_preview=True)
 
 
 async def _run_parser_bypass_validation(
@@ -153,7 +191,15 @@ async def _run_parser_bypass_validation(
         clear_busy(uid)
 
     if path.exists():
-        await message.answer_document(InputFile(path), reply_markup=_main_menu_kb(message, user=user))
+        await _send_report_with_analytics(
+            message,
+            path,
+            title=query,
+            city=city,
+            include=overrides.get("include"),
+            exclude=overrides.get("exclude"),
+            reply_markup=_main_menu_kb(message, user=user),
+        )
     else:
         await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
 
@@ -215,7 +261,16 @@ async def _run_with_amount(
         clear_busy(uid)
 
     if path.exists():
-        await message.answer_document(InputFile(path), reply_markup=_main_menu_kb(message, user=user))
+        await _send_report_with_analytics(
+            message,
+            path,
+            title=title,
+            city=city,
+            approx_total=total,
+            include=ov.get("include"),
+            exclude=ov.get("exclude"),
+            reply_markup=_main_menu_kb(message, user=user),
+        )
     else:
         await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
 
@@ -281,7 +336,15 @@ async def _run_parser(
             clear_busy(requester_id)
 
         if path.exists():
-            await message.answer_document(InputFile(path), reply_markup=_main_menu_kb(message, user=user))
+            await _send_report_with_analytics(
+                message,
+                path,
+                title=norm_title,
+                city=city,
+                include=overrides.get("include"),
+                exclude=overrides.get("exclude"),
+                reply_markup=_main_menu_kb(message, user=user),
+            )
         else:
             await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
         return
