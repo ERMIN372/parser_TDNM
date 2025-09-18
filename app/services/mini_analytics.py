@@ -20,6 +20,8 @@ log = logging.getLogger(__name__)
 
 _CONTEXT: dict[str, tuple[str, str]] = {}
 
+_THIN_NBSP = "\u202f"
+
 __all__ = ["register_context", "render_mini_analytics"]
 
 _SPARKLINE_LEVELS = "▁▂▃▄▅▆▇█"
@@ -140,10 +142,23 @@ def _format_int(value: int | float | None) -> str:
     return f"{int(round(value)):,}".replace(",", " ")
 
 
-def _format_rub(value: float | int | None) -> str:
-    if value is None or (isinstance(value, float) and (math.isnan(value) or value <= 0)):
-        return "—"
-    return _format_int(value)
+def _format_money(value: float | int | None) -> str:
+    if value is None:
+        return "нет данных"
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "нет данных"
+
+    if math.isnan(numeric):
+        return "нет данных"
+
+    absolute = abs(numeric)
+    rounded = int(1000 * math.floor((absolute / 1000) + 0.5))
+    if numeric < 0:
+        rounded = -rounded
+    return f"{rounded:,}".replace(",", _THIN_NBSP)
 
 
 def _format_percent(value: float | None) -> str:
@@ -444,16 +459,20 @@ def render_mini_analytics(
                     median_val = float(np.nanmedian(mid_valid.values))
                     p10_val = float(np.nanpercentile(mid_valid.values, 10))
                     p90_val = float(np.nanpercentile(mid_valid.values, 90))
-                    share_val = (available_mask.sum() / processed) * 100 if processed else 0
+                    share_val: float | None = None
+                    if processed:
+                        share_val = (available_mask.sum() / processed) * 100
 
                     salary_lines.extend(
                         [
                             "<b>💰 Вилки (₽/мес, midpoint)</b>",
-                            f"• медиана: {_format_rub(median_val)}",
-                            f"• p10–p90: {_format_rub(p10_val)} — {_format_rub(p90_val)}",
-                            f"• с вилкой: {_format_percent(share_val)}",
+                            f"• медиана: {_format_money(median_val)}",
+                            f"• низ рынка: {_format_money(p10_val)}",
+                            f"• верх рынка: {_format_money(p90_val)}",
                         ]
                     )
+                    if share_val is not None:
+                        salary_lines.append(f"• с вилкой: {_format_percent(share_val)}")
         if salary_lines:
             sections.append("\n".join(salary_lines))
 
