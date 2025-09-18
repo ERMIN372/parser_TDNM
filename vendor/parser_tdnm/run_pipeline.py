@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from typing import Iterable, List
 
+from .constants import DEFAULT_HH_SEARCH_FIELD
+
 ROOT = Path(__file__).resolve().parent
 PARSERS_DIR = ROOT / "parsers"
 DEFAULT_OUTPUT_DIR = ROOT / "exports"
@@ -38,7 +40,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
                         help="Пауза между запросами к HH")
     parser.add_argument("--site", choices=["hh", "gorodrabot", "both"], default="hh",
                         help="Ограничить источники вакансий")
-    parser.add_argument("--search-in", dest="search_in", default="name",
+    parser.add_argument("--search-in", dest="search_in", default=DEFAULT_HH_SEARCH_FIELD,
                         choices=["name", "description", "company_name", "everything"],
                         help="Поле поиска HH")
     parser.add_argument("--search_in", dest="search_in", help="alias")
