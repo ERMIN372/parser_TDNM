@@ -4,6 +4,8 @@ import re
 from typing import Optional, Tuple, List
 import requests
 
+from vendor.parser_tdnm.constants import DEFAULT_HH_SEARCH_FIELD
+
 UA = os.getenv("PARSER_USER_AGENT", "hr-assist/1.0")
 HH_BASE = os.getenv("PARSER_HH_BASE", "https://api.hh.ru")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
@@ -85,7 +87,12 @@ def probe_hh_found(title: str, area_id: int) -> Tuple[bool, int]:
     try:
         r = requests.get(
             f"{HH_BASE}/vacancies",
-            params={"text": t, "area": area_id, "per_page": 1},
+            params={
+                "text": t,
+                "area": area_id,
+                "per_page": 1,
+                "search_field": DEFAULT_HH_SEARCH_FIELD,
+            },
             headers={"User-Agent": UA},
             timeout=REQUEST_TIMEOUT,
         )

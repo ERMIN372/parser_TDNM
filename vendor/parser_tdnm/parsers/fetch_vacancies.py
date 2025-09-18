@@ -2,6 +2,8 @@
 import time, argparse, pandas as pd, re, urllib.parse, html
 from typing import List, Dict, Any, Tuple, Optional
 
+from ..constants import DEFAULT_HH_SEARCH_FIELD
+
 try:  # pragma: no cover - зависимость должна ставиться вместе с ботом
     import requests
 except ImportError:  # pragma: no cover
@@ -484,7 +486,7 @@ def main():
     ap.add_argument("--per-page", dest="per_page", type=int, default=50)
     ap.add_argument("--per_page", dest="per_page", type=int, help="alias", metavar="N")
     ap.add_argument("--pause", type=float, default=0.6)
-    ap.add_argument("--search-in", dest="search_in", default="name",
+    ap.add_argument("--search-in", dest="search_in", default=DEFAULT_HH_SEARCH_FIELD,
                     help="name|description|company_name|everything")
     ap.add_argument("--search_in", dest="search_in", help="alias")
     ap.add_argument("--site", choices=["hh", "gorodrabot", "both"], default="both")
