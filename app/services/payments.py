@@ -1,11 +1,13 @@
 from __future__ import annotations
-import os, uuid, logging
+
+import os
+import uuid
 from typing import Tuple
+
 from yookassa import Configuration, Payment
 
 from app.storage import repo
-
-log = logging.getLogger(__name__)
+from app.utils.logging import log_event, update_context
 
 # Прайс-лист (копейки)
 PRICES = {
@@ -21,6 +23,11 @@ TITLES = {
     "p9": "9 запросов",
     "unlim30": "Безлимит 30 дней",
 }
+
+
+def _credits_delta(pack: str) -> int:
+    return {"p1": 1, "p3": 3, "p9": 9}.get(pack, 0)
+
 
 def _rub(amount_cop: int) -> str:
     return f"{amount_cop/100:.2f}"
@@ -94,7 +101,14 @@ def create_payment(user_id: int, pack: str, bot_username: str | None = None) -> 
     p = Payment.create(body, idempotency_key=idem)
     # Сохраним pending в нашей БД
     payment = repo.create_payment(user_id, pack, amount_cop, "RUB", payload=p.id)
-    log.info("YooKassa create: id=%s pack=%s amount=%s", p.id, pack, amount_cop)
+    payment_ctx = {
+        "id": p.id,
+        "status": "pending",
+        "pack": pack,
+        "amount": _rub(amount_cop),
+    }
+    update_context(payment=payment_ctx)
+    log_event("payment_created", message=f"payment {p.id} created", payment=payment_ctx)
     return p.id, p.confirmation.confirmation_url
 
 def check_and_apply(user_id: int, payment_id: str) -> str:
@@ -106,7 +120,7 @@ def check_and_apply(user_id: int, payment_id: str) -> str:
     _cfg()
     p = Payment.find_one(payment_id)
     status = getattr(p, "status", "unknown")
-    log.info("YooKassa status: id=%s status=%s", payment_id, status)
+    update_context(payment={"id": payment_id, "status": status})
 
     # найдём нашу запись
     from app.storage.models import Payment as DbPayment  # локальный импорт
@@ -118,10 +132,37 @@ def check_and_apply(user_id: int, payment_id: str) -> str:
         if rec.status != "paid":
             repo.mark_payment_paid(rec.id)
             msg = _apply_effect(user_id, rec.pack)
+            delta = _credits_delta(rec.pack)
+            if delta:
+                update_context(credits_delta=delta)
+            if rec.pack == "unlim30":
+                update_context(quota={"unlimited": True})
+            log_event(
+                "payment_succeeded",
+                message=f"payment {payment_id} succeeded",
+                payment={"id": payment_id, "status": "succeeded", "pack": rec.pack},
+            )
             return f"✅ Оплата прошла. {msg}"
         else:
+            log_event(
+                "payment_succeeded",
+                message=f"payment {payment_id} already applied",
+                payment={"id": payment_id, "status": "succeeded", "pack": rec.pack},
+            )
             return "✅ Этот платёж уже учтён."
     elif status in {"canceled", "waiting_for_capture"}:
+        log_event(
+            "payment_failed",
+            level="WARN",
+            message=f"payment {payment_id} status={status}",
+            payment={"id": payment_id, "status": status, "pack": rec.pack},
+        )
         return f"Статус платежа: {status}. Если считаете, что это ошибка — напишите нам."
     else:
+        log_event(
+            "payment_failed",
+            level="WARN",
+            message=f"payment {payment_id} status={status}",
+            payment={"id": payment_id, "status": status, "pack": rec.pack},
+        )
         return f"Статус платежа: {status}. Ещё не оплачено."

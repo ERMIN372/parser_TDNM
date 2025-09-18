@@ -3,8 +3,10 @@ import time
 from typing import Dict, Set
 
 from aiogram import types
-from aiogram.dispatcher.middlewares import BaseMiddleware
 from aiogram.dispatcher.handler import CancelHandler
+from aiogram.dispatcher.middlewares import BaseMiddleware
+
+from app.utils.logging import log_event
 
 # Текст уведомления
 BUSY_TEXT = "⏳ Уже выполняю твой запрос — дождись, пожалуйста."
@@ -41,6 +43,11 @@ class BusyMiddleware(BaseMiddleware):
             if now - _last_ping.get(uid, 0.0) >= PING_EVERY:
                 _last_ping[uid] = now
                 await message.answer(BUSY_TEXT)
+                log_event(
+                    "busy_reject",
+                    message="User is busy (message)",
+                    ok=False,
+                )
             raise CancelHandler()
 
     async def on_pre_process_callback_query(self, call: types.CallbackQuery, data: dict):
@@ -50,4 +57,9 @@ class BusyMiddleware(BaseMiddleware):
         if is_busy(uid):
             # короткий ответ без алерта, чтобы не мешать UX
             await call.answer("⏳ Обрабатываю предыдущий запрос…", show_alert=False)
+            log_event(
+                "busy_reject",
+                message="User is busy (callback)",
+                ok=False,
+            )
             raise CancelHandler()

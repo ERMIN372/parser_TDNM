@@ -1,30 +1,30 @@
 from __future__ import annotations
 import logging
+import asyncio
 import math
 import os
-from typing import Dict, Tuple, List
+from typing import Dict, List, Tuple
 
-from aiogram import types, Dispatcher
+from aiogram import Dispatcher, types
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InputFile,
     ReplyKeyboardRemove,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
 )
 
 # анти-спам / занятость пользователя
-from ..middlewares.busy import is_busy, set_busy, clear_busy, BUSY_TEXT
+from ..middlewares.busy import BUSY_TEXT, clear_busy, is_busy, set_busy
 
 from ..services import parser_adapter
 from ..services import validator  # валидация запроса
 from ..services.mini_analytics import register_context, render_mini_analytics
-from ..services.quota import check_and_consume
+from ..services.quota import FREE_PER_MONTH, check_and_consume
 from app import keyboards
 from app.utils.admins import is_admin
-
-log = logging.getLogger(__name__)
+from app.utils.logging import complete_operation, log_event, update_context
 
 # Кеш последнего «сомнительного» запроса: user_id -> (query, city, overrides)
 _WARN_CACHE: Dict[int, Tuple[str, str, dict]] = {}
@@ -45,11 +45,20 @@ async def _ensure_quota(
     full_name = getattr(person, "full_name", None) if person else None
 
     decision = check_and_consume(uid, username, full_name)
+    quota_info = {
+        "free_limit": FREE_PER_MONTH,
+        "free_used": max(0, FREE_PER_MONTH - decision.free_left),
+        "credits": decision.credits,
+        "unlimited": decision.mode == "unlimited",
+    }
+    credits_delta = -1 if decision.mode == "paid" else 0
+    update_context(quota=quota_info, credits_delta=credits_delta)
     if not decision.allowed:
         await message.answer(
             decision.message or "Лимит исчерпан — попробуйте позже 🙏",
             reply_markup=_main_menu_kb(message, user=user),
         )
+        complete_operation(ok=False, err="quota_exceeded")
         return False
 
     if decision.mode == "paid":
@@ -118,6 +127,37 @@ def _ensure_str_list(values) -> list[str]:
     return result
 
 
+def _build_args(
+    title: str | None,
+    city: str | None,
+    overrides: dict | None = None,
+    *,
+    qty: int | None = None,
+) -> dict[str, object]:
+    args: dict[str, object] = {}
+    if title:
+        args["title"] = title
+    if city:
+        args["city"] = city
+    if qty is not None:
+        args["qty"] = qty
+    overrides = overrides or {}
+    for key in ("include", "exclude"):
+        if key in overrides:
+            args[key] = _ensure_str_list(overrides[key])
+    for key in ("pages", "per_page", "pause", "site", "area"):
+        if key in overrides:
+            args[key] = overrides[key]
+    return args
+
+
+def _dialog_step(step: str, value: str | None = None) -> dict[str, str]:
+    preview = (value or "").strip()
+    if len(preview) > 60:
+        preview = preview[:57] + "…"
+    return {"step": step, "value": preview}
+
+
 def _resolve_requester_id(message: types.Message, uid: int | None = None) -> int:
     if uid is not None:
         return uid
@@ -132,6 +172,48 @@ def _main_menu_kb(message: types.Message, *, user: types.User | None = None):
     person = user or getattr(message, "from_user", None)
     user_id = getattr(person, "id", None)
     return keyboards.main_kb(is_admin=is_admin(user_id))
+
+
+def _log_parse_start(title: str, city: str, overrides: dict | None = None, *, approx_total: int | None = None) -> None:
+    args = _build_args(title, city, overrides, qty=approx_total)
+    update_context(args=args)
+    details = [f"title='{title}'", f"city='{city}'"]
+    if approx_total is not None:
+        details.append(f"qty={approx_total}")
+    if overrides and overrides.get("site"):
+        details.append(f"site={overrides['site']}")
+    log_event("parse_start", message="parse_start " + " ".join(details), args=args)
+
+
+def _log_parse_ready(title: str, city: str, overrides: dict | None = None, *, approx_total: int | None = None) -> None:
+    args = _build_args(title, city, overrides, qty=approx_total)
+    update_context(args=args)
+    log_event("parse_ready", message=f"parse_ready title='{title}' city='{city}'", args=args)
+
+
+def _log_preview_start(title: str, city: str, overrides: dict | None = None) -> None:
+    args = _build_args(title, city, overrides)
+    log_event("preview_start", message=f"preview_start title='{title}' city='{city}'", args=args)
+
+
+def _log_preview_ready(title: str, city: str, rows: int, overrides: dict | None = None) -> None:
+    args = _build_args(title, city, overrides)
+    log_event(
+        "preview_ready",
+        message=f"preview_ready rows={rows} title='{title}' city='{city}'",
+        args=args,
+    )
+
+
+def _log_preview_timeout(title: str, city: str, overrides: dict | None = None, err: str | None = None) -> None:
+    args = _build_args(title, city, overrides)
+    log_event(
+        "preview_timeout",
+        level="WARN",
+        message=f"preview_timeout title='{title}' city='{city}'",
+        args=args,
+        err=err,
+    )
 
 
 async def _send_report_with_analytics(
@@ -175,6 +257,7 @@ async def _run_parser_bypass_validation(
         if not await _ensure_quota(message, uid, user=user):
             return
         await message.answer("Окей, запускаю поиск. Это может занять 1–2 минуты…")
+        _log_parse_start(query, city, overrides)
         path = await parser_adapter.run_report(
             uid,
             query,
@@ -183,14 +266,17 @@ async def _run_parser_bypass_validation(
             **overrides,
         )
     except Exception as e:  # pragma: no cover
-        logging.exception("parser failed")
+        event = "parse_timeout" if isinstance(e, asyncio.TimeoutError) else "parse_error"
         err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
+        log_event(event, level="ERROR", err=err_text)
         await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
+        complete_operation(ok=False, err=err_text)
         return
     finally:
         clear_busy(uid)
 
     if path.exists():
+        _log_parse_ready(query, city, overrides)
         await _send_report_with_analytics(
             message,
             path,
@@ -202,6 +288,8 @@ async def _run_parser_bypass_validation(
         )
     else:
         await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
+        log_event("parse_error", level="ERROR", err="report_missing")
+        complete_operation(ok=False, err="report_missing")
 
 
 async def _run_with_amount(
@@ -243,6 +331,7 @@ async def _run_with_amount(
     await message.answer(
         f"Окей, выгружаю ~{min(total, per_page*pages)} вакансий… это может занять несколько минут."
     )
+    _log_parse_start(title, city, ov, approx_total=total)
     try:
         path = await parser_adapter.run_report(
             uid,
@@ -253,14 +342,17 @@ async def _run_with_amount(
             **ov,
         )
     except Exception as e:
-        logging.exception("parser failed")
         err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
+        event = "parse_timeout" if isinstance(e, asyncio.TimeoutError) else "parse_error"
+        log_event(event, level="ERROR", err=err_text)
         await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
+        complete_operation(ok=False, err=err_text)
         return
     finally:
         clear_busy(uid)
 
     if path.exists():
+        _log_parse_ready(title, city, ov, approx_total=total)
         await _send_report_with_analytics(
             message,
             path,
@@ -273,6 +365,8 @@ async def _run_with_amount(
         )
     else:
         await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
+        log_event("parse_error", level="ERROR", err="report_missing")
+        complete_operation(ok=False, err="report_missing")
 
 
 # ---------- core ----------
@@ -285,6 +379,15 @@ async def _run_parser(
     uid: int | None = None,
     user: types.User | None = None,
 ):
+    args_payload = _build_args(query, city, overrides)
+    update_context(command="/parse", args=args_payload)
+    log_event(
+        "request_parsed",
+        message=f"/parse {query}; {city}",
+        command="/parse",
+        args=args_payload,
+    )
+
     # если пользователь занят — мягко отшьём сразу
     requester_id = _resolve_requester_id(message, uid)
     if is_busy(requester_id):
@@ -300,6 +403,7 @@ async def _run_parser(
             InlineKeyboardButton("✏️ Исправить запрос", callback_data="parse_fix"),
         )
         _WARN_CACHE[requester_id] = (query, city, overrides)
+        log_event("validation_warning", level="WARN", message=bad_msg, args=args_payload)
         await message.answer(
             bad_msg
             + "\n\nЕсли ты уверен(а) — могу всё равно запустить поиск. "
@@ -307,6 +411,7 @@ async def _run_parser(
             reply_markup=kb,
         )
         await ParseForm.waiting_query.set()
+        complete_operation(ok=False, err="validation_warning")
         return
 
     # 2) Если юзер сам задал pages/per_page — запускаем без шага объёма (и блокируем пользователя)
@@ -320,6 +425,7 @@ async def _run_parser(
             await message.answer("Собираю вакансии, это может занять несколько минут…")
             if "area" not in overrides:
                 overrides["area"] = area_id
+            _log_parse_start(norm_title, city, overrides)
             path = await parser_adapter.run_report(
                 requester_id,
                 norm_title,
@@ -328,14 +434,17 @@ async def _run_parser(
                 **overrides,
             )
         except Exception as e:
-            logging.exception("parser failed")
             err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
+            event = "parse_timeout" if isinstance(e, asyncio.TimeoutError) else "parse_error"
+            log_event(event, level="ERROR", err=err_text)
             await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
+            complete_operation(ok=False, err=err_text)
             return
         finally:
             clear_busy(requester_id)
 
         if path.exists():
+            _log_parse_ready(norm_title, city, overrides)
             await _send_report_with_analytics(
                 message,
                 path,
@@ -347,6 +456,8 @@ async def _run_parser(
             )
         else:
             await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
+            log_event("parse_error", level="ERROR", err="report_missing")
+            complete_operation(ok=False, err="report_missing")
         return
 
     # 3) Шаг выбора объёма (число найденных НЕ показываем)
@@ -363,6 +474,7 @@ async def _run_parser(
     kb.row(InlineKeyboardButton("👀 Превью (5)", callback_data="preview:5"))
 
     _PENDING_QTY[requester_id] = (norm_title, city, area_id, overrides, max_total)
+    update_context(dialog_step=_dialog_step("choose_qty", str(max_total)))
     await message.answer("Выбери объём выгрузки:", reply_markup=kb)
 
 
@@ -376,7 +488,14 @@ async def cmd_parse(message: types.Message, state: FSMContext):
     if args:
         raw_parts = [p.strip() for p in args.split(";") if p.strip()]
         if len(raw_parts) < 2:
+            log_event(
+                "validation_warning",
+                level="WARN",
+                message="parse command missing city",
+                command="/parse",
+            )
             await message.reply("Используй формат: /parse должность; город; pages=1")
+            complete_operation(ok=False, err="invalid_arguments")
             return
         query, city, *rest = raw_parts
         overrides: dict[str, object] = {}
@@ -385,10 +504,19 @@ async def cmd_parse(message: types.Message, state: FSMContext):
                 overrides = _parse_overrides(rest)
             except ValueError as exc:
                 await message.reply(str(exc))
+                log_event(
+                    "validation_warning",
+                    level="WARN",
+                    message=str(exc),
+                    command="/parse",
+                )
+                complete_operation(ok=False, err=str(exc))
                 return
         await _run_parser(message, query, city, overrides)
         return
 
+    update_context(command="parse_dialog")
+    log_event("request_parsed", message="parse dialog start", command="parse_dialog")
     await message.answer("Введите должность:", reply_markup=ReplyKeyboardRemove())
     await ParseForm.waiting_query.set()
 
@@ -397,7 +525,9 @@ async def process_query(message: types.Message, state: FSMContext):
     if is_busy(message.from_user.id):
         await message.answer(BUSY_TEXT)
         return
-    await state.update_data(query=message.text.strip())
+    text = (message.text or "").strip()
+    update_context(dialog_step=_dialog_step("query", text))
+    await state.update_data(query=text)
     await message.answer("Город?")
     await ParseForm.waiting_city.set()
 
@@ -408,7 +538,8 @@ async def process_city(message: types.Message, state: FSMContext):
         return
     data = await state.get_data()
     query = data.get("query")
-    city = message.text.strip()
+    city = (message.text or "").strip()
+    update_context(dialog_step=_dialog_step("city", city))
     kb = InlineKeyboardMarkup().row(
         InlineKeyboardButton("➕ Добавить ключевые", callback_data="kw_yes"),
         InlineKeyboardButton("Пропустить", callback_data="kw_no"),
@@ -423,6 +554,7 @@ async def cb_kw_yes(call: types.CallbackQuery, state: FSMContext):
         await call.answer(BUSY_TEXT, show_alert=False)
         return
     await call.answer()
+    update_context(dialog_step=_dialog_step("kw_prompt", "include"))
     await call.message.answer(
         "Введи слова, которые ДОЛЖНЫ встречаться (через запятую). Пример: электроника, b2b, pcb.\n"
         "Если не нужно — пришли пусто или «-».",
@@ -436,6 +568,7 @@ async def cb_kw_no(call: types.CallbackQuery, state: FSMContext):
         await call.answer(BUSY_TEXT, show_alert=False)
         return
     await call.answer()
+    update_context(dialog_step=_dialog_step("kw_skip", ""))
     data = await state.get_data()
     query = data.get("query")
     city = data.get("city")
@@ -456,6 +589,7 @@ async def process_kw_include(message: types.Message, state: FSMContext):
         return
     txt = (message.text or "").strip()
     include = [] if txt in {"", "-"} else _split_kw(txt)
+    update_context(dialog_step=_dialog_step("kw_include", ", ".join(include)))
     await state.update_data(include=include)
     await message.answer(
         "Теперь слова, которые НУЖНО исключить (через запятую). Пример: стажёр, помощник.\n"
@@ -470,6 +604,7 @@ async def process_kw_exclude(message: types.Message, state: FSMContext):
         return
     txt = (message.text or "").strip()
     exclude = [] if txt in {"", "-"} else _split_kw(txt)
+    update_context(dialog_step=_dialog_step("kw_exclude", ", ".join(exclude)))
     data = await state.get_data()
     query = data.get("query")
     city = data.get("city")
@@ -490,6 +625,7 @@ async def cb_parse_force(call: types.CallbackQuery, state: FSMContext):
         await ParseForm.waiting_query.set()
         return
     query, city, overrides = payload
+    update_context(dialog_step=_dialog_step("force_parse", f"{query}; {city}"))
     try:
         await state.finish()
     except Exception:
@@ -510,6 +646,7 @@ async def cb_parse_fix(call: types.CallbackQuery):
         return
     _WARN_CACHE.pop(call.from_user.id, None)
     await call.answer()
+    update_context(dialog_step=_dialog_step("fix_query", ""))
     await call.message.answer("Окей! Введи должность ещё раз:", reply_markup=ReplyKeyboardRemove())
     await ParseForm.waiting_query.set()
 
@@ -538,6 +675,7 @@ async def cb_qty(call: types.CallbackQuery):
 
     # фикс: после старта выгрузки «забываем» pending, чтобы старые кнопки не плодили ошибки
     _PENDING_QTY.pop(call.from_user.id, None)
+    update_context(dialog_step=_dialog_step("qty", str(total)))
     await _run_with_amount(
         call.message,
         title,
@@ -565,6 +703,7 @@ async def cb_preview(call: types.CallbackQuery):
     include = (overrides or {}).get("include") or []
     exclude = (overrides or {}).get("exclude") or []
 
+    _log_preview_start(title, city, overrides)
     try:
         rows = await parser_adapter.preview_rows(
             uid,
@@ -574,13 +713,18 @@ async def cb_preview(call: types.CallbackQuery):
             include=include,
             exclude=exclude,
         )
-    except Exception:
-        logging.exception("preview failed")
+    except asyncio.TimeoutError as exc:
+        _log_preview_timeout(title, city, overrides, err=str(exc))
+        await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
+        return
+    except Exception as exc:
+        _log_preview_timeout(title, city, overrides, err=str(exc))
         await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
         return
 
     if not rows:
         await call.message.answer("Совпадений не нашлось по текущим критериям.")
+        _log_preview_ready(title, city, 0, overrides)
         return
 
     # аккуратный текст превью
@@ -597,6 +741,7 @@ async def cb_preview(call: types.CallbackQuery):
 
     txt = "<b>Предпросмотр (первые совпадения):</b>\n" + "\n".join(lines)
     await call.message.answer(txt, disable_web_page_preview=True)
+    _log_preview_ready(title, city, len(rows), overrides)
 
 
 def register(dp: Dispatcher):
