@@ -2,7 +2,17 @@
 import time, argparse, pandas as pd, re, urllib.parse, html
 from typing import List, Dict, Any, Tuple, Optional
 
-from ..constants import DEFAULT_HH_SEARCH_FIELD
+try:  # pragma: no cover - import shim for script execution
+    from ..constants import DEFAULT_HH_SEARCH_FIELD
+except ImportError:  # noqa: F401 - fallback for running as standalone script
+    import importlib
+    import sys
+    from pathlib import Path
+
+    current_dir = Path(__file__).resolve().parent.parent
+    if str(current_dir) not in sys.path:
+        sys.path.insert(0, str(current_dir))
+    DEFAULT_HH_SEARCH_FIELD = importlib.import_module("constants").DEFAULT_HH_SEARCH_FIELD
 
 try:  # pragma: no cover - зависимость должна ставиться вместе с ботом
     import requests
