@@ -1,10 +1,14 @@
 from __future__ import annotations
+
 import os
-from aiogram import types, Dispatcher
-from aiogram.types import InputFile  # <- для баннера
-from app import keyboards
+
+from aiogram import Dispatcher, types
 from aiogram.dispatcher import FSMContext
+from aiogram.types import InputFile  # <- для баннера
+
+from app import keyboards
 from app.utils.admins import is_admin
+from app.utils.logging import log_event, update_context
 
 
 # Админы и лимиты
@@ -16,6 +20,8 @@ BANNER_PATH = os.getenv("START_BANNER_PATH", "assets/start_banner_1x1.png")
 
 # ---------- /start ----------
 async def cmd_start(message: types.Message, state: FSMContext):
+    update_context(command="/start")
+    log_event("request_parsed", message="/start", command="/start")
     try:
         await state.finish()
     except Exception:
@@ -54,6 +60,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 # ---------- /help ----------
 async def cmd_help(message: types.Message):
+    update_context(command="/help")
+    log_event("request_parsed", message="/help", command="/help")
     text = (
         "<b>Памятка</b>\n\n"
         "<b>Как искать</b>\n"
@@ -79,6 +87,8 @@ async def cmd_help(message: types.Message):
 
 # ---------- /advanced (необязательно) ----------
 async def cmd_advanced(message: types.Message):
+    update_context(command="/advanced")
+    log_event("request_parsed", message="/advanced", command="/advanced")
     text = (
         "<b>Расширенные настройки</b> (нужны редко):\n\n"
         "Эти параметры можно дописать после города через точку с запятой.\n"
@@ -95,11 +105,15 @@ async def cmd_advanced(message: types.Message):
 
 # -------- показать меню по слову «Меню» --------
 async def show_menu(message: types.Message):
+    update_context(command="show_menu")
+    log_event("request_parsed", message="show_menu", command="show_menu")
     kb = keyboards.main_kb(is_admin=is_admin(message.from_user.id))
     await message.reply("Меню 👇", reply_markup=kb)
 
 # опционально /cancel — сбросить текущий диалог
 async def cmd_cancel(message: types.Message, state: FSMContext):
+    update_context(command="/cancel")
+    log_event("request_parsed", message="/cancel", command="/cancel")
     await state.finish()
     kb = keyboards.main_kb(is_admin=is_admin(message.from_user.id))
     await message.reply("Окей, сбросил диалог. Нажми кнопки ниже или /start.", reply_markup=kb)

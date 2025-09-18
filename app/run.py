@@ -1,79 +1,108 @@
-import os
+from __future__ import annotations
+
 import asyncio
-import logging
+import os
 
 import aiogram
 import aiohttp
 import uvicorn
-from aiogram import Bot, Dispatcher, executor
+from aiogram import Dispatcher, executor
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from .middlewares.busy import BusyMiddleware
 
+from . import webhook
 from .config import settings
 from .handlers import (
-    start,
-    status,
+    admin as h_admin,
     parse,
     payments as h_payments,
-    admin as h_admin,
+    start,
+    status,
 )
-from . import webhook
+from .middlewares.busy import BusyMiddleware
+from .middlewares.operation_logger import OperationLoggerMiddleware
 from .storage.db import init_db
-
-bot = Bot(token=settings.TELEGRAM_BOT_TOKEN, parse_mode="HTML")
-dp = Dispatcher(bot, storage=MemoryStorage())
-
-dp.middleware.setup(BusyMiddleware())  # ← ВАЖНО: глобальная блокировка
-
-# ---------- логирование ----------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
-
-# ---------- инициализация бота / диспетчера ----------
-bot = Bot(token=settings.TELEGRAM_BOT_TOKEN, parse_mode="HTML")
-dp = Dispatcher(bot, storage=MemoryStorage())
-
-# ---------- регистрация хендлеров (после создания dp!) ----------
-start.register(dp)
-status.register(dp)
-parse.register(dp)
-h_payments.register(dp)   # /buy + callback'и оплаты
-h_admin.register(dp)      # /admin, /addcredits, /grant_unlim, /astats
+from .utils.logging import (
+    build_audit_summary,
+    complete_operation,
+    log_event,
+    set_audit_sink,
+    setup_logging,
+)
+from .utils.telegram_logging import LoggedBot
 
 
-def main():
-    # создать БД/таблицы при старте
+def create_dispatcher() -> Dispatcher:
+    setup_logging()
+
+    bot = LoggedBot(token=settings.TELEGRAM_BOT_TOKEN, parse_mode="HTML")
+    dp = Dispatcher(bot, storage=MemoryStorage())
+
+    dp.middleware.setup(OperationLoggerMiddleware())
+    dp.middleware.setup(BusyMiddleware())
+
+    audit_chat_id = os.getenv("LOG_TO_AUDIT_CHAT_ID")
+    if audit_chat_id:
+        async def _send_audit(payload: dict) -> None:
+            text = build_audit_summary(payload)
+            try:
+                await bot.send_message(int(audit_chat_id), text)
+            except Exception as exc:  # pragma: no cover - audit is best effort
+                log_event("audit_delivery_failed", level="WARN", err=str(exc))
+
+        set_audit_sink(_send_audit)
+
+    start.register(dp)
+    status.register(dp)
+    parse.register(dp)
+    h_payments.register(dp)
+    h_admin.register(dp)
+
+    async def _error_handler(update, error):  # noqa: ANN001
+        log_event("exception", level="ERROR", err=str(error))
+        complete_operation(ok=False, err=str(error))
+        return True
+
+    dp.register_errors_handler(_error_handler)
+
+    return dp
+
+
+dp = create_dispatcher()
+bot = dp.bot
+
+
+def main() -> None:
     init_db()
 
-    log.info(
-        "Starting bot in %s mode (aiogram=%s, aiohttp=%s)",
-        settings.MODE,
-        aiogram.__version__,
-        aiohttp.__version__,
+    log_event(
+        "bot_start",
+        message=(
+            f"Starting bot in {settings.MODE} mode "
+            f"(aiogram={aiogram.__version__}, aiohttp={aiohttp.__version__})"
+        ),
     )
 
     if settings.MODE == "polling":
-        # локально / на Replit: long-polling
         executor.start_polling(dp, skip_updates=True)
-    else:
-        # вебхук-режим (если используешь)
-        webhook.set_dispatcher(dp)
+        return
 
-        async def _run():
-            try:
-                await webhook.setup_webhook(bot)
-                config = uvicorn.Config(
-                    webhook.app,
-                    host=settings.WEBAPP_HOST,
-                    port=settings.WEBAPP_PORT,
-                    log_level="info",
-                )
-                server = uvicorn.Server(config)
-                await server.serve()
-            finally:
-                await webhook.remove_webhook(bot)
+    webhook.set_dispatcher(dp)
 
-        asyncio.run(_run())
+    async def _run() -> None:
+        try:
+            await webhook.setup_webhook(bot)
+            config = uvicorn.Config(
+                webhook.app,
+                host=settings.WEBAPP_HOST,
+                port=settings.WEBAPP_PORT,
+                log_level="info",
+            )
+            server = uvicorn.Server(config)
+            await server.serve()
+        finally:
+            await webhook.remove_webhook(bot)
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

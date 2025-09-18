@@ -1,16 +1,30 @@
-from aiogram import types, Dispatcher
-import aiogram
 import os
+
+import aiogram
+from aiogram import Dispatcher, types
+
 from app.storage.repo import free_used_this_month, get_credits, is_unlimited_active
+from app.utils.logging import log_event, update_context
 
 FREE_PER_MONTH = int(os.getenv("FREE_PER_MONTH", "3"))
 
 async def cmd_status(message: types.Message):
+    update_context(command="/status")
+    log_event("request_parsed", message="/status", command="/status")
     uid = message.from_user.id
     free_used = free_used_this_month(uid)
     free_left = max(0, FREE_PER_MONTH - free_used)
     credits = get_credits(uid)
     active, until = is_unlimited_active(uid)
+
+    update_context(
+        quota={
+            "free_used": free_used,
+            "free_limit": FREE_PER_MONTH,
+            "credits": credits,
+            "unlimited": bool(active),
+        }
+    )
 
     lines = [
         "🧭 Статус:",
