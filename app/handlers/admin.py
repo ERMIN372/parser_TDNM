@@ -298,7 +298,18 @@ def register(dp: Dispatcher):
     dp.register_callback_query_handler(cb_cast_all,   lambda c: c.data == "admin_cast_all")
     dp.register_callback_query_handler(cb_cast_prompt,lambda c: c.data == "admin_cast_prompt")
     dp.register_callback_query_handler(cb_cast_user,  lambda c: c.data and c.data.startswith("admin_cast_user:"))
-    dp.register_message_handler(catch_reply_broadcast_all, content_types=types.ContentTypes.TEXT)
+    dp.register_message_handler(
+        catch_reply_broadcast_all,
+        lambda m: (
+            m.reply_to_message
+            and "текстом для рассылки всем пользователям"
+            in (
+                (m.reply_to_message.text or "")
+                + (m.reply_to_message.caption or "")
+            )
+        ),
+        content_types=types.ContentTypes.TEXT,
+    )
     dp.register_message_handler(catch_reply_cast_user,     content_types=types.ContentTypes.TEXT)
 
     # команда точечной рассылки
