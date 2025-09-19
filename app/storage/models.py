@@ -1,8 +1,15 @@
 from __future__ import annotations
 from datetime import datetime
 from peewee import (
-    Model, AutoField, BigIntegerField, CharField, DateTimeField,
-    ForeignKeyField, IntegerField, TextField
+    Model,
+    AutoField,
+    BigIntegerField,
+    BooleanField,
+    CharField,
+    DateTimeField,
+    ForeignKeyField,
+    IntegerField,
+    TextField,
 )
 from .db import db
 
@@ -41,3 +48,55 @@ class Payment(BaseModel):
     provider_payload = TextField(null=True)
     created_at = DateTimeField(default=datetime.utcnow)
     paid_at = DateTimeField(null=True)
+
+
+class ReferralStats(BaseModel):
+    id = AutoField()
+    user = ForeignKeyField(User, backref="referral_stats", unique=True, on_delete="CASCADE")
+    token = CharField(unique=True)
+    invited_count = IntegerField(default=0)
+    activated_count = IntegerField(default=0)
+    bonuses_earned = IntegerField(default=0)
+    last_invited_at = DateTimeField(null=True)
+    last_bonus_at = DateTimeField(null=True)
+
+
+class Referral(BaseModel):
+    id = AutoField()
+    inviter = ForeignKeyField(User, backref="referrals_sent", on_delete="CASCADE")
+    invitee = ForeignKeyField(User, backref="referral_source", unique=True, on_delete="CASCADE")
+    created_at = DateTimeField(default=datetime.utcnow)
+    expires_at = DateTimeField(null=True)
+    activated_at = DateTimeField(null=True)
+    status = CharField(default="pending")  # pending|activated|rejected
+    source = CharField(default="deep_link")
+    token = CharField(null=True)
+    rejection_reason = CharField(null=True)
+
+
+class PromoCode(BaseModel):
+    id = AutoField()
+    code = CharField(unique=True)
+    inviter = ForeignKeyField(User, backref="promo_codes", null=True, on_delete="SET NULL")
+    is_active = BooleanField(default=True)
+    expires_at = DateTimeField(null=True)
+    max_uses = IntegerField(null=True)
+    uses = IntegerField(default=0)
+
+
+class Ledger(BaseModel):
+    id = AutoField()
+    user = ForeignKeyField(User, backref="ledger", on_delete="CASCADE")
+    kind = CharField()  # credit|unlimited
+    delta = IntegerField()
+    reason = CharField()
+    related_referral = ForeignKeyField("Referral", null=True, on_delete="SET NULL")
+    ts = DateTimeField(default=datetime.utcnow)
+    balance_after = IntegerField(null=True)
+
+
+class ReferralBan(BaseModel):
+    id = AutoField()
+    user = ForeignKeyField(User, backref="referral_ban", unique=True, on_delete="CASCADE")
+    reason = CharField(null=True)
+    created_at = DateTimeField(default=datetime.utcnow)

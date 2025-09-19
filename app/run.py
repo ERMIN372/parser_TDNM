@@ -15,6 +15,7 @@ from .handlers import (
     admin as h_admin,
     parse,
     payments as h_payments,
+    referrals as h_referrals,
     start,
     status,
 )
@@ -55,6 +56,7 @@ def create_dispatcher() -> Dispatcher:
     status.register(dp)
     parse.register(dp)
     h_payments.register(dp)
+    h_referrals.register(dp)
     h_admin.register(dp)
 
     async def _error_handler(update, error):  # noqa: ANN001

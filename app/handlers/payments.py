@@ -4,6 +4,7 @@ from aiogram import Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.services import payments
+from app.services import referrals
 from app.utils.logging import complete_operation, log_event, update_context
 
 
@@ -52,12 +53,14 @@ async def cb_check(call: types.CallbackQuery):
     update_context(command="pay_check", args={"payment_id": pid})
     log_event("request_parsed", message=f"pay_check {pid}", command="pay_check", args={"payment_id": pid})
     try:
-        msg = payments.check_and_apply(call.from_user.id, pid)
+        msg, activation = payments.check_and_apply(call.from_user.id, pid)
     except Exception as exc:
         log_event("payment_failed", level="ERROR", err=str(exc), message="payment check failed")
-        msg = "Не удалось проверить оплату. Попробуйте позже."
+        msg, activation = "Не удалось проверить оплату. Попробуйте позже.", None
         complete_operation(ok=False, err="payment_check_failed")
     await call.message.reply(msg)
+    if activation:
+        await _notify_referral_activation(call.bot, activation, call.from_user)
     await call.answer()
 
 
@@ -69,12 +72,44 @@ async def start_with_payload(message: types.Message):
     update_context(command="start_payload", args={"payment_id": pid})
     log_event("request_parsed", message=f"/start payload {pid}", command="/start", args={"payment_id": pid})
     try:
-        msg = payments.check_and_apply(message.from_user.id, pid)
+        msg, activation = payments.check_and_apply(message.from_user.id, pid)
     except Exception as exc:
         log_event("payment_failed", level="ERROR", err=str(exc), message="payment check failed")
-        msg = "Не удалось проверить оплату. Попробуйте позже."
+        msg, activation = "Не удалось проверить оплату. Попробуйте позже.", None
         complete_operation(ok=False, err="payment_check_failed")
     await message.reply(msg)
+    if activation:
+        await _notify_referral_activation(message.bot, activation, message.from_user)
+
+
+async def _notify_referral_activation(bot, activation: referrals.ActivationResult, invitee: types.User | None) -> None:
+    if not activation.inviter_id:
+        return
+    mention = _format_user_mention(invitee)
+    if activation.granted and activation.bonus:
+        text = f"🔥 Реферал {mention} активирован — +{activation.bonus} кредит начислен!"
+    else:
+        text = f"Реферал {mention} активировал триггер, но бонус не начислен (достигнут лимит)."
+
+    try:
+        await bot.send_message(activation.inviter_id, text)
+    except Exception as exc:  # pragma: no cover
+        log_event(
+            "referral_notify_failed",
+            level="WARN",
+            inviter_id=activation.inviter_id,
+            err=str(exc),
+        )
+
+
+def _format_user_mention(user: types.User | None) -> str:
+    if not user:
+        return "приглашённый"
+    if user.username:
+        return f"@{user.username}"
+    if user.full_name:
+        return user.full_name
+    return str(getattr(user, "id", "приглашённый"))
 
 
 def register(dp: Dispatcher):

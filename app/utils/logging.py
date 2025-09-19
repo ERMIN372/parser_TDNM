@@ -64,6 +64,7 @@ class OperationContext:
     quota: Dict[str, Any] | None = None
     credits_delta: int | None = None
     payment: Dict[str, Any] | None = None
+    referral: Dict[str, Any] | None = None
     ok: bool | None = None
     err: str | None = None
 
@@ -86,6 +87,7 @@ class OperationContext:
             "quota",
             "credits_delta",
             "payment",
+            "referral",
             "ok",
             "err",
         ):

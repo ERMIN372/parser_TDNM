@@ -18,9 +18,21 @@ class Settings:
     PARSER_GORODRABOT_BASE: str | None = None
     HTTP_PROXY: str | None = None
     REQUEST_TIMEOUT: int | None = None
+    REF_ENABLED: bool = True
+    REF_BONUS_INVITEE: int = 0
+    REF_BONUS_INVITER: int = 0
+    REF_ATTRIBUTION_TTL_HOURS: int = 48
+    REF_MAX_BONUS_PER_DAY: int = 5
+    REF_MAX_BONUS_TOTAL: int = 100
+    REF_PROMO_TTL_HOURS: int = 48
 
 
 def _load() -> Settings:
+    def _bool(value: str | None, default: bool = False) -> bool:
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
     cfg = Settings(
         TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         MODE=os.getenv("MODE", "polling"),
@@ -33,6 +45,13 @@ def _load() -> Settings:
         PARSER_GORODRABOT_BASE=os.getenv("PARSER_GORODRABOT_BASE"),
         HTTP_PROXY=os.getenv("HTTP_PROXY"),
         REQUEST_TIMEOUT=int(os.getenv("REQUEST_TIMEOUT", "20")),
+        REF_ENABLED=_bool(os.getenv("REF_ENABLED"), True),
+        REF_BONUS_INVITEE=int(os.getenv("REF_BONUS_INVITEE", "1")),
+        REF_BONUS_INVITER=int(os.getenv("REF_BONUS_INVITER", "1")),
+        REF_ATTRIBUTION_TTL_HOURS=int(os.getenv("REF_ATTRIBUTION_TTL_HOURS", "48")),
+        REF_MAX_BONUS_PER_DAY=int(os.getenv("REF_MAX_BONUS_PER_DAY", "5")),
+        REF_MAX_BONUS_TOTAL=int(os.getenv("REF_MAX_BONUS_TOTAL", "100")),
+        REF_PROMO_TTL_HOURS=int(os.getenv("REF_PROMO_TTL_HOURS", "48")),
     )
     if cfg.MODE not in {"polling", "webhook"}:
         raise ValueError("MODE must be 'polling' or 'webhook'")
