@@ -141,14 +141,27 @@ def pack_price_text(pack_id: str) -> str:
     return f"₽{_format_rub(price_cop)}"
 
 
+def _pack_callback_data(pack_id: str) -> str | None:
+    if pack_id == "unlim30":
+        return "buy:unlim:30"
+    mapping = {
+        "p1": "buy:pack:1",
+        "p3": "buy:pack:3",
+        "p9": "buy:pack:9",
+    }
+    return mapping.get(pack_id)
+
+
 def paywall_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        InlineKeyboardButton("Купить 1", callback_data="buy:pack:1"),
-        InlineKeyboardButton("Купить 3", callback_data="buy:pack:3"),
-        InlineKeyboardButton("Купить 9", callback_data="buy:pack:9"),
-        InlineKeyboardButton("Безлимит на 30 дней", callback_data="buy:unlim:30"),
-    )
+    for pack_id in payments.PACK_ORDER:
+        callback_data = _pack_callback_data(pack_id)
+        if not callback_data:
+            continue
+        title = payments.TITLES.get(pack_id, pack_id)
+        price_text = pack_price_text(pack_id)
+        button_text = f"{title} — {price_text}" if price_text else title
+        kb.add(InlineKeyboardButton(button_text, callback_data=callback_data))
     kb.row(InlineKeyboardButton("Тарифы", callback_data="buy:info"))
     kb.row(InlineKeyboardButton("Назад в меню", callback_data="buy:back"))
     return kb
