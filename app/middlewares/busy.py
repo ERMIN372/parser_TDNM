@@ -9,7 +9,7 @@ from aiogram.dispatcher.middlewares import BaseMiddleware
 from app.utils.logging import log_event
 
 # Текст уведомления
-BUSY_TEXT = "⏳ Уже выполняю твой запрос — дождись, пожалуйста."
+BUSY_TEXT = "🧑‍🍳 Уже выполняю твой запрос — дождись, пожалуйста."
 
 # Глобальный реестр «занятых» пользователей
 BUSY_USERS: Set[int] = set()
@@ -56,7 +56,7 @@ class BusyMiddleware(BaseMiddleware):
             return
         if is_busy(uid):
             # короткий ответ без алерта, чтобы не мешать UX
-            await call.answer("⏳ Обрабатываю предыдущий запрос…", show_alert=False)
+            await call.answer(BUSY_TEXT, show_alert=False)
             log_event(
                 "busy_reject",
                 message="User is busy (callback)",
