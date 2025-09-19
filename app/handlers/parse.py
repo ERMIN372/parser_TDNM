@@ -628,7 +628,7 @@ async def cb_chip(call: types.CallbackQuery, state: FSMContext):
         return
 
     if is_busy(call.from_user.id):
-        await call.answer("⌛ Выполняю запрос…", show_alert=False)
+        await call.answer(BUSY_TEXT, show_alert=False)
         return
 
     token = payload.get("token")
@@ -644,12 +644,53 @@ async def cb_chip(call: types.CallbackQuery, state: FSMContext):
 
     action = payload.get("action")
     if action == "more":
-        markup = chips.advance_page(session)
+        markup = chips.change_page(session, 1)
         try:
             await call.message.edit_reply_markup(markup)
         except (MessageCantBeEdited, MessageNotModified):
             pass
         chips.log_click(session.kind, "more", "control", position=None, action="more")
+        await call.answer()
+        return
+
+    if action == "prev":
+        markup = chips.change_page(session, -1)
+        try:
+            await call.message.edit_reply_markup(markup)
+        except (MessageCantBeEdited, MessageNotModified):
+            pass
+        chips.log_click(session.kind, "prev", "control", position=None, action="prev")
+        await call.answer()
+        return
+
+    if action == "category":
+        try:
+            category_index = int(payload.get("value", "-1"))
+        except ValueError:
+            await call.answer("Эта клавиатура устарела. Начните заново.", show_alert=False)
+            return
+        markup = chips.show_category(session, category_index)
+        try:
+            await call.message.edit_reply_markup(markup)
+        except (MessageCantBeEdited, MessageNotModified):
+            pass
+        chips.log_click(
+            session.kind,
+            "category",
+            "control",
+            position=category_index + 1 if category_index >= 0 else None,
+            action="category",
+        )
+        await call.answer()
+        return
+
+    if action == "back":
+        markup = chips.back_to_categories(session)
+        try:
+            await call.message.edit_reply_markup(markup)
+        except (MessageCantBeEdited, MessageNotModified):
+            pass
+        chips.log_click(session.kind, "back", "control", position=None, action="back")
         await call.answer()
         return
 
@@ -667,8 +708,7 @@ async def cb_chip(call: types.CallbackQuery, state: FSMContext):
             await call.message.edit_reply_markup()
         except (MessageCantBeEdited, MessageNotModified):
             pass
-        await call.answer()
-        await call.message.answer(f"✅ Должность: {value}")
+        await call.answer(f"Выбрано: {value}")
         await _handle_role_value(call.message, state, value, user_id=call.from_user.id)
         return
 
@@ -693,13 +733,11 @@ async def cb_chip(call: types.CallbackQuery, state: FSMContext):
         await call.message.edit_reply_markup()
     except (MessageCantBeEdited, MessageNotModified):
         pass
-    await call.answer()
+    await call.answer(f"Выбрано: {candidate.value}")
 
     if session.kind == "role":
-        await call.message.answer(f"✅ Должность: {candidate.value}")
         await _handle_role_value(call.message, state, candidate.value, user_id=call.from_user.id)
     else:
-        await call.message.answer(f"✅ Город: {candidate.value}")
         await _handle_city_value(call.message, state, candidate.value, user_id=call.from_user.id)
 
 
