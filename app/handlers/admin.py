@@ -10,6 +10,7 @@ from pathlib import Path
 
 from app.storage import repo
 from app.storage.models import User
+from app.services import referrals as referral_service
 from app.utils.backup import make_sqlite_backup
 from app.utils.admins import is_admin
 
@@ -25,6 +26,7 @@ def _kb_admin_home() -> InlineKeyboardMarkup:
         InlineKeyboardButton("👥 Пользователи", callback_data="admin_users:1"),
         InlineKeyboardButton("📣 Рассылка", callback_data="admin_cast"),
     )
+    kb.add(InlineKeyboardButton("🎯 Рефералы", callback_data="admin_ref"))
     kb.add(InlineKeyboardButton("💾 Бэкап БД", callback_data="admin_backup"))
     return kb
 
@@ -122,6 +124,116 @@ async def cb_user(call: types.CallbackQuery):
         await call.answer("Пользователь не найден", show_alert=True); return
     await _safe_edit_text(call.message, _user_card_text(u), reply_markup=_kb_user(u), parse_mode="HTML")
     await call.answer()
+
+
+def _render_referral_summary() -> tuple[str, InlineKeyboardMarkup]:
+    data = referral_service.admin_summary()
+    summary = data["summary"]
+    lines = [
+        "🎯 <b>Реферальная программа</b>",
+        f"Приглашено: {summary['invited']}",
+        f"Активировано: {summary['activated']}",
+        f"Отклонено: {summary['rejected']}",
+        f"Выдано бонусов: {summary['bonuses']}",
+        "",
+    ]
+    top = data["top"]
+    if top:
+        lines.append("Топ-10 по активациям:")
+        for stats in top:
+            u = repo.get_user(stats.user_id)
+            name = f"@{u.username}" if u and u.username else str(stats.user_id)
+            lines.append(
+                f"• {name}: приглашено {stats.invited_count}, активировано {stats.activated_count}, бонусы {stats.bonuses_earned}"
+            )
+        lines.append("")
+    pending = data["pending"]
+    kb = InlineKeyboardMarkup(row_width=1)
+    if pending:
+        lines.append("Ожидают активации:")
+        for ref in pending[:10]:
+            invitee = repo.get_user(ref.invitee_id)
+            invitee_name = f"@{invitee.username}" if invitee and invitee.username else str(ref.invitee_id)
+            lines.append(f"• #{ref.id} — {invitee_name} (от {ref.created_at:%Y-%m-%d %H:%M})")
+            kb.add(InlineKeyboardButton(f"🔍 #{ref.id}", callback_data=f"admin_referral:{ref.id}"))
+        lines.append("")
+    kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="admin_ref"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="admin_home"))
+    return "\n".join(lines), kb
+
+
+async def cb_ref_summary(call: types.CallbackQuery):
+    if not _guard(call.from_user.id):
+        return
+    text, kb = _render_referral_summary()
+    await _safe_edit_text(call.message, text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+def _format_user(user: User | None) -> str:
+    if not user:
+        return "-"
+    if user.username:
+        return f"@{user.username} ({user.user_id})"
+    return f"{user.full_name or '-'} ({user.user_id})"
+
+
+def _kb_referral(referral_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Активировать", callback_data=f"admin_referral_activate:{referral_id}"),
+        InlineKeyboardButton("🚫 Отклонить", callback_data=f"admin_referral_reject:{referral_id}"),
+    )
+    kb.add(InlineKeyboardButton("⬅️ К списку", callback_data="admin_ref"))
+    return kb
+
+
+async def cb_referral_card(call: types.CallbackQuery):
+    if not _guard(call.from_user.id):
+        return
+    _, rid = call.data.split(":")
+    rid_int = int(rid)
+    details = referral_service.admin_referral_details(rid_int)
+    if not details:
+        await call.answer("Реферал не найден", show_alert=True)
+        return
+    inviter = _format_user(details["inviter"])
+    invitee = _format_user(details["invitee"])
+    text = (
+        "🔍 <b>Реферал</b>\n"
+        f"ID: <code>{details['id']}</code>\n"
+        f"Пригласивший: {inviter}\n"
+        f"Приглашённый: {invitee}\n"
+        f"Статус: {details['status']}\n"
+        f"Создан: {details['created_at']:%Y-%m-%d %H:%M} UTC\n"
+    )
+    if details.get("activated_at"):
+        text += f"Активирован: {details['activated_at']:%Y-%m-%d %H:%M} UTC\n"
+    if details.get("reason"):
+        text += f"Причина: {details['reason']}\n"
+    text += f"Источник: {details['source']}\n"
+    await _safe_edit_text(call.message, text, reply_markup=_kb_referral(rid_int), parse_mode="HTML")
+    await call.answer()
+
+
+async def cb_referral_activate(call: types.CallbackQuery):
+    if not _guard(call.from_user.id):
+        return
+    _, rid = call.data.split(":")
+    ok, msg = referral_service.admin_activate_referral(int(rid))
+    await call.answer(msg, show_alert=not ok)
+    if ok:
+        await cb_referral_card(call)
+
+
+async def cb_referral_reject(call: types.CallbackQuery):
+    if not _guard(call.from_user.id):
+        return
+    _, rid = call.data.split(":")
+    ok, msg = referral_service.admin_reject_referral(int(rid), reason="manual_reject")
+    await call.answer(msg, show_alert=not ok)
+    if ok:
+        await cb_referral_card(call)
 
 # -------- действия: безлимит/кредиты --------
 async def cb_unlim(call: types.CallbackQuery):
@@ -292,6 +404,10 @@ def register(dp: Dispatcher):
     dp.register_callback_query_handler(cb_user,  lambda c: c.data and c.data.startswith("admin_user:"))
     dp.register_callback_query_handler(cb_unlim, lambda c: c.data and c.data.startswith("admin_unlim:"))
     dp.register_callback_query_handler(cb_credit, lambda c: c.data and c.data.startswith("admin_credit:"))
+    dp.register_callback_query_handler(cb_ref_summary, lambda c: c.data == "admin_ref")
+    dp.register_callback_query_handler(cb_referral_card, lambda c: c.data and c.data.startswith("admin_referral:"))
+    dp.register_callback_query_handler(cb_referral_activate, lambda c: c.data and c.data.startswith("admin_referral_activate:"))
+    dp.register_callback_query_handler(cb_referral_reject, lambda c: c.data and c.data.startswith("admin_referral_reject:"))
 
     # рассылки
     dp.register_callback_query_handler(cb_cast_menu,  lambda c: c.data == "admin_cast")

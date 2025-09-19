@@ -7,6 +7,8 @@ from aiogram.dispatcher import FSMContext
 from aiogram.types import InputFile  # <- для баннера
 
 from app import keyboards
+from app.services import referrals
+from app.storage import repo
 from app.utils.admins import is_admin
 from app.utils.logging import log_event, update_context
 
@@ -28,7 +30,32 @@ async def cmd_start(message: types.Message, state: FSMContext):
         # на случай, если состояния нет или не инициализировано
         pass
 
-    kb = keyboards.main_kb(is_admin=is_admin(message.from_user.id))
+    uid = message.from_user.id
+    existing = repo.get_user(uid)
+    repo.ensure_user(uid, message.from_user.username, message.from_user.full_name)
+    ref_result = referrals.handle_start(
+        uid,
+        message.get_args() or "",
+        is_new=existing is None,
+        username=message.from_user.username,
+        full_name=message.from_user.full_name,
+    )
+    ref_context = {
+        "status": ref_result.status,
+        "inviter_id": ref_result.inviter_id,
+        "bonus": ref_result.invitee_bonus,
+    }
+    update_context(referral=ref_context)
+
+    kb = keyboards.main_kb(is_admin=is_admin(uid))
+
+    ref_lines: list[str] = []
+    if ref_result.inviter_username:
+        ref_lines.append(f"Тебя пригласил {ref_result.inviter_username} — ему прилетит бонус после первой активности.")
+    if ref_result.invitee_bonus:
+        ref_lines.append(f"Тебе начислен приветственный бонус: +{ref_result.invitee_bonus} кредит.")
+    if ref_result.message and ref_result.status == "rejected":
+        ref_lines.append(ref_result.message)
 
     # 1) Пробуем отправить баннер (если файл есть) с коротким капшеном
     try:
@@ -37,6 +64,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 "HR-Assist — собираю вакансии и присылаю Excel-отчёт.\n"
                 f"Нажми «🔎 Поиск». Бесплатно — {FREE_PER_MONTH} запроса в месяц."
             )
+            if ref_lines:
+                caption = "\n".join(ref_lines + ["", caption])
             await message.answer_photo(InputFile(BANNER_PATH), caption=caption, reply_markup=kb)
             return
     except Exception:
@@ -44,7 +73,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
         pass
 
     # 2) Фолбэк-текст (если баннера нет/не отправился)
+    extra = "\n".join(ref_lines)
+    if extra:
+        extra += "\n\n"
     text = (
+        f"{extra}"
         "Привет! Я <b>HR-Assist</b> — соберу вакансии по твоему запросу и пришлю файл Excel.\n\n"
         "Как пользоваться:\n"
         "1) Нажми «🔎 Поиск» — я спрошу должность и город.\n"

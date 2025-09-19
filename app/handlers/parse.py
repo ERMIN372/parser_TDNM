@@ -19,6 +19,7 @@ from aiogram.types import (
 from ..middlewares.busy import BUSY_TEXT, clear_busy, is_busy, set_busy
 
 from ..services import parser_adapter
+from ..services import referrals
 from ..services import validator  # валидация запроса
 from ..services.mini_analytics import register_context, render_mini_analytics
 from ..services.quota import FREE_PER_MONTH, check_and_consume
@@ -174,6 +175,16 @@ def _main_menu_kb(message: types.Message, *, user: types.User | None = None):
     return keyboards.main_kb(is_admin=is_admin(user_id))
 
 
+def _format_user_mention(user: types.User | None) -> str:
+    if not user:
+        return "приглашённый"
+    if user.username:
+        return f"@{user.username}"
+    if user.full_name:
+        return user.full_name
+    return str(getattr(user, "id", "приглашённый"))
+
+
 def _log_parse_start(title: str, city: str, overrides: dict | None = None, *, approx_total: int | None = None) -> None:
     args = _build_args(title, city, overrides, qty=approx_total)
     update_context(args=args)
@@ -237,6 +248,22 @@ async def _send_report_with_analytics(
     )
     if text:
         await message.answer(text, disable_web_page_preview=True)
+    activation = referrals.handle_activation_trigger(message.from_user.id, "report")
+    if activation and activation.inviter_id:
+        mention = _format_user_mention(message.from_user)
+        if activation.granted and activation.bonus:
+            notify_text = f"🔥 Реферал {mention} активирован — +{activation.bonus} кредит начислен!"
+        else:
+            notify_text = f"Реферал {mention} активировал триггер, но бонус не начислен (достигнут лимит)."
+        try:
+            await message.bot.send_message(activation.inviter_id, notify_text)
+        except Exception as exc:  # pragma: no cover
+            log_event(
+                "referral_notify_failed",
+                level="WARN",
+                inviter_id=activation.inviter_id,
+                err=str(exc),
+            )
 
 
 async def _run_parser_bypass_validation(

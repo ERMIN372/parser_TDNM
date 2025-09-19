@@ -20,7 +20,17 @@ db = SqliteDatabase(
 
 def init_db() -> None:
     """Создать таблицы, если их ещё нет."""
-    from .models import User, Usage, Credit, Payment  # noqa
+    from .models import (
+        User,
+        Usage,
+        Credit,
+        Payment,
+        Referral,
+        ReferralStats,
+        PromoCode,
+        Ledger,
+        ReferralBan,
+    )  # noqa: WPS347
     db.connect(reuse_if_open=True)
-    db.create_tables([User, Usage, Credit, Payment])
+    db.create_tables([User, Usage, Credit, Payment, Referral, ReferralStats, PromoCode, Ledger, ReferralBan])
     db.close()

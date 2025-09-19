@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import os
 import uuid
-from typing import Tuple
+from typing import Optional, Tuple
 
 from yookassa import Configuration, Payment
 
 from app.storage import repo
 from app.utils.logging import log_event, update_context
+from . import referrals
 
 # Прайс-лист (копейки)
 PRICES = {
@@ -32,21 +33,26 @@ def _credits_delta(pack: str) -> int:
 def _rub(amount_cop: int) -> str:
     return f"{amount_cop/100:.2f}"
 
-def _apply_effect(user_id: int, pack: str) -> str:
+def _apply_effect(user_id: int, pack: str) -> Tuple[str, Optional[referrals.ActivationResult]]:
     """Применить покупку к аккаунту."""
     if pack == "p1":
         bal = repo.add_credits(user_id, 1)
-        return f"Зачислено 1 кредит. Баланс: {bal}"
+        return _finish_payment(user_id, "Зачислено 1 кредит. Баланс: {bal}")
     if pack == "p3":
         bal = repo.add_credits(user_id, 3)
-        return f"Зачислено 3 кредита. Баланс: {bal}"
+        return _finish_payment(user_id, f"Зачислено 3 кредита. Баланс: {bal}")
     if pack == "p9":
         bal = repo.add_credits(user_id, 9)
-        return f"Зачислено 9 кредитов. Баланс: {bal}"
+        return _finish_payment(user_id, f"Зачислено 9 кредитов. Баланс: {bal}")
     if pack == "unlim30":
         until = repo.set_unlimited(user_id, 30)
-        return f"Включён безлимит до {until:%Y-%m-%d %H:%M} UTC"
-    return "Ок"
+        return _finish_payment(user_id, f"Включён безлимит до {until:%Y-%m-%d %H:%M} UTC")
+    return _finish_payment(user_id, "Ок")
+
+
+def _finish_payment(user_id: int, message: str) -> Tuple[str, Optional[referrals.ActivationResult]]:
+    activation = referrals.handle_activation_trigger(user_id, "payment")
+    return message, activation
 
 _configured = False
 
@@ -111,7 +117,7 @@ def create_payment(user_id: int, pack: str, bot_username: str | None = None) -> 
     log_event("payment_created", message=f"payment {p.id} created", payment=payment_ctx)
     return p.id, p.confirmation.confirmation_url
 
-def check_and_apply(user_id: int, payment_id: str) -> str:
+def check_and_apply(user_id: int, payment_id: str) -> Tuple[str, Optional[referrals.ActivationResult]]:
     """
     Проверяет статус платежа в ЮKassa.
     Если оплачен — отмечает как paid и применяет эффект на аккаунт.
@@ -126,12 +132,12 @@ def check_and_apply(user_id: int, payment_id: str) -> str:
     from app.storage.models import Payment as DbPayment  # локальный импорт
     rec = DbPayment.get_or_none(DbPayment.provider_payload == payment_id)
     if not rec:
-        return "Платёж не найден в системе."
+        return "Платёж не найден в системе.", None
 
     if status == "succeeded":
         if rec.status != "paid":
             repo.mark_payment_paid(rec.id)
-            msg = _apply_effect(user_id, rec.pack)
+            msg, activation = _apply_effect(user_id, rec.pack)
             delta = _credits_delta(rec.pack)
             if delta:
                 update_context(credits_delta=delta)
@@ -142,14 +148,14 @@ def check_and_apply(user_id: int, payment_id: str) -> str:
                 message=f"payment {payment_id} succeeded",
                 payment={"id": payment_id, "status": "succeeded", "pack": rec.pack},
             )
-            return f"✅ Оплата прошла. {msg}"
+            return f"✅ Оплата прошла. {msg}", activation
         else:
             log_event(
                 "payment_succeeded",
                 message=f"payment {payment_id} already applied",
                 payment={"id": payment_id, "status": "succeeded", "pack": rec.pack},
             )
-            return "✅ Этот платёж уже учтён."
+            return "✅ Этот платёж уже учтён.", None
     elif status in {"canceled", "waiting_for_capture"}:
         log_event(
             "payment_failed",
@@ -157,7 +163,7 @@ def check_and_apply(user_id: int, payment_id: str) -> str:
             message=f"payment {payment_id} status={status}",
             payment={"id": payment_id, "status": status, "pack": rec.pack},
         )
-        return f"Статус платежа: {status}. Если считаете, что это ошибка — напишите нам."
+        return f"Статус платежа: {status}. Если считаете, что это ошибка — напишите нам.", None
     else:
         log_event(
             "payment_failed",
@@ -165,4 +171,4 @@ def check_and_apply(user_id: int, payment_id: str) -> str:
             message=f"payment {payment_id} status={status}",
             payment={"id": payment_id, "status": status, "pack": rec.pack},
         )
-        return f"Статус платежа: {status}. Ещё не оплачено."
+        return f"Статус платежа: {status}. Ещё не оплачено.", None
