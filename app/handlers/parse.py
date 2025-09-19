@@ -29,12 +29,92 @@ from ..services.quota import FREE_PER_MONTH, QuotaDecision, check_quota, commit_
 from app import keyboards
 from app.utils.admins import is_admin
 from app.utils.logging import complete_operation, log_event, update_context
+from app.utils.progress import ProgressMessage
 from app.utils.normalize import normalize_city, normalize_role
 
 # Кеш последнего «сомнительного» запроса: user_id -> (query, city, overrides)
 _WARN_CACHE: Dict[int, Tuple[str, str, dict]] = {}
 # Кеш шага выбора объёма: user_id -> (norm_title, city, area_id, overrides, max_total)
 _PENDING_QTY: Dict[int, Tuple[str, str, int, dict, int]] = {}
+
+PROGRESS_STEPS_2 = (
+    "Шаг 1/2: собираю вакансии… {spinner}",
+    "Шаг 2/2: формирую Excel-отчёт… {spinner}",
+)
+PROGRESS_STEPS_3 = (
+    "Шаг 1/3: собираю вакансии… {spinner}",
+    "Шаг 2/3: фильтрую по ключевым словам… {spinner}",
+    "Шаг 3/3: формирую Excel-отчёт… {spinner}",
+)
+PREVIEW_TEMPLATE = "Готовлю превью (5 вакансий)… {spinner}"
+DONE_TEXT = "Готово ✅"
+FAIL_TEXT = "❌ Не получилось (ошибка/таймаут). Попробуй позже."
+
+
+class ReportProgressTracker:
+    def __init__(self, progress: ProgressMessage, steps: tuple[str, ...]):
+        self._progress = progress
+        self._steps = steps
+        self._current = 0
+        self._finished = False
+
+    @property
+    def has_filter(self) -> bool:
+        return len(self._steps) == len(PROGRESS_STEPS_3)
+
+    async def handle_event(self, kind: str, payload: dict) -> None:
+        if self._finished:
+            return
+        if kind == "status":
+            status = payload.get("status")
+            if status == "csv":
+                await self._set_step(1 if len(self._steps) > 1 else 0)
+            elif status == "report" and payload.get("format") == "xlsx":
+                if not self.has_filter and len(self._steps) > 1:
+                    await self._set_step(len(self._steps) - 1)
+        elif kind == "filter_start":
+            if self.has_filter:
+                await self._set_step(1)
+        elif kind == "filter_done":
+            if self.has_filter:
+                await self._set_step(2)
+
+    async def _set_step(self, index: int) -> None:
+        if index < 0 or index >= len(self._steps):
+            return
+        if index == self._current:
+            return
+        self._current = index
+        await self._progress.update_template(self._steps[index])
+
+    async def finish_success(self, *, delete_after: float | None = 45.0) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        await self._progress.finish(DONE_TEXT, delete_after=delete_after)
+
+    async def fail(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        await self._progress.fail(FAIL_TEXT)
+
+
+async def _start_report_progress(
+    message: types.Message,
+    include: list[str] | None = None,
+    exclude: list[str] | None = None,
+) -> ReportProgressTracker:
+    steps = PROGRESS_STEPS_3 if (include or exclude) else PROGRESS_STEPS_2
+    progress = await ProgressMessage.create(message.bot, message.chat.id, steps[0])
+    return ReportProgressTracker(progress, steps)
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    return isinstance(exc, asyncio.TimeoutError) or isinstance(
+        getattr(exc, "__cause__", None),
+        asyncio.TimeoutError,
+    )
 
 
 async def _ensure_quota(
@@ -383,6 +463,9 @@ async def _run_parser_bypass_validation(
         city=city,
         overrides=overrides,
     )
+    tracker: ReportProgressTracker | None = None
+    decision: QuotaDecision | None = None
+    result: parser_adapter.ReportResult | None = None
     try:
         decision = await _ensure_quota(
             message,
@@ -393,41 +476,58 @@ async def _run_parser_bypass_validation(
         )
         if not decision:
             return
-        await message.answer("Окей, запускаю поиск. Это может занять 1–2 минуты…")
+        include_list = _ensure_str_list(overrides.get("include"))
+        exclude_list = _ensure_str_list(overrides.get("exclude"))
+        tracker = await _start_report_progress(message, include_list, exclude_list)
         _log_parse_start(query, city, overrides)
-        path = await parser_adapter.run_report(
+
+        async def _progress(kind: str, payload: dict) -> None:
+            if tracker:
+                await tracker.handle_event(kind, payload)
+
+        result = await parser_adapter.run_report(
             uid,
             query,
             city,
             role=query,
-            **overrides,
+            include=include_list,
+            exclude=exclude_list,
+            progress=_progress,
+            **{k: v for k, v in overrides.items() if k not in {"include", "exclude"}},
         )
     except Exception as e:  # pragma: no cover
-        event = "parse_timeout" if isinstance(e, asyncio.TimeoutError) else "parse_error"
+        if tracker:
+            await tracker.fail()
+        event = "parse_timeout" if _is_timeout_error(e) else "parse_error"
         err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
         log_event(event, level="ERROR", err=err_text)
         await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
         complete_operation(ok=False, err=err_text)
         return
+    else:
+        path = result.xlsx_path if result else None
+        if path and path.exists():
+            await _finalize_quota_usage(message, uid, decision)
+            _log_parse_ready(query, city, overrides)
+            await _send_report_with_analytics(
+                message,
+                path,
+                title=query,
+                city=city,
+                include=overrides.get("include"),
+                exclude=overrides.get("exclude"),
+                reply_markup=_main_menu_kb(message, user=user),
+            )
+            if tracker:
+                await tracker.finish_success()
+        else:
+            if tracker:
+                await tracker.fail()
+            await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
+            log_event("parse_error", level="ERROR", err="report_missing")
+            complete_operation(ok=False, err="report_missing")
     finally:
         clear_busy(uid)
-
-    if path.exists():
-        await _finalize_quota_usage(message, uid, decision)
-        _log_parse_ready(query, city, overrides)
-        await _send_report_with_analytics(
-            message,
-            path,
-            title=query,
-            city=city,
-            include=overrides.get("include"),
-            exclude=overrides.get("exclude"),
-            reply_markup=_main_menu_kb(message, user=user),
-        )
-    else:
-        await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
-        log_event("parse_error", level="ERROR", err="report_missing")
-        complete_operation(ok=False, err="report_missing")
 
 
 async def _run_with_amount(
@@ -473,6 +573,8 @@ async def _run_with_amount(
         approx_total=total,
     )
     decision: QuotaDecision | None = None
+    tracker: ReportProgressTracker | None = None
+    result: parser_adapter.ReportResult | None = None
 
     try:
         decision = await _ensure_quota(
@@ -485,47 +587,62 @@ async def _run_with_amount(
         if not decision:
             return
 
-        await message.answer(
-            f"Окей, выгружаю ~{min(total, per_page*pages)} вакансий… это может занять несколько минут."
-        )
+        include_list = _ensure_str_list(ov.get("include"))
+        exclude_list = _ensure_str_list(ov.get("exclude"))
+        tracker = await _start_report_progress(message, include_list, exclude_list)
         _log_parse_start(title, city, ov, approx_total=total)
-        try:
-            path = await parser_adapter.run_report(
-                uid,
-                title,
-                city,
-                role=title,
-                timeout=timeout,
-                **ov,
+
+        async def _progress(kind: str, payload: dict) -> None:
+            if tracker:
+                await tracker.handle_event(kind, payload)
+
+        run_kwargs = {k: v for k, v in ov.items() if k not in {"include", "exclude"}}
+        result = await parser_adapter.run_report(
+            uid,
+            title,
+            city,
+            role=title,
+            timeout=timeout,
+            include=include_list,
+            exclude=exclude_list,
+            progress=_progress,
+            **run_kwargs,
+        )
+    except Exception as e:
+        if tracker:
+            await tracker.fail()
+        err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
+        event = "parse_timeout" if _is_timeout_error(e) else "parse_error"
+        log_event(event, level="ERROR", err=err_text)
+        await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
+        complete_operation(ok=False, err=err_text)
+        return
+    else:
+        path = result.xlsx_path if result else None
+        if path and path.exists():
+            if decision:
+                await _finalize_quota_usage(message, uid, decision)
+            _log_parse_ready(title, city, ov, approx_total=total)
+            await _send_report_with_analytics(
+                message,
+                path,
+                title=title,
+                city=city,
+                approx_total=total,
+                include=ov.get("include"),
+                exclude=ov.get("exclude"),
+                reply_markup=_main_menu_kb(message, user=user),
             )
-        except Exception as e:
-            err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
-            event = "parse_timeout" if isinstance(e, asyncio.TimeoutError) else "parse_error"
-            log_event(event, level="ERROR", err=err_text)
-            await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
-            complete_operation(ok=False, err=err_text)
-            return
+            if tracker:
+                await tracker.finish_success()
+        else:
+            if tracker:
+                await tracker.fail()
+            await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
+            log_event("parse_error", level="ERROR", err="report_missing")
+            complete_operation(ok=False, err="report_missing")
     finally:
         clear_busy(uid)
-
-    if path.exists():
-        if decision:
-            await _finalize_quota_usage(message, uid, decision)
-        _log_parse_ready(title, city, ov, approx_total=total)
-        await _send_report_with_analytics(
-            message,
-            path,
-            title=title,
-            city=city,
-            approx_total=total,
-            include=ov.get("include"),
-            exclude=ov.get("exclude"),
-            reply_markup=_main_menu_kb(message, user=user),
-        )
-    else:
-        await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
-        log_event("parse_error", level="ERROR", err="report_missing")
-        complete_operation(ok=False, err="report_missing")
 
 
 # ---------- core ----------
@@ -591,6 +708,8 @@ async def _run_parser(
             overrides=ov,
         )
         decision: QuotaDecision | None = None
+        tracker: ReportProgressTracker | None = None
+        result: parser_adapter.ReportResult | None = None
         try:
             decision = await _ensure_quota(
                 message,
@@ -601,42 +720,60 @@ async def _run_parser(
             )
             if not decision:
                 return
-            await message.answer("Собираю вакансии, это может занять несколько минут…")
+            include_list = _ensure_str_list(ov.get("include"))
+            exclude_list = _ensure_str_list(ov.get("exclude"))
+            tracker = await _start_report_progress(message, include_list, exclude_list)
             _log_parse_start(norm_title, city_to_use, ov)
-            path = await parser_adapter.run_report(
+
+            async def _progress(kind: str, payload: dict) -> None:
+                if tracker:
+                    await tracker.handle_event(kind, payload)
+
+            run_kwargs = {k: v for k, v in ov.items() if k not in {"include", "exclude"}}
+            result = await parser_adapter.run_report(
                 requester_id,
                 norm_title,
                 city_to_use,
                 role=norm_title,
-                **ov,
+                include=include_list,
+                exclude=exclude_list,
+                progress=_progress,
+                **run_kwargs,
             )
         except Exception as e:
+            if tracker:
+                await tracker.fail()
             err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
-            event = "parse_timeout" if isinstance(e, asyncio.TimeoutError) else "parse_error"
+            event = "parse_timeout" if _is_timeout_error(e) else "parse_error"
             log_event(event, level="ERROR", err=err_text)
             await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
             complete_operation(ok=False, err=err_text)
             return
+        else:
+            path = result.xlsx_path if result else None
+            if path and path.exists():
+                if decision:
+                    await _finalize_quota_usage(message, requester_id, decision)
+                _log_parse_ready(norm_title, city_to_use, ov)
+                await _send_report_with_analytics(
+                    message,
+                    path,
+                    title=norm_title,
+                    city=city_to_use,
+                    include=ov.get("include"),
+                    exclude=ov.get("exclude"),
+                    reply_markup=_main_menu_kb(message, user=user),
+                )
+                if tracker:
+                    await tracker.finish_success()
+            else:
+                if tracker:
+                    await tracker.fail()
+                await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
+                log_event("parse_error", level="ERROR", err="report_missing")
+                complete_operation(ok=False, err="report_missing")
         finally:
             clear_busy(requester_id)
-
-        if path.exists():
-            if decision:
-                await _finalize_quota_usage(message, requester_id, decision)
-            _log_parse_ready(norm_title, city_to_use, ov)
-            await _send_report_with_analytics(
-                message,
-                path,
-                title=norm_title,
-                city=city_to_use,
-                include=ov.get("include"),
-                exclude=ov.get("exclude"),
-                reply_markup=_main_menu_kb(message, user=user),
-            )
-        else:
-            await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
-            log_event("parse_error", level="ERROR", err="report_missing")
-            complete_operation(ok=False, err="report_missing")
         return
 
     # 3) Шаг выбора объёма (число найденных НЕ показываем)
@@ -983,76 +1120,93 @@ async def cb_qty(call: types.CallbackQuery):
 
 async def cb_preview(call: types.CallbackQuery):
     """Показать 5 первых совпадений без уничтожения кеша запроса."""
+    uid = call.from_user.id
+    if not set_busy(uid):
+        await call.answer(BUSY_TEXT, show_alert=False)
+        return
+
     await call.answer("Готовлю превью…", show_alert=False)
 
-    uid = call.from_user.id
-    payload = _PENDING_QTY.get(uid)   # ВАЖНО: .get(), НЕ .pop()!
-    if not payload:
-        await call.message.answer("Не нашёл предыдущий запрос. Введи должность ещё раз:")
-        await ParseForm.waiting_query.set()
-        return
-
-    title, city, area_id, overrides, _max_total = payload
-    include = (overrides or {}).get("include") or []
-    exclude = (overrides or {}).get("exclude") or []
-
-    if not ALLOW_FREE_PREVIEW:
-        snapshot = paywall.SavedRequest(
-            kind="preview",
-            query=title,
-            city=city,
-            overrides=overrides or {},
-            area_id=area_id,
-        )
-        decision = await _ensure_quota(
-            call.message,
-            uid,
-            user=call.from_user,
-            snapshot=snapshot,
-            reason="preview",
-        )
-        if not decision:
+    progress: ProgressMessage | None = None
+    try:
+        payload = _PENDING_QTY.get(uid)   # ВАЖНО: .get(), НЕ .pop()!
+        if not payload:
+            await call.message.answer("Не нашёл предыдущий запрос. Введи должность ещё раз:")
+            await ParseForm.waiting_query.set()
             return
 
-    _log_preview_start(title, city, overrides)
-    try:
-        rows = await parser_adapter.preview_rows(
-            uid,
-            title,
-            city,
-            area=area_id,
-            include=include,
-            exclude=exclude,
-        )
-    except asyncio.TimeoutError as exc:
-        _log_preview_timeout(title, city, overrides, err=str(exc))
-        await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
-        return
-    except Exception as exc:
-        _log_preview_timeout(title, city, overrides, err=str(exc))
-        await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
-        return
+        title, city, area_id, overrides, _max_total = payload
+        include = (overrides or {}).get("include") or []
+        exclude = (overrides or {}).get("exclude") or []
 
-    if not rows:
-        await call.message.answer("Совпадений не нашлось по текущим критериям.")
-        _log_preview_ready(title, city, 0, overrides)
-        return
+        if not ALLOW_FREE_PREVIEW:
+            snapshot = paywall.SavedRequest(
+                kind="preview",
+                query=title,
+                city=city,
+                overrides=overrides or {},
+                area_id=area_id,
+            )
+            decision = await _ensure_quota(
+                call.message,
+                uid,
+                user=call.from_user,
+                snapshot=snapshot,
+                reason="preview",
+            )
+            if not decision:
+                return
 
-    # аккуратный текст превью
-    lines = []
-    for r in rows:
-        t = r.get("title") or "—"
-        c = r.get("company") or "—"
-        s = r.get("salary") or "—"
-        link = r.get("link")
-        if link:
-            lines.append(f"• <a href=\"{link}\">{t}</a> — {c} — {s}")
-        else:
-            lines.append(f"• {t} — {c} — {s}")
+        progress = await ProgressMessage.create(call.message.bot, call.message.chat.id, PREVIEW_TEMPLATE)
+        _log_preview_start(title, city, overrides)
+        try:
+            rows = await parser_adapter.preview_rows(
+                uid,
+                title,
+                city,
+                area=area_id,
+                include=include,
+                exclude=exclude,
+            )
+        except asyncio.TimeoutError as exc:
+            _log_preview_timeout(title, city, overrides, err=str(exc))
+            if progress:
+                await progress.fail()
+            await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
+            return
+        except Exception as exc:
+            _log_preview_timeout(title, city, overrides, err=str(exc))
+            if progress:
+                await progress.fail()
+            await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
+            return
 
-    txt = "<b>Предпросмотр (первые совпадения):</b>\n" + "\n".join(lines)
-    await call.message.answer(txt, disable_web_page_preview=True)
-    _log_preview_ready(title, city, len(rows), overrides)
+        if not rows:
+            await call.message.answer("Совпадений не нашлось по текущим критериям.")
+            _log_preview_ready(title, city, 0, overrides)
+            if progress:
+                await progress.finish(DONE_TEXT, delete_after=45.0)
+            return
+
+        # аккуратный текст превью
+        lines = []
+        for r in rows:
+            t = r.get("title") or "—"
+            c = r.get("company") or "—"
+            s = r.get("salary") or "—"
+            link = r.get("link")
+            if link:
+                lines.append(f"• <a href=\"{link}\">{t}</a> — {c} — {s}")
+            else:
+                lines.append(f"• {t} — {c} — {s}")
+
+        txt = "<b>Предпросмотр (первые совпадения):</b>\n" + "\n".join(lines)
+        await call.message.answer(txt, disable_web_page_preview=True)
+        _log_preview_ready(title, city, len(rows), overrides)
+        if progress:
+            await progress.finish(DONE_TEXT, delete_after=45.0)
+    finally:
+        clear_busy(uid)
 
 
 async def prompt_resume(bot: Bot, user_id: int) -> None:

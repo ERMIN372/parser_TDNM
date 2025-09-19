@@ -1,12 +1,14 @@
 from __future__ import annotations
 import os
 import sys
+import json
 import asyncio
 import subprocess
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Iterable, List, Optional, Tuple
+from typing import Awaitable, Callable, Iterable, List, Optional, Tuple
+from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
@@ -53,10 +55,17 @@ def _load_table(path_csv: Path, path_xlsx: Optional[Path] = None):
     return None
 
 
-def _postfilter_any(xlsx_path: Path, include: List[str], exclude: List[str]) -> None:
+def _postfilter_any(
+    xlsx_path: Path,
+    include: List[str],
+    exclude: List[str],
+    *,
+    csv_path: Path | None = None,
+) -> None:
     if not xlsx_path or not xlsx_path.exists():
         return
-    df = _load_table(xlsx_path.parent / "raw.csv", xlsx_path)
+    source_csv = csv_path if csv_path and csv_path.exists() else xlsx_path.parent / "raw.csv"
+    df = _load_table(source_csv, xlsx_path)
     if df is None:
         return
 
@@ -342,6 +351,15 @@ async def preview_rows(
     return rows_out
 
 
+@dataclass
+class ReportResult:
+    xlsx_path: Path
+    csv_path: Path | None = None
+
+
+ProgressCallback = Callable[[str, dict], Awaitable[None]]
+
+
 async def run_report(
     user_id: int,
     query: str,
@@ -356,7 +374,8 @@ async def run_report(
     include: Iterable[str] | str | None = None,
     exclude: Iterable[str] | str | None = None,
     timeout: int | None = None,
-) -> Path:
+    progress: ProgressCallback | None = None,
+) -> ReportResult:
     if not query or not city:
         raise RuntimeError("Неверные параметры поиска (пустые город/должность).")
 
@@ -392,19 +411,85 @@ async def run_report(
     eff_timeout = timeout or (LARGE_TIMEOUT if (pages or 0) > 2 or (per_page or 0) >= 100 else DEFAULT_TIMEOUT)
     log.info("Running parser: %s", " ".join(map(str, cmd)))
 
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    csv_path: Path | None = None
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def _read_stdout() -> None:
+        nonlocal csv_path
+        assert proc.stdout is not None
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text_line = line.decode(errors="ignore").rstrip("\r\n")
+            stdout_lines.append(text_line)
+            if progress:
+                try:
+                    payload = json.loads(text_line)
+                except json.JSONDecodeError:
+                    continue
+                if payload.get("status") == "csv" and payload.get("path"):
+                    try:
+                        csv_path = Path(payload["path"])
+                    except Exception:  # pragma: no cover
+                        csv_path = None
+                try:
+                    await progress("status", payload)
+                except Exception:  # pragma: no cover
+                    log.warning("progress callback failed", exc_info=True)
+
+    async def _read_stderr() -> None:
+        assert proc.stderr is not None
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                break
+            stderr_lines.append(line.decode(errors="ignore").rstrip("\r\n"))
+
+    stdout_task = asyncio.create_task(_read_stdout())
+    stderr_task = asyncio.create_task(_read_stderr())
+
     try:
-        proc = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True, timeout=eff_timeout
-        )
-    except subprocess.TimeoutExpired as e:
+        await asyncio.wait_for(proc.wait(), timeout=eff_timeout)
+    except asyncio.TimeoutError as e:
+        proc.kill()
+        await proc.wait()
         log.error("Parser timeout")
         raise RuntimeError("Превышено время ожидания парсера") from e
+    finally:
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
 
     if proc.returncode != 0:
-        log.error("Parser failed (rc=%s)\nstdout:\n%s\nstderr:\n%s", proc.returncode, proc.stdout, proc.stderr)
-        raise RuntimeError(f"Не удалось получить отчёт: парсер завершился с ошибкой {proc.returncode}")
+        stdout_text = "\n".join(stdout_lines)
+        stderr_text = "\n".join(stderr_lines)
+        log.error(
+            "Parser failed (rc=%s)\nstdout:\n%s\nstderr:\n%s",
+            proc.returncode,
+            stdout_text,
+            stderr_text,
+        )
+        raise RuntimeError(
+            f"Не удалось получить отчёт: парсер завершился с ошибкой {proc.returncode}"
+        )
 
     if inc or exc:
-        _postfilter_any(out_path, inc, exc)
+        if progress:
+            try:
+                await progress("filter_start", {"csv_path": str(csv_path) if csv_path else None})
+            except Exception:  # pragma: no cover
+                log.warning("progress callback failed on filter_start", exc_info=True)
+        await asyncio.to_thread(_postfilter_any, out_path, inc, exc, csv_path=csv_path)
+        if progress:
+            try:
+                await progress("filter_done", {"csv_path": str(csv_path) if csv_path else None})
+            except Exception:  # pragma: no cover
+                log.warning("progress callback failed on filter_done", exc_info=True)
 
-    return out_path
+    return ReportResult(xlsx_path=out_path, csv_path=csv_path)
