@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional, Tuple
 
 from yookassa import Configuration, Payment
@@ -10,12 +11,27 @@ from app.storage import repo
 from app.utils.logging import log_event, update_context
 from . import referrals
 
+
+def _price_from_env(var: str, default_cop: int) -> int:
+    raw = os.getenv(var)
+    if not raw:
+        return default_cop
+    try:
+        amount = Decimal(str(raw).replace(" ", "").replace(",", "."))
+    except (InvalidOperation, ValueError):
+        return default_cop
+    if amount < 0:
+        return default_cop
+    value = (amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return int(value)
+
+
 # Прайс-лист (копейки)
 PRICES = {
-    "p1": 49_00,        # 1 запрос
-    "p3": 139_00,       # 3 запроса
-    "p9": 399_00,       # 9 запросов
-    "unlim30": 1_299_00 # безлимит 30 дней
+    "p1": _price_from_env("PRICE_PACK_1", 49_00),        # 1 запрос
+    "p3": _price_from_env("PRICE_PACK_3", 139_00),       # 3 запроса
+    "p9": _price_from_env("PRICE_PACK_9", 399_00),       # 9 запросов
+    "unlim30": _price_from_env("PRICE_PACK_UNLIM30", 1_299_00),
 }
 
 TITLES = {
@@ -24,6 +40,9 @@ TITLES = {
     "p9": "9 запросов",
     "unlim30": "Безлимит 30 дней",
 }
+
+# порядок отображения пакетов
+PACK_ORDER = ["p1", "p3", "p9", "unlim30"]
 
 
 def _credits_delta(pack: str) -> int:
@@ -117,7 +136,7 @@ def create_payment(user_id: int, pack: str, bot_username: str | None = None) -> 
     log_event("payment_created", message=f"payment {p.id} created", payment=payment_ctx)
     return p.id, p.confirmation.confirmation_url
 
-def check_and_apply(user_id: int, payment_id: str) -> Tuple[str, Optional[referrals.ActivationResult]]:
+def check_and_apply(user_id: int, payment_id: str) -> Tuple[str, Optional[referrals.ActivationResult], str]:
     """
     Проверяет статус платежа в ЮKassa.
     Если оплачен — отмечает как paid и применяет эффект на аккаунт.
@@ -132,7 +151,7 @@ def check_and_apply(user_id: int, payment_id: str) -> Tuple[str, Optional[referr
     from app.storage.models import Payment as DbPayment  # локальный импорт
     rec = DbPayment.get_or_none(DbPayment.provider_payload == payment_id)
     if not rec:
-        return "Платёж не найден в системе.", None
+        return "Платёж не найден в системе.", None, status
 
     if status == "succeeded":
         if rec.status != "paid":
@@ -148,14 +167,14 @@ def check_and_apply(user_id: int, payment_id: str) -> Tuple[str, Optional[referr
                 message=f"payment {payment_id} succeeded",
                 payment={"id": payment_id, "status": "succeeded", "pack": rec.pack},
             )
-            return f"✅ Оплата прошла. {msg}", activation
+            return f"✅ Оплата прошла. {msg}", activation, "succeeded"
         else:
             log_event(
                 "payment_succeeded",
                 message=f"payment {payment_id} already applied",
                 payment={"id": payment_id, "status": "succeeded", "pack": rec.pack},
             )
-            return "✅ Этот платёж уже учтён.", None
+            return "✅ Этот платёж уже учтён.", None, "succeeded"
     elif status in {"canceled", "waiting_for_capture"}:
         log_event(
             "payment_failed",
@@ -163,7 +182,7 @@ def check_and_apply(user_id: int, payment_id: str) -> Tuple[str, Optional[referr
             message=f"payment {payment_id} status={status}",
             payment={"id": payment_id, "status": status, "pack": rec.pack},
         )
-        return f"Статус платежа: {status}. Если считаете, что это ошибка — напишите нам.", None
+        return f"Статус платежа: {status}. Если считаете, что это ошибка — напишите нам.", None, status
     else:
         log_event(
             "payment_failed",
@@ -171,4 +190,4 @@ def check_and_apply(user_id: int, payment_id: str) -> Tuple[str, Optional[referr
             message=f"payment {payment_id} status={status}",
             payment={"id": payment_id, "status": status, "pack": rec.pack},
         )
-        return f"Статус платежа: {status}. Ещё не оплачено.", None
+        return f"Статус платежа: {status}. Ещё не оплачено.", None, status
