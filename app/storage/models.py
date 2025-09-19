@@ -90,7 +90,7 @@ class Ledger(BaseModel):
     kind = CharField()  # credit|unlimited
     delta = IntegerField()
     reason = CharField()
-    related_referral = ForeignKeyField("Referral", null=True, on_delete="SET NULL")
+    related_referral = ForeignKeyField(Referral, null=True, on_delete="SET NULL")
     ts = DateTimeField(default=datetime.utcnow)
     balance_after = IntegerField(null=True)
 
