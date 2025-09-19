@@ -30,7 +30,19 @@ def init_db() -> None:
         PromoCode,
         Ledger,
         ReferralBan,
+        SearchQuery,
     )  # noqa: WPS347
     db.connect(reuse_if_open=True)
-    db.create_tables([User, Usage, Credit, Payment, Referral, ReferralStats, PromoCode, Ledger, ReferralBan])
+    db.create_tables([
+        User,
+        Usage,
+        Credit,
+        Payment,
+        Referral,
+        ReferralStats,
+        PromoCode,
+        Ledger,
+        ReferralBan,
+        SearchQuery,
+    ])
     db.close()

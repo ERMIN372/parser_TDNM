@@ -103,30 +103,30 @@ def probe_hh_found(title: str, area_id: int) -> Tuple[bool, int]:
         return False, 0
 
 
-def validate_request(title: str, city: str) -> Tuple[bool, str, int, str]:
+def validate_request(title: str, city: str) -> Tuple[bool, str, int, str, str]:
     """
     Комплексная валидация:
     - должность
-    - распознаём город -> area_id
+    - распознаём город -> area_id + canonical_city
     - проверяем 'found' на HH
-    Возвращает: (ok, norm_title, area_id, message_if_not_ok)
+    Возвращает: (ok, norm_title, area_id, canonical_city, message_if_not_ok)
     """
     ok, msg = validate_title(title)
     if not ok:
-        return False, "", 0, msg
+        return False, "", 0, "", msg
 
     ok_city, area_id, canonical_city, suggestions = resolve_city(city)
     if not ok_city or not area_id:
         hint = ""
         if suggestions:
             hint = "\nВозможно, имелось в виду: " + ", ".join(suggestions[:5])
-        return False, "", 0, "Не нашёл такой город. Попробуй точнее." + hint
+        return False, "", 0, "", "Не нашёл такой город. Попробуй точнее." + hint
 
     ok_probe, found = probe_hh_found(title, area_id)
     if ok_probe and found < MIN_FOUND:
-        return False, "", 0, (
+        return False, "", 0, canonical_city or "", (
             f"По запросу «{_clean(title)}» в «{canonical_city}» слишком мало вакансий ({found}). "
             "Проверь опечатки или укажи другое название."
         )
     # если пробу не удалось сделать — не блокируем, но это редкость
-    return True, _clean(title), area_id, ""
+    return True, _clean(title), area_id, canonical_city, ""

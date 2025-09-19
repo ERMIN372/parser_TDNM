@@ -1,5 +1,6 @@
 from __future__ import annotations
 from datetime import datetime
+
 from peewee import (
     Model,
     AutoField,
@@ -11,6 +12,7 @@ from peewee import (
     IntegerField,
     TextField,
 )
+
 from .db import db
 
 class BaseModel(Model):
@@ -100,3 +102,11 @@ class ReferralBan(BaseModel):
     user = ForeignKeyField(User, backref="referral_ban", unique=True, on_delete="CASCADE")
     reason = CharField(null=True)
     created_at = DateTimeField(default=datetime.utcnow)
+
+
+class SearchQuery(BaseModel):
+    id = AutoField()
+    user = ForeignKeyField(User, backref="search_queries", on_delete="CASCADE")
+    role = CharField()
+    city = CharField()
+    created_at = DateTimeField(default=datetime.utcnow, index=True)
