@@ -5,7 +5,7 @@ import math
 import os
 from typing import Dict, List, Tuple
 
-from aiogram import Dispatcher, types
+from aiogram import Bot, Dispatcher, types
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import (
@@ -24,7 +24,8 @@ from ..services import referrals
 from ..services import validator  # валидация запроса
 from ..services import chips
 from ..services.mini_analytics import register_context, render_mini_analytics
-from ..services.quota import FREE_PER_MONTH, check_and_consume
+from ..services import paywall
+from ..services.quota import FREE_PER_MONTH, QuotaDecision, check_quota, commit_usage
 from app import keyboards
 from app.utils.admins import is_admin
 from app.utils.logging import complete_operation, log_event, update_context
@@ -41,42 +42,89 @@ async def _ensure_quota(
     uid: int,
     *,
     user: types.User | None = None,
-) -> bool:
-    """Проверяет и списывает лимит перед запуском выгрузки."""
+    snapshot: paywall.SavedRequest | None = None,
+    reason: str = "parse",
+) -> QuotaDecision | None:
+    """Проверяет лимиты перед запуском тяжёлой операции."""
 
     person = user or getattr(message, "from_user", None)
     username = getattr(person, "username", None) if person else None
     full_name = getattr(person, "full_name", None) if person else None
 
-    decision = check_and_consume(uid, username, full_name)
-    quota_info = {
+    decision = check_quota(uid, username, full_name)
+    quota_info: dict[str, object] = {
         "free_limit": FREE_PER_MONTH,
-        "free_used": max(0, FREE_PER_MONTH - decision.free_left),
+        "free_used": decision.free_used,
+        "free_left": decision.free_left,
         "credits": decision.credits,
-        "unlimited": decision.mode == "unlimited",
+        "mode": decision.mode,
     }
-    credits_delta = -1 if decision.mode == "paid" else 0
-    update_context(quota=quota_info, credits_delta=credits_delta)
-    if not decision.allowed:
-        await message.answer(
-            decision.message or "Лимит исчерпан — попробуйте позже 🙏",
-            reply_markup=_main_menu_kb(message, user=user),
-        )
-        complete_operation(ok=False, err="quota_exceeded")
-        return False
+    if decision.unlimited_until:
+        quota_info["unlimited_until"] = decision.unlimited_until.isoformat()
+        quota_info["unlimited"] = True
+    update_context(quota=quota_info)
 
-    if decision.mode == "paid":
-        await message.answer(f"💳 Списан 1 кредит. Осталось: {decision.credits}")
-    elif decision.mode == "free" and decision.free_left == 0:
+    if decision.allowed:
+        return decision
+
+    if snapshot:
+        paywall.save_request(uid, snapshot)
+
+    log_event(
+        "limit_reached_shown",
+        level="INFO",
+        message="quota limit reached",
+        quota=quota_info,
+        args={"reason": reason, "snapshot": snapshot.to_log() if snapshot else None},
+    )
+
+    await message.answer(paywall.paywall_text(), reply_markup=paywall.paywall_keyboard())
+    complete_operation(ok=False, err="quota_exceeded")
+    return None
+
+
+async def _finalize_quota_usage(
+    message: types.Message,
+    uid: int,
+    decision: QuotaDecision,
+) -> None:
+    outcome = commit_usage(uid, decision)
+    if outcome is None:
+        return
+
+    quota_info: dict[str, object] = {
+        "free_limit": FREE_PER_MONTH,
+        "free_used": outcome.free_used,
+        "free_left": outcome.free_left,
+        "credits": outcome.credits,
+        "mode": outcome.mode,
+    }
+    if outcome.unlimited_until:
+        quota_info["unlimited_until"] = outcome.unlimited_until.isoformat()
+        quota_info["unlimited"] = True
+
+    credits_delta = outcome.credits_delta if outcome.credits_delta else None
+    update_context(quota=quota_info, credits_delta=credits_delta)
+
+    if outcome.mode == "paid":
+        if outcome.credits_delta:
+            await message.answer(f"💳 Списан 1 кредит. Осталось: {outcome.credits}")
+        else:
+            log_event(
+                "quota_consume_warning",
+                level="WARN",
+                message="expected to consume paid credit but balance unchanged",
+                quota=quota_info,
+            )
+    elif outcome.mode == "free" and outcome.free_left == 0:
         await message.answer(
             "Бесплатные запросы в этом месяце закончились — дальше будут списываться кредиты."
         )
 
-    return True
-
 # верхний лимит для «Всё»
 MAX_EXPORT = int(os.getenv("MAX_EXPORT", "500"))
 BIG_PER_PAGE = 100  # HH допускает до 100
+ALLOW_FREE_PREVIEW = os.getenv("ALLOW_FREE_PREVIEW", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class ParseForm(StatesGroup):
@@ -329,8 +377,21 @@ async def _run_parser_bypass_validation(
     if not set_busy(uid):
         await message.answer(BUSY_TEXT)
         return
+    snapshot = paywall.SavedRequest(
+        kind="bypass",
+        query=query,
+        city=city,
+        overrides=overrides,
+    )
     try:
-        if not await _ensure_quota(message, uid, user=user):
+        decision = await _ensure_quota(
+            message,
+            uid,
+            user=user,
+            snapshot=snapshot,
+            reason="parse_bypass",
+        )
+        if not decision:
             return
         await message.answer("Окей, запускаю поиск. Это может занять 1–2 минуты…")
         _log_parse_start(query, city, overrides)
@@ -352,6 +413,7 @@ async def _run_parser_bypass_validation(
         clear_busy(uid)
 
     if path.exists():
+        await _finalize_quota_usage(message, uid, decision)
         _log_parse_ready(query, city, overrides)
         await _send_report_with_analytics(
             message,
@@ -401,33 +463,54 @@ async def _run_with_amount(
     else:
         timeout = None
 
-    if not await _ensure_quota(message, uid, user=user):
-        return
-
-    await message.answer(
-        f"Окей, выгружаю ~{min(total, per_page*pages)} вакансий… это может занять несколько минут."
+    snapshot = paywall.SavedRequest(
+        kind="amount",
+        query=title,
+        city=city,
+        overrides=ov,
+        area_id=area_id,
+        total=total,
+        approx_total=total,
     )
-    _log_parse_start(title, city, ov, approx_total=total)
+    decision: QuotaDecision | None = None
+
     try:
-        path = await parser_adapter.run_report(
+        decision = await _ensure_quota(
+            message,
             uid,
-            title,
-            city,
-            role=title,
-            timeout=timeout,
-            **ov,
+            user=user,
+            snapshot=snapshot,
+            reason="parse_amount",
         )
-    except Exception as e:
-        err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
-        event = "parse_timeout" if isinstance(e, asyncio.TimeoutError) else "parse_error"
-        log_event(event, level="ERROR", err=err_text)
-        await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
-        complete_operation(ok=False, err=err_text)
-        return
+        if not decision:
+            return
+
+        await message.answer(
+            f"Окей, выгружаю ~{min(total, per_page*pages)} вакансий… это может занять несколько минут."
+        )
+        _log_parse_start(title, city, ov, approx_total=total)
+        try:
+            path = await parser_adapter.run_report(
+                uid,
+                title,
+                city,
+                role=title,
+                timeout=timeout,
+                **ov,
+            )
+        except Exception as e:
+            err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
+            event = "parse_timeout" if isinstance(e, asyncio.TimeoutError) else "parse_error"
+            log_event(event, level="ERROR", err=err_text)
+            await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
+            complete_operation(ok=False, err=err_text)
+            return
     finally:
         clear_busy(uid)
 
     if path.exists():
+        if decision:
+            await _finalize_quota_usage(message, uid, decision)
         _log_parse_ready(title, city, ov, approx_total=total)
         await _send_report_with_analytics(
             message,
@@ -498,19 +581,34 @@ async def _run_parser(
         if not set_busy(requester_id):
             await message.answer(BUSY_TEXT)
             return
+        ov = dict(overrides)
+        if "area" not in ov:
+            ov["area"] = area_id
+        snapshot = paywall.SavedRequest(
+            kind="direct",
+            query=norm_title,
+            city=city_to_use,
+            overrides=ov,
+        )
+        decision: QuotaDecision | None = None
         try:
-            if not await _ensure_quota(message, requester_id, user=user):
+            decision = await _ensure_quota(
+                message,
+                requester_id,
+                user=user,
+                snapshot=snapshot,
+                reason="parse_direct",
+            )
+            if not decision:
                 return
             await message.answer("Собираю вакансии, это может занять несколько минут…")
-            if "area" not in overrides:
-                overrides["area"] = area_id
-            _log_parse_start(norm_title, city_to_use, overrides)
+            _log_parse_start(norm_title, city_to_use, ov)
             path = await parser_adapter.run_report(
                 requester_id,
                 norm_title,
                 city_to_use,
                 role=norm_title,
-                **overrides,
+                **ov,
             )
         except Exception as e:
             err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
@@ -523,14 +621,16 @@ async def _run_parser(
             clear_busy(requester_id)
 
         if path.exists():
-            _log_parse_ready(norm_title, city_to_use, overrides)
+            if decision:
+                await _finalize_quota_usage(message, requester_id, decision)
+            _log_parse_ready(norm_title, city_to_use, ov)
             await _send_report_with_analytics(
                 message,
                 path,
                 title=norm_title,
                 city=city_to_use,
-                include=overrides.get("include"),
-                exclude=overrides.get("exclude"),
+                include=ov.get("include"),
+                exclude=ov.get("exclude"),
                 reply_markup=_main_menu_kb(message, user=user),
             )
         else:
@@ -896,6 +996,24 @@ async def cb_preview(call: types.CallbackQuery):
     include = (overrides or {}).get("include") or []
     exclude = (overrides or {}).get("exclude") or []
 
+    if not ALLOW_FREE_PREVIEW:
+        snapshot = paywall.SavedRequest(
+            kind="preview",
+            query=title,
+            city=city,
+            overrides=overrides or {},
+            area_id=area_id,
+        )
+        decision = await _ensure_quota(
+            call.message,
+            uid,
+            user=call.from_user,
+            snapshot=snapshot,
+            reason="preview",
+        )
+        if not decision:
+            return
+
     _log_preview_start(title, city, overrides)
     try:
         rows = await parser_adapter.preview_rows(
@@ -937,6 +1055,104 @@ async def cb_preview(call: types.CallbackQuery):
     _log_preview_ready(title, city, len(rows), overrides)
 
 
+async def prompt_resume(bot: Bot, user_id: int) -> None:
+    request = paywall.get_request(user_id)
+    if not request:
+        log_event("resume_prompt_skipped", message="resume cache empty", args={"user_id": user_id})
+        try:
+            await bot.send_message(
+                user_id,
+                "Оплата прошла ✅ Лимит обновлён — начни поиск с «🔎 Поиск».",
+                reply_markup=keyboards.main_kb(is_admin=is_admin(user_id)),
+            )
+        except Exception as exc:  # pragma: no cover
+            log_event(
+                "resume_prompt_failed",
+                level="WARN",
+                err=str(exc),
+                args={"user_id": user_id},
+            )
+        return
+
+    text = f"Оплата прошла ✅ Запустить прошлый запрос: «{request.summary()}»?"
+    kb = paywall.resume_keyboard()
+    try:
+        await bot.send_message(user_id, text, reply_markup=kb)
+        log_event("resume_prompt_shown", message="resume prompt shown", args={"request": request.to_log()})
+    except Exception as exc:  # pragma: no cover
+        log_event(
+            "resume_prompt_failed",
+            level="WARN",
+            err=str(exc),
+            args={"request": request.to_log()},
+        )
+
+
+async def cb_resume_yes(call: types.CallbackQuery):
+    await call.answer()
+    request = paywall.consume_request(call.from_user.id)
+    if not request:
+        await call.message.answer(
+            "Не нашёл сохранённый запрос. Начни заново с «🔎 Поиск».",
+            reply_markup=_main_menu_kb(call.message, user=call.from_user),
+        )
+        log_event("resume_prompt_skipped", message="resume cache empty on confirm", args={"user_id": call.from_user.id})
+        return
+
+    log_event("resume_confirmed", message="resume confirmed", args={"request": request.to_log()})
+
+    if request.kind == "amount" and request.area_id is not None and request.total is not None:
+        await _run_with_amount(
+            call.message,
+            request.query,
+            request.city,
+            request.area_id,
+            request.overrides,
+            request.total,
+            uid=call.from_user.id,
+            user=call.from_user,
+        )
+    elif request.kind == "direct":
+        await _run_parser(
+            call.message,
+            request.query,
+            request.city,
+            request.overrides,
+            uid=call.from_user.id,
+            user=call.from_user,
+        )
+    elif request.kind == "bypass":
+        await _run_parser_bypass_validation(
+            call.message,
+            request.query,
+            request.city,
+            request.overrides,
+            uid=call.from_user.id,
+            user=call.from_user,
+        )
+    else:
+        await call.message.answer(
+            "Не удалось восстановить параметры запроса. Начни заново с «🔎 Поиск».",
+            reply_markup=_main_menu_kb(call.message, user=call.from_user),
+        )
+        log_event(
+            "resume_prompt_skipped",
+            message="resume unsupported kind",
+            args={"request": request.to_log()},
+        )
+
+
+async def cb_resume_skip(call: types.CallbackQuery):
+    await call.answer()
+    request = paywall.get_request(call.from_user.id)
+    paywall.clear_request(call.from_user.id)
+    log_event("resume_skipped", message="resume skipped", args={"request": request.to_log() if request else None})
+    await call.message.answer(
+        "Хорошо! Когда будешь готов(а) — запусти поиск через «🔎 Поиск».",
+        reply_markup=_main_menu_kb(call.message, user=call.from_user),
+    )
+
+
 def register(dp: Dispatcher):
     # команды и диалог
     dp.register_message_handler(cmd_parse, commands=["parse"], state="*")
@@ -958,3 +1174,5 @@ def register(dp: Dispatcher):
     # выбор объёма и превью
     dp.register_callback_query_handler(cb_qty,     lambda c: c.data and c.data.startswith("qty:"),     state="*")
     dp.register_callback_query_handler(cb_preview, lambda c: c.data and c.data.startswith("preview:"), state="*")
+    dp.register_callback_query_handler(cb_resume_yes,  lambda c: c.data == "resume:last", state="*")
+    dp.register_callback_query_handler(cb_resume_skip, lambda c: c.data == "resume:skip", state="*")

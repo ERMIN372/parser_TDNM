@@ -2,6 +2,7 @@ import os
 
 import aiogram
 from aiogram import Dispatcher, types
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app.storage.repo import free_used_this_month, get_credits, is_unlimited_active
 from app.utils.logging import log_event, update_context
@@ -34,7 +35,8 @@ async def cmd_status(message: types.Message):
         "",
         f"aiogram: {aiogram.__version__}",
     ]
-    await message.reply("\n".join(lines))
+    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("💳 Купить", callback_data="buy:open"))
+    await message.reply("\n".join(lines), reply_markup=kb)
 
 def register(dp: Dispatcher):
     dp.register_message_handler(cmd_status, commands=["status"])

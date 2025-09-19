@@ -3,32 +3,39 @@ from __future__ import annotations
 from aiogram import Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.services import payments
-from app.services import referrals
+from app import keyboards
+from app.handlers import parse
+from app.services import paywall, payments, referrals
 from app.utils.logging import complete_operation, log_event, update_context
+from app.utils.admins import is_admin
 
 
-def _kb_packs() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        InlineKeyboardButton("1 запрос — 49 ₽", callback_data="pay_create:p1"),
-        InlineKeyboardButton("3 запроса — 139 ₽", callback_data="pay_create:p3"),
-        InlineKeyboardButton("9 запросов — 399 ₽", callback_data="pay_create:p9"),
-        InlineKeyboardButton("Безлимит 30 дней — 1299 ₽", callback_data="pay_create:unlim30"),
-    )
-    return kb
+def _resolve_pack(data: str) -> str | None:
+    parts = data.split(":")
+    if len(parts) < 3:
+        return None
+    if parts[1] == "pack":
+        return {"1": "p1", "3": "p3", "9": "p9"}.get(parts[2])
+    if parts[1] == "unlim" and parts[2] == "30":
+        return "unlim30"
+    return None
 
 
 async def cmd_buy(message: types.Message):
     update_context(command="/buy")
     log_event("request_parsed", message="/buy", command="/buy")
-    await message.reply("Выберите пакет:", reply_markup=_kb_packs())
+    await message.reply(paywall.paywall_text(), reply_markup=paywall.paywall_keyboard())
 
 
-async def cb_create(call: types.CallbackQuery):
-    pack = call.data.split(":", 1)[1]
-    update_context(command="pay_create", args={"pack": pack})
-    log_event("request_parsed", message=f"pay_create {pack}", command="pay_create", args={"pack": pack})
+async def _start_payment_flow(call: types.CallbackQuery, pack: str) -> None:
+    update_context(command="buy_pack", args={"pack": pack})
+    log_event("buy_cta_clicked", message=f"buy_cta {pack}", args={"pack": pack})
+
+    pending = paywall.get_pending_payment(call.from_user.id)
+    if pending and pending.pack == pack:
+        await call.answer("Оплата уже открыта — проверь ссылку выше.")
+        return
+
     me = await call.bot.get_me()
     try:
         pid, url = payments.create_payment(call.from_user.id, pack, bot_username=me.username)
@@ -37,15 +44,54 @@ async def cb_create(call: types.CallbackQuery):
         await call.answer("Ошибка создания платежа", show_alert=True)
         complete_operation(ok=False, err="payment_create_failed")
         return
-    kb = InlineKeyboardMarkup().add(
-        InlineKeyboardButton("💳 Оплатить", url=url),
-        InlineKeyboardButton("✅ Проверить оплату", callback_data=f"pay_check:{pid}"),
-    )
-    await call.message.reply(
-        f"Заказ оформлен: {payments.TITLES[pack]}.\nПосле оплаты жми «Проверить оплату».",
+
+    paywall.set_pending_payment(call.from_user.id, pid, pack, url)
+
+    price_text = paywall.pack_price_text(pack)
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("💳 Оплатить", url=url))
+    kb.add(InlineKeyboardButton("✅ Проверить оплату", callback_data=f"pay_check:{pid}"))
+
+    title = payments.TITLES.get(pack, pack)
+    price_part = f" — {price_text}" if price_text else ""
+    await call.message.answer(
+        f"Заказ оформлен: {title}{price_part}.\nПосле оплаты жми «Проверить оплату».",
         reply_markup=kb,
     )
+    await call.message.answer("Открыл оплату. После успешного платежа доступ появится автоматически.")
     await call.answer()
+
+
+async def cb_create(call: types.CallbackQuery):
+    pack = call.data.split(":", 1)[1]
+    update_context(command="pay_create", args={"pack": pack})
+    log_event("request_parsed", message=f"pay_create {pack}", command="pay_create", args={"pack": pack})
+    await _start_payment_flow(call, pack)
+
+
+async def cb_buy_pack(call: types.CallbackQuery):
+    pack = _resolve_pack(call.data)
+    if not pack:
+        await call.answer()
+        return
+    await _start_payment_flow(call, pack)
+
+
+async def cb_buy_open(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer(paywall.paywall_text(), reply_markup=paywall.paywall_keyboard())
+
+
+async def cb_buy_info(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer(paywall.paywall_text(), reply_markup=paywall.paywall_keyboard())
+
+
+async def cb_buy_back(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer(
+        "Главное меню:", reply_markup=keyboards.main_kb(is_admin=is_admin(call.from_user.id))
+    )
 
 
 async def cb_check(call: types.CallbackQuery):
@@ -53,14 +99,18 @@ async def cb_check(call: types.CallbackQuery):
     update_context(command="pay_check", args={"payment_id": pid})
     log_event("request_parsed", message=f"pay_check {pid}", command="pay_check", args={"payment_id": pid})
     try:
-        msg, activation = payments.check_and_apply(call.from_user.id, pid)
+        msg, activation, status = payments.check_and_apply(call.from_user.id, pid)
     except Exception as exc:
         log_event("payment_failed", level="ERROR", err=str(exc), message="payment check failed")
-        msg, activation = "Не удалось проверить оплату. Попробуйте позже.", None
+        msg, activation, status = "Не удалось проверить оплату. Попробуйте позже.", None, "error"
         complete_operation(ok=False, err="payment_check_failed")
     await call.message.reply(msg)
     if activation:
         await _notify_referral_activation(call.bot, activation, call.from_user)
+    if status != "pending":
+        paywall.clear_pending_payment(call.from_user.id)
+    if status == "succeeded":
+        await parse.prompt_resume(call.bot, call.from_user.id)
     await call.answer()
 
 
@@ -72,14 +122,18 @@ async def start_with_payload(message: types.Message):
     update_context(command="start_payload", args={"payment_id": pid})
     log_event("request_parsed", message=f"/start payload {pid}", command="/start", args={"payment_id": pid})
     try:
-        msg, activation = payments.check_and_apply(message.from_user.id, pid)
+        msg, activation, status = payments.check_and_apply(message.from_user.id, pid)
     except Exception as exc:
         log_event("payment_failed", level="ERROR", err=str(exc), message="payment check failed")
-        msg, activation = "Не удалось проверить оплату. Попробуйте позже.", None
+        msg, activation, status = "Не удалось проверить оплату. Попробуйте позже.", None, "error"
         complete_operation(ok=False, err="payment_check_failed")
     await message.reply(msg)
     if activation:
         await _notify_referral_activation(message.bot, activation, message.from_user)
+    if status != "pending":
+        paywall.clear_pending_payment(message.from_user.id)
+    if status == "succeeded":
+        await parse.prompt_resume(message.bot, message.from_user.id)
 
 
 async def _notify_referral_activation(bot, activation: referrals.ActivationResult, invitee: types.User | None) -> None:
@@ -115,6 +169,14 @@ def _format_user_mention(user: types.User | None) -> str:
 def register(dp: Dispatcher):
     dp.register_message_handler(cmd_buy, commands=["buy"])
     dp.register_message_handler(cmd_buy, lambda m: m.text in {"💳 Купить", "Купить"}, state="*")
+    dp.register_callback_query_handler(cb_buy_open, lambda c: c.data == "buy:open", state="*")
+    dp.register_callback_query_handler(cb_buy_info, lambda c: c.data == "buy:info", state="*")
+    dp.register_callback_query_handler(cb_buy_back, lambda c: c.data == "buy:back", state="*")
+    dp.register_callback_query_handler(
+        cb_buy_pack,
+        lambda c: c.data and (c.data.startswith("buy:pack:") or c.data.startswith("buy:unlim:")),
+        state="*",
+    )
     dp.register_callback_query_handler(cb_create, lambda c: c.data and c.data.startswith("pay_create:"))
     dp.register_callback_query_handler(cb_check, lambda c: c.data and c.data.startswith("pay_check:"))
     dp.register_message_handler(start_with_payload, commands=["start"])
