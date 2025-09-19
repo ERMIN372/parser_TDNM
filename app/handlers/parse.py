@@ -14,6 +14,7 @@ from aiogram.types import (
     InputFile,
     ReplyKeyboardRemove,
 )
+from aiogram.utils.exceptions import MessageCantBeEdited, MessageNotModified
 
 # анти-спам / занятость пользователя
 from ..middlewares.busy import BUSY_TEXT, clear_busy, is_busy, set_busy
@@ -21,11 +22,13 @@ from ..middlewares.busy import BUSY_TEXT, clear_busy, is_busy, set_busy
 from ..services import parser_adapter
 from ..services import referrals
 from ..services import validator  # валидация запроса
+from ..services import chips
 from ..services.mini_analytics import register_context, render_mini_analytics
 from ..services.quota import FREE_PER_MONTH, check_and_consume
 from app import keyboards
 from app.utils.admins import is_admin
 from app.utils.logging import complete_operation, log_event, update_context
+from app.utils.normalize import normalize_city, normalize_role
 
 # Кеш последнего «сомнительного» запроса: user_id -> (query, city, overrides)
 _WARN_CACHE: Dict[int, Tuple[str, str, dict]] = {}
@@ -175,6 +178,50 @@ def _main_menu_kb(message: types.Message, *, user: types.User | None = None):
     return keyboards.main_kb(is_admin=is_admin(user_id))
 
 
+def _keywords_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("➕ Добавить ключевые", callback_data="kw_yes"),
+        InlineKeyboardButton("Пропустить", callback_data="kw_no"),
+    )
+    return kb
+
+
+async def _handle_role_value(
+    message: types.Message,
+    state: FSMContext,
+    raw_value: str,
+    *,
+    user_id: int,
+) -> str:
+    chips.finish_session(user_id, "role")
+    role = normalize_role(raw_value)
+    update_context(dialog_step=_dialog_step("query", role))
+    await state.update_data(query=role)
+    prompt = await message.answer("Город?")
+    await ParseForm.waiting_city.set()
+    await chips.render_city_chips(prompt, user_id)
+    return role
+
+
+async def _handle_city_value(
+    message: types.Message,
+    state: FSMContext,
+    raw_value: str,
+    *,
+    user_id: int,
+) -> str:
+    chips.finish_session(user_id, "city")
+    city = normalize_city(raw_value)
+    update_context(dialog_step=_dialog_step("city", city))
+    await state.update_data(city=city)
+    await message.answer(
+        "Хочешь уточнить поиск ключевыми словами (включить/исключить)?",
+        reply_markup=_keywords_keyboard(),
+    )
+    return city
+
+
 def _format_user_mention(user: types.User | None) -> str:
     if not user:
         return "приглашённый"
@@ -240,6 +287,8 @@ async def _send_report_with_analytics(
 ) -> None:
     register_context(path, title=title, city=city)
     await message.answer_document(InputFile(path), reply_markup=reply_markup)
+    if getattr(message, "from_user", None):
+        chips.record_success(message.from_user.id, title, city)
     text = render_mini_analytics(
         path,
         approx_total=approx_total,
@@ -422,7 +471,7 @@ async def _run_parser(
         return
 
     # 1) Мягкая валидация
-    ok, norm_title, area_id, bad_msg = validator.validate_request(query, city)
+    ok, norm_title, area_id, canonical_city, bad_msg = validator.validate_request(query, city)
     if not ok:
         kb = InlineKeyboardMarkup(row_width=1)
         kb.add(
@@ -442,6 +491,9 @@ async def _run_parser(
         return
 
     # 2) Если юзер сам задал pages/per_page — запускаем без шага объёма (и блокируем пользователя)
+    city_to_use = canonical_city or city
+    city = city_to_use
+
     if "pages" in overrides or "per_page" in overrides:
         if not set_busy(requester_id):
             await message.answer(BUSY_TEXT)
@@ -452,11 +504,11 @@ async def _run_parser(
             await message.answer("Собираю вакансии, это может занять несколько минут…")
             if "area" not in overrides:
                 overrides["area"] = area_id
-            _log_parse_start(norm_title, city, overrides)
+            _log_parse_start(norm_title, city_to_use, overrides)
             path = await parser_adapter.run_report(
                 requester_id,
                 norm_title,
-                city,
+                city_to_use,
                 role=norm_title,
                 **overrides,
             )
@@ -471,12 +523,12 @@ async def _run_parser(
             clear_busy(requester_id)
 
         if path.exists():
-            _log_parse_ready(norm_title, city, overrides)
+            _log_parse_ready(norm_title, city_to_use, overrides)
             await _send_report_with_analytics(
                 message,
                 path,
                 title=norm_title,
-                city=city,
+                city=city_to_use,
                 include=overrides.get("include"),
                 exclude=overrides.get("exclude"),
                 reply_markup=_main_menu_kb(message, user=user),
@@ -500,7 +552,7 @@ async def _run_parser(
     # предпросмотр первых 5 — лёгкий запрос; тоже с блокировкой
     kb.row(InlineKeyboardButton("👀 Превью (5)", callback_data="preview:5"))
 
-    _PENDING_QTY[requester_id] = (norm_title, city, area_id, overrides, max_total)
+    _PENDING_QTY[requester_id] = (norm_title, city_to_use, area_id, overrides, max_total)
     update_context(dialog_step=_dialog_step("choose_qty", str(max_total)))
     await message.answer("Выбери объём выгрузки:", reply_markup=kb)
 
@@ -544,35 +596,111 @@ async def cmd_parse(message: types.Message, state: FSMContext):
 
     update_context(command="parse_dialog")
     log_event("request_parsed", message="parse dialog start", command="parse_dialog")
-    await message.answer("Введите должность:", reply_markup=ReplyKeyboardRemove())
+    prompt = await message.answer("Введите должность:", reply_markup=ReplyKeyboardRemove())
     await ParseForm.waiting_query.set()
+    await chips.render_role_chips(prompt, message.from_user.id)
 
 
 async def process_query(message: types.Message, state: FSMContext):
     if is_busy(message.from_user.id):
         await message.answer(BUSY_TEXT)
         return
-    text = (message.text or "").strip()
-    update_context(dialog_step=_dialog_step("query", text))
-    await state.update_data(query=text)
-    await message.answer("Город?")
-    await ParseForm.waiting_city.set()
+    text = message.text or ""
+    await _handle_role_value(message, state, text, user_id=message.from_user.id)
 
 
 async def process_city(message: types.Message, state: FSMContext):
     if is_busy(message.from_user.id):
         await message.answer(BUSY_TEXT)
         return
-    data = await state.get_data()
-    query = data.get("query")
-    city = (message.text or "").strip()
-    update_context(dialog_step=_dialog_step("city", city))
-    kb = InlineKeyboardMarkup().row(
-        InlineKeyboardButton("➕ Добавить ключевые", callback_data="kw_yes"),
-        InlineKeyboardButton("Пропустить", callback_data="kw_no"),
-    )
-    await state.update_data(city=city)
-    await message.answer("Хочешь уточнить поиск ключевыми словами (включить/исключить)?", reply_markup=kb)
+    city = message.text or ""
+    await _handle_city_value(message, state, city, user_id=message.from_user.id)
+
+
+async def cb_chip(call: types.CallbackQuery, state: FSMContext):
+    payload = chips.parse_callback_data(call.data or "")
+    if not payload:
+        return
+
+    kind = payload.get("kind")
+    if kind not in {"role", "city"}:
+        await call.answer()
+        return
+
+    if is_busy(call.from_user.id):
+        await call.answer("⌛ Выполняю запрос…", show_alert=False)
+        return
+
+    token = payload.get("token")
+    session = chips.get_session(token or "")
+    if (
+        not token
+        or session is None
+        or session.kind != kind
+        or not chips.is_active(call.from_user.id, session.kind, session.token)
+    ):
+        await call.answer("Эта клавиатура устарела. Начните заново.", show_alert=False)
+        return
+
+    action = payload.get("action")
+    if action == "more":
+        markup = chips.advance_page(session)
+        try:
+            await call.message.edit_reply_markup(markup)
+        except (MessageCantBeEdited, MessageNotModified):
+            pass
+        chips.log_click(session.kind, "more", "control", position=None, action="more")
+        await call.answer()
+        return
+
+    if action == "random":
+        if session.kind != "role":
+            await call.answer()
+            return
+        value = chips.random_role()
+        if not value:
+            await call.answer("Нет доступных вариантов", show_alert=False)
+            return
+        chips.log_click("role", value, "base", position=None, action="random")
+        chips.finish_session(call.from_user.id, "role")
+        try:
+            await call.message.edit_reply_markup()
+        except (MessageCantBeEdited, MessageNotModified):
+            pass
+        await call.answer()
+        await call.message.answer(f"✅ Должность: {value}")
+        await _handle_role_value(call.message, state, value, user_id=call.from_user.id)
+        return
+
+    if action != "pick":
+        await call.answer()
+        return
+
+    try:
+        index = int(payload.get("value", "-1"))
+    except ValueError:
+        await call.answer("Эта клавиатура устарела. Начните заново.", show_alert=False)
+        return
+
+    candidate = chips.resolve_candidate(session, index)
+    if not candidate:
+        await call.answer("Эта клавиатура устарела. Начните заново.", show_alert=False)
+        return
+
+    chips.log_click(session.kind, candidate.value, candidate.source, position=index + 1)
+    chips.finish_session(call.from_user.id, session.kind)
+    try:
+        await call.message.edit_reply_markup()
+    except (MessageCantBeEdited, MessageNotModified):
+        pass
+    await call.answer()
+
+    if session.kind == "role":
+        await call.message.answer(f"✅ Должность: {candidate.value}")
+        await _handle_role_value(call.message, state, candidate.value, user_id=call.from_user.id)
+    else:
+        await call.message.answer(f"✅ Город: {candidate.value}")
+        await _handle_city_value(call.message, state, candidate.value, user_id=call.from_user.id)
 
 
 # ---------- ключевые слова (include/exclude) ----------
@@ -777,6 +905,7 @@ def register(dp: Dispatcher):
     dp.register_message_handler(cmd_parse, lambda m: m.text == "🔎 Поиск", state="*")
     dp.register_message_handler(process_query, state=ParseForm.waiting_query)
     dp.register_message_handler(process_city, state=ParseForm.waiting_city)
+    dp.register_callback_query_handler(cb_chip, lambda c: c.data and c.data.startswith("chip:"), state="*")
 
     # ключевые слова
     dp.register_callback_query_handler(cb_kw_yes, lambda c: c.data == "kw_yes", state="*")

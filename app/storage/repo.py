@@ -4,7 +4,7 @@ from typing import Optional, Tuple, List
 
 from peewee import fn
 from .db import db
-from .models import User, Usage, Credit, Payment
+from .models import User, Usage, Credit, Payment, SearchQuery
 
 
 # ---------- утилиты ----------
@@ -82,6 +82,57 @@ def record_usage(user_id: int, kind: str) -> None:
     with db.atomic():
         ensure_user(user_id, None, None)
         Usage.create(user=user_id, month_key=_month_key(), kind=kind)
+
+
+# ---------- поисковые запросы / чипсы ----------
+def record_successful_search(user_id: int, role: str, city: str) -> None:
+    role = (role or "").strip()
+    city = (city or "").strip()
+    if not role or not city:
+        return
+    with db.atomic():
+        ensure_user(user_id, None, None)
+        SearchQuery.create(user=user_id, role=role, city=city)
+
+
+def get_recent_searches(user_id: int, limit: int = 20) -> List[SearchQuery]:
+    if limit <= 0:
+        return []
+    query = (
+        SearchQuery.select()
+        .where(SearchQuery.user == user_id)
+        .order_by(SearchQuery.created_at.desc())
+        .limit(limit)
+    )
+    return list(query)
+
+
+def get_trending_roles(since: datetime, limit: int, min_count: int) -> List[Tuple[str, int]]:
+    if limit <= 0:
+        return []
+    query = (
+        SearchQuery.select(SearchQuery.role, fn.COUNT(SearchQuery.id).alias("cnt"))
+        .where((SearchQuery.created_at >= since) & (SearchQuery.role != ""))
+        .group_by(SearchQuery.role)
+        .having(fn.COUNT(SearchQuery.id) >= min_count)
+        .order_by(fn.COUNT(SearchQuery.id).desc(), SearchQuery.role.asc())
+        .limit(limit)
+    )
+    return [(row.role, row.cnt) for row in query]
+
+
+def get_trending_cities(since: datetime, limit: int, min_count: int) -> List[Tuple[str, int]]:
+    if limit <= 0:
+        return []
+    query = (
+        SearchQuery.select(SearchQuery.city, fn.COUNT(SearchQuery.id).alias("cnt"))
+        .where((SearchQuery.created_at >= since) & (SearchQuery.city != ""))
+        .group_by(SearchQuery.city)
+        .having(fn.COUNT(SearchQuery.id) >= min_count)
+        .order_by(fn.COUNT(SearchQuery.id).desc(), SearchQuery.city.asc())
+        .limit(limit)
+    )
+    return [(row.city, row.cnt) for row in query]
 
 
 # ---------- кредиты ----------
