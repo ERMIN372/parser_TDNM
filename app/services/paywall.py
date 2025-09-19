@@ -120,18 +120,10 @@ def clear_pending_payment(user_id: int) -> None:
 
 
 def paywall_text() -> str:
-    lines = [
-        "Лимит исчерпан: бесплатные запросы на этот месяц закончились, платные кредиты отсутствуют.",
-        "",
-        "Можно оформить доступ:",
-    ]
-    for pack_id in payments.PACK_ORDER:
-        price_cop = payments.PRICES.get(pack_id)
-        if price_cop is None:
-            continue
-        title = payments.TITLES.get(pack_id, pack_id)
-        lines.append(f"• {title} — ₽{_format_rub(price_cop)}")
-    return "\n".join(lines)
+    return (
+        "Лимит исчерпан: бесплатные запросы на этот месяц закончились, "
+        "платные кредиты отсутствуют."
+    )
 
 
 def pack_price_text(pack_id: str) -> str:
