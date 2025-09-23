@@ -5,7 +5,6 @@ import logging
 import math
 import re
 from collections import Counter
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -20,19 +19,10 @@ except Exception:  # pragma: no cover - gracefully handle missing pandas
 log = logging.getLogger(__name__)
 
 _CONTEXT: dict[str, tuple[str, str]] = {}
-_SUMMARY: dict[str, "MiniSummary"] = {}
 
 _THIN_NBSP = "\u202f"
 
-__all__ = ["register_context", "render_mini_analytics", "get_summary"]
-
-
-@dataclass
-class MiniSummary:
-    median: str | None = None
-    low: str | None = None
-    high: str | None = None
-    top_companies: list[str] = field(default_factory=list)
+__all__ = ["register_context", "render_mini_analytics"]
 
 _SPARKLINE_LEVELS = "▁▂▃▄▅▆▇█"
 _SCHEDULE_MAP = (
@@ -144,12 +134,6 @@ def register_context(path: Path, *, title: str | None, city: str | None) -> None
     safe_title = (title or "").strip()
     safe_city = (city or "").strip()
     _CONTEXT[key] = (safe_title, safe_city)
-    _SUMMARY.pop(key, None)
-
-
-def get_summary(path: Path) -> MiniSummary | None:
-    key = str(Path(path).resolve())
-    return _SUMMARY.get(key)
 
 
 def _format_int(value: int | float | None) -> str:
@@ -430,7 +414,6 @@ def render_mini_analytics(
         header_lines.append(processed_line)
 
         sections: list[str] = ["\n".join(header_lines)]
-        summary = MiniSummary()
 
         # Salary block
         salary_lines: list[str] = []
@@ -480,19 +463,12 @@ def render_mini_analytics(
                     if processed:
                         share_val = (available_mask.sum() / processed) * 100
 
-                    median_text = _format_money(median_val)
-                    low_text = _format_money(p10_val)
-                    high_text = _format_money(p90_val)
-                    summary.median = median_text
-                    summary.low = low_text
-                    summary.high = high_text
-
                     salary_lines.extend(
                         [
                             "<b>💰 Вилки (₽/мес, midpoint)</b>",
-                            f"• медиана: {median_text}",
-                            f"• низ рынка: {low_text}",
-                            f"• верх рынка: {high_text}",
+                            f"• медиана: {_format_money(median_val)}",
+                            f"• низ рынка: {_format_money(p10_val)}",
+                            f"• верх рынка: {_format_money(p90_val)}",
                         ]
                     )
                     if share_val is not None:
@@ -508,17 +484,12 @@ def render_mini_analytics(
             combined = combined[combined["norm"].str.len() > 0]
             if not combined.empty:
                 counts = combined.groupby("norm").size().sort_values(ascending=False)
-                top_rows: list[str] = []
-                collected_companies: list[str] = []
+                top_rows = []
                 for idx, (norm_name, count) in enumerate(counts.head(5).items(), start=1):
                     display_name = combined[combined["norm"] == norm_name]["orig"].iloc[0]
-                    if len(collected_companies) < 3:
-                        collected_companies.append(str(display_name))
                     top_rows.append(f"{idx}) {html.escape(display_name)} — {_format_int(count)}")
                 if top_rows:
-                    sections.append("\n".join(["<b>🏢 Топ работодателей</b>"] + top_rows))
-                if collected_companies:
-                    summary.top_companies = collected_companies
+                    sections.append("\n".join(["<b>🏢 Топ работодателей по кол-ву вакансий</b>"] + top_rows))
 
         # Schedule / format
         if "schedule" in df.columns:
@@ -594,9 +565,7 @@ def render_mini_analytics(
         if filters_line:
             sections.append(filters_line)
 
-        text = "\n\n".join(sections)
-        _SUMMARY[key] = summary
-        return text
+        return "\n\n".join(sections)
     except Exception as exc:  # pragma: no cover
         log.warning("mini_analytics: failed to render analytics for %s: %s", path, exc, exc_info=True)
         return None

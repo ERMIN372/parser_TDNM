@@ -10,3 +10,6 @@ packages = ["glibcLocales", "xcodebuild", "zlib", "mailutils"]
 
 [agent]
 expertMode = true
+
+[deployment]
+deploymentTarget = "gce"

@@ -33,7 +33,6 @@ async def cmd_status(message: types.Message):
         f"• Платные кредиты: {credits}",
         f"• Безлимит: {'до ' + until.strftime('%Y-%m-%d %H:%M') + ' UTC' if active and until else 'нет'}",
         "",
-        f"aiogram: {aiogram.__version__}",
     ]
     kb = InlineKeyboardMarkup().add(InlineKeyboardButton("💳 Купить", callback_data="buy:open"))
     await message.reply("\n".join(lines), reply_markup=kb)

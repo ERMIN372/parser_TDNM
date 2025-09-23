@@ -154,8 +154,6 @@ def paywall_keyboard() -> InlineKeyboardMarkup:
         price_text = pack_price_text(pack_id)
         button_text = f"{title} — {price_text}" if price_text else title
         kb.add(InlineKeyboardButton(button_text, callback_data=callback_data))
-    kb.row(InlineKeyboardButton("Тарифы", callback_data="buy:info"))
-    kb.row(InlineKeyboardButton("Назад в меню", callback_data="buy:back"))
     return kb
 
 
