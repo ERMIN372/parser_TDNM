@@ -9,10 +9,6 @@ externalPort = 8080
 localPort = 8090
 externalPort = 80
 
-[[ports]]
-localPort = 45573
-externalPort = 3000
-
 [nix]
 packages = ["glibcLocales", "xcodebuild", "zlib", "mailutils"]
 
