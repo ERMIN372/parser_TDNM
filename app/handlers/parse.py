@@ -501,7 +501,8 @@ async def cb_report_share_copy(call: types.CallbackQuery):
     me = await call.bot.get_me()
     link = report_share.build_share_link(me.username or "", call.from_user.id)
     share_text = report_share.build_share_text(snapshot, link)
-    await call.answer(share_text, show_alert=True)
+    await call.answer("Скопируй текст ниже 👇", show_alert=True)
+    await call.message.answer(share_text, disable_web_page_preview=True)
 
 
 async def cb_report_again(call: types.CallbackQuery, state: FSMContext):
