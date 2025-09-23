@@ -91,8 +91,20 @@ def main() -> None:
     webhook.set_dispatcher(dp)
 
     async def _run() -> None:
+        webhook_setup_success = False
         try:
-            await webhook.setup_webhook(bot)
+            # Try to setup webhook, but don't fail if it doesn't work initially
+            try:
+                await webhook.setup_webhook(bot)
+                webhook_setup_success = True
+                log_event("webhook_setup", message="Webhook configured successfully")
+            except Exception as e:
+                log_event("webhook_setup_failed", level="WARN", 
+                         message=f"Initial webhook setup failed: {e}. Server will start anyway.")
+                print(f"Warning: Webhook setup failed: {e}")
+                print("The server will start anyway. You can manually set the webhook later.")
+            
+            # Start the server regardless of webhook setup status
             config = uvicorn.Config(
                 webhook.app,
                 host=settings.WEBAPP_HOST,
@@ -100,9 +112,15 @@ def main() -> None:
                 log_level="info",
             )
             server = uvicorn.Server(config)
+            log_event("server_start", message=f"Starting server on {settings.WEBAPP_HOST}:{settings.WEBAPP_PORT}")
             await server.serve()
         finally:
-            await webhook.remove_webhook(bot)
+            # Only try to remove webhook if it was successfully set
+            if webhook_setup_success:
+                try:
+                    await webhook.remove_webhook(bot)
+                except Exception as e:
+                    log_event("webhook_cleanup_failed", level="WARN", message=f"Failed to cleanup webhook: {e}")
 
     asyncio.run(_run())
 

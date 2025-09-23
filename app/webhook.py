@@ -14,6 +14,16 @@ def set_dispatcher(dp: Dispatcher):
     _bot = dp.bot
 
 
+@app.get("/")
+async def health_check():
+    """Health check endpoint for deployment verification"""
+    return {
+        "status": "ok",
+        "message": "Telegram Bot Server is running",
+        "mode": "webhook",
+        "dispatcher_ready": _dp is not None
+    }
+
 @app.post("/webhook")
 async def handle_update(request: Request):
     if _dp is None:
@@ -25,7 +35,25 @@ async def handle_update(request: Request):
 
 
 async def setup_webhook(bot: Bot):
-    await bot.set_webhook(settings.WEBHOOK_URL)
+    """Setup webhook with validation and error handling for deployment"""
+    if not settings.WEBHOOK_URL:
+        raise ValueError("WEBHOOK_URL is required for webhook mode")
+    
+    # Validate webhook URL format
+    if not settings.WEBHOOK_URL.startswith(('https://', 'http://localhost')):
+        raise ValueError("WEBHOOK_URL must use HTTPS (or HTTP for localhost)")
+    
+    if '/webhook' not in settings.WEBHOOK_URL:
+        raise ValueError("WEBHOOK_URL should end with '/webhook' endpoint")
+    
+    try:
+        await bot.set_webhook(settings.WEBHOOK_URL)
+        print(f"Webhook successfully set to: {settings.WEBHOOK_URL}")
+    except Exception as e:
+        print(f"Failed to set webhook: {e}")
+        print("This might be expected during development or if the deployment URL is not yet accessible")
+        # Re-raise for proper error handling
+        raise
 
 
 async def remove_webhook(bot: Bot):
