@@ -16,7 +16,7 @@ packages = ["glibcLocales", "xcodebuild", "zlib", "mailutils"]
 expertMode = true
 
 [deployment]
-deploymentTarget = "vm"
+deploymentTarget = "autoscale"
 run = ["./start.sh"]
 
 [workflows]
