@@ -23,7 +23,8 @@ from ..services import parser_adapter
 from ..services import referrals
 from ..services import validator  # валидация запроса
 from ..services import chips
-from ..services.mini_analytics import register_context, render_mini_analytics
+from ..services.mini_analytics import get_summary, register_context, render_mini_analytics
+from ..services import report_share
 from ..services import paywall
 from ..services.quota import FREE_PER_MONTH, QuotaDecision, check_quota, commit_usage
 from app import keyboards
@@ -306,6 +307,14 @@ def _main_menu_kb(message: types.Message, *, user: types.User | None = None):
     return keyboards.main_kb(is_admin=is_admin(user_id))
 
 
+def _report_actions_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("📬 Поделиться отчётом", callback_data="report_share"))
+    kb.add(InlineKeyboardButton("🔁 Ещё раз", callback_data="report_again"))
+    kb.add(InlineKeyboardButton("🏠 Меню", callback_data="report_menu"))
+    return kb
+
+
 def _keywords_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     kb.row(
@@ -414,17 +423,38 @@ async def _send_report_with_analytics(
     reply_markup=None,
 ) -> None:
     register_context(path, title=title, city=city)
-    await message.answer_document(InputFile(path), reply_markup=reply_markup)
-    if getattr(message, "from_user", None):
-        chips.record_success(message.from_user.id, title, city)
+    share_kb = _report_actions_keyboard()
+    await message.answer_document(InputFile(path), reply_markup=share_kb)
+    person = getattr(message, "from_user", None)
+    if person:
+        chips.record_success(person.id, title, city)
+    include_list = _ensure_str_list(include)
+    exclude_list = _ensure_str_list(exclude)
     text = render_mini_analytics(
         path,
         approx_total=approx_total,
-        include=_ensure_str_list(include),
-        exclude=_ensure_str_list(exclude),
+        include=include_list,
+        exclude=exclude_list,
     )
+    summary = get_summary(path)
+    if person:
+        report_share.save_last_report(
+            person.id,
+            role=title,
+            city=city,
+            include=include_list,
+            exclude=exclude_list,
+            volume=approx_total,
+            path=path,
+            median=getattr(summary, "median", None),
+            low=getattr(summary, "low", None),
+            high=getattr(summary, "high", None),
+            top_companies=getattr(summary, "top_companies", None),
+        )
     if text:
-        await message.answer(text, disable_web_page_preview=True)
+        await message.answer(text, disable_web_page_preview=True, reply_markup=reply_markup)
+    elif reply_markup is not None:
+        await message.answer("Готово ✅", reply_markup=reply_markup)
     activation = referrals.handle_activation_trigger(message.from_user.id, "report")
     if activation and activation.inviter_id:
         mention = _format_user_mention(message.from_user)
@@ -441,6 +471,48 @@ async def _send_report_with_analytics(
                 inviter_id=activation.inviter_id,
                 err=str(exc),
             )
+
+
+async def cb_report_share(call: types.CallbackQuery):
+    await call.answer()
+    snapshot = report_share.get_last_report(call.from_user.id)
+    if not snapshot:
+        await call.message.answer("Сначала запусти поиск.")
+        return
+    log_event(
+        "share_opened",
+        user_id=call.from_user.id,
+        role=snapshot.role,
+        city=snapshot.city,
+    )
+    me = await call.bot.get_me()
+    link = report_share.build_share_link(me.username or "", call.from_user.id)
+    share_text = report_share.build_share_text(snapshot, link)
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("Скопировать текст", callback_data="report_share_copy"))
+    await call.message.answer(share_text, reply_markup=kb, disable_web_page_preview=True)
+
+
+async def cb_report_share_copy(call: types.CallbackQuery):
+    snapshot = report_share.get_last_report(call.from_user.id)
+    if not snapshot:
+        await call.answer("Сначала запусти поиск.", show_alert=True)
+        return
+    me = await call.bot.get_me()
+    link = report_share.build_share_link(me.username or "", call.from_user.id)
+    share_text = report_share.build_share_text(snapshot, link)
+    await call.answer(share_text, show_alert=True)
+
+
+async def cb_report_again(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    await cmd_parse(call.message, state)
+
+
+async def cb_report_menu(call: types.CallbackQuery):
+    await call.answer()
+    kb = keyboards.main_kb(is_admin=is_admin(call.from_user.id))
+    await call.message.answer("Главное меню:", reply_markup=kb)
 
 
 async def _run_parser_bypass_validation(
@@ -1328,5 +1400,9 @@ def register(dp: Dispatcher):
     # выбор объёма и превью
     dp.register_callback_query_handler(cb_qty,     lambda c: c.data and c.data.startswith("qty:"),     state="*")
     dp.register_callback_query_handler(cb_preview, lambda c: c.data and c.data.startswith("preview:"), state="*")
+    dp.register_callback_query_handler(cb_report_share, lambda c: c.data == "report_share", state="*")
+    dp.register_callback_query_handler(cb_report_share_copy, lambda c: c.data == "report_share_copy", state="*")
+    dp.register_callback_query_handler(cb_report_again, lambda c: c.data == "report_again", state="*")
+    dp.register_callback_query_handler(cb_report_menu, lambda c: c.data == "report_menu", state="*")
     dp.register_callback_query_handler(cb_resume_yes,  lambda c: c.data == "resume:last", state="*")
     dp.register_callback_query_handler(cb_resume_skip, lambda c: c.data == "resume:skip", state="*")
