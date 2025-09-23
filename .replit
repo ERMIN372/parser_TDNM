@@ -35,10 +35,9 @@ args = "Bot Server"
 name = "Bot Server"
 author = "agent"
 
-[[workflows.workflow.tasks]]
-task = "shell.exec"
-args = "MODE=webhook WEBAPP_HOST=0.0.0.0 WEBAPP_PORT=8080 ./start.sh"
-waitForPort = 8080
-
 [workflows.workflow.metadata]
 outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "MODE=polling ./start.sh"
