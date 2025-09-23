@@ -2,12 +2,16 @@ run="./repl.deploy --standalone ./start.sh"
 modules = ["python-3.11"]
 
 [[ports]]
+localPort = 8080
+externalPort = 8080
+
+[[ports]]
 localPort = 8090
 externalPort = 80
 
 [[ports]]
-localPort = 8080
-externalPort = 8080
+localPort = 45573
+externalPort = 3000
 
 [nix]
 packages = ["glibcLocales", "xcodebuild", "zlib", "mailutils"]
