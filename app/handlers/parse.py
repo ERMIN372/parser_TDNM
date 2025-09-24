@@ -23,7 +23,7 @@ from ..services import parser_adapter
 from ..services import referrals
 from ..services import validator  # валидация запроса
 from ..services import chips
-from ..services.mini_analytics import get_summary, register_context, render_mini_analytics
+from ..services.mini_analytics import register_context, render_mini_analytics
 from ..services import report_share
 from ..services import paywall
 from ..services.quota import FREE_PER_MONTH, QuotaDecision, check_quota, commit_usage
