@@ -33,11 +33,16 @@ def _load() -> Settings:
             return default
         return value.strip().lower() in {"1", "true", "yes", "on"}
 
+    webapp_port_value = os.getenv("WEBAPP_PORT")
+    if not webapp_port_value:
+        webapp_port_value = os.getenv("PORT")
+    webapp_port = int(webapp_port_value or "8080")
+
     cfg = Settings(
         TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         MODE=os.getenv("MODE", "polling"),
         WEBAPP_HOST=os.getenv("WEBAPP_HOST", "0.0.0.0"),
-        WEBAPP_PORT=int(os.getenv("WEBAPP_PORT", "8080")),
+        WEBAPP_PORT=webapp_port,
         WEBHOOK_URL=os.getenv("WEBHOOK_URL", ""),
         REPORT_DIR=Path(os.getenv("REPORT_DIR", "./reports")),
         PARSER_USER_AGENT=os.getenv("PARSER_USER_AGENT"),
