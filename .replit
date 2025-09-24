@@ -5,6 +5,10 @@ modules = ["python-3.11"]
 localPort = 8080
 externalPort = 8080
 
+[[ports]]
+localPort = 5000
+externalPort = 80
+
 [nix]
 packages = ["glibcLocales", "xcodebuild", "zlib", "mailutils"]
 
@@ -33,8 +37,7 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "./start.sh"
-waitForPort = 8080
+args = "MODE=polling ./start.sh"
 
 [workflows.workflow.metadata]
 outputType = "console"
