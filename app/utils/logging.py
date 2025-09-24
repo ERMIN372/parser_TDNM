@@ -146,31 +146,19 @@ class JsonFormatter(logging.Formatter):
 
 
 class ConsoleFormatter(logging.Formatter):
-    COLORS = {
-        "DEBUG": "\x1b[38;5;245m",
-        "INFO": "\x1b[38;5;46m",
-        "WARN": "\x1b[38;5;214m",
-        "WARNING": "\x1b[38;5;214m",
-        "ERROR": "\x1b[38;5;196m",
-        "RESET": "\x1b[0m",
-    }
+    def __init__(self) -> None:
+        super().__init__("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
     def format(self, record: logging.LogRecord) -> str:
-        event: Dict[str, Any] = getattr(record, "event_data", {})
-        level = record.levelname
-        color = self.COLORS.get(level, "")
-        reset = self.COLORS["RESET"] if color else ""
-        ts = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
-        correlation_id = event.get("correlation_id", "----")
-        user_part = ""
-        if event.get("username"):
-            user_part = f" @{event['username']}"
-        if event.get("full_name"):
-            user_part += f" ({event.get('user_id', '-')}: {event['full_name']})"
-        elif event.get("user_id"):
-            user_part += f" ({event['user_id']})"
-        summary = record.getMessage()
-        return f"[{ts} {color}{level}{reset}] (#{correlation_id[:6]}){user_part}: {summary}"
+        message = super().format(record)
+        event: Dict[str, Any] | None = getattr(record, "event_data", None)
+        if event:
+            try:
+                extra = json.dumps(event, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                extra = str(event)
+            return f"{message} | data={extra}"
+        return message
 
 
 def _ensure_logger() -> Logger:
@@ -188,6 +176,9 @@ def setup_logging() -> None:
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
+
+    for noisy in ("aiogram", "aiohttp.access", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.INFO)
 
     log_queue: queue.Queue[logging.LogRecord] = queue.Queue()
     queue_handler = QueueHandler(log_queue)

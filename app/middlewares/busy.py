@@ -9,7 +9,7 @@ from aiogram.dispatcher.middlewares import BaseMiddleware
 from app.utils.logging import log_event
 
 # Текст уведомления
-BUSY_TEXT = "🧑‍🍳 Уже выполняю твой запрос — дождись, пожалуйста."
+BUSY_TEXT = "⏳ Уже выполняю твой запрос — дождись, пожалуйста."
 
 # Глобальный реестр «занятых» пользователей
 BUSY_USERS: Set[int] = set()
