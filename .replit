@@ -2,15 +2,15 @@ run="./repl.deploy --standalone ./start.sh"
 modules = ["python-3.11"]
 
 [[ports]]
-localPort = 8080
-externalPort = 8080
-
-[[ports]]
 localPort = 5000
 externalPort = 80
 
+[[ports]]
+localPort = 8080
+externalPort = 8080
+
 [nix]
-packages = ["glibcLocales", "xcodebuild", "zlib", "mailutils"]
+packages = ["glibcLocales", "xcodebuild", "zlib", "mailutils", "imagemagick6"]
 
 [agent]
 expertMode = true
