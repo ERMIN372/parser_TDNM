@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .config import settings
-from .utils.logging import setup_logging
+from .utils.logging import log_event, setup_logging
 
 
 setup_logging()
@@ -83,13 +83,67 @@ async def version_info():
     return {"rev": rev, "env": "replit"}
 
 
+def _extract_update_details(update: types.Update) -> dict[str, object | None]:
+    message = (
+        update.message
+        or update.edited_message
+        or update.channel_post
+        or update.edited_channel_post
+    )
+
+    has_message = message is not None
+    message_text = None
+    chat_id = None
+
+    if message:
+        chat_id = getattr(message.chat, "id", None)
+        message_text = getattr(message, "text", None) or getattr(message, "caption", None)
+    elif update.callback_query:
+        callback = update.callback_query
+        if callback.message and callback.message.chat:
+            chat_id = callback.message.chat.id
+        else:
+            chat_id = getattr(callback.from_user, "id", None)
+        message_text = callback.data
+    elif update.inline_query:
+        chat_id = getattr(update.inline_query.from_user, "id", None)
+        message_text = update.inline_query.query
+    elif update.chosen_inline_result:
+        chat_id = getattr(update.chosen_inline_result.from_user, "id", None)
+        message_text = update.chosen_inline_result.query
+    elif update.shipping_query:
+        chat_id = getattr(update.shipping_query.from_user, "id", None)
+    elif update.pre_checkout_query:
+        chat_id = getattr(update.pre_checkout_query.from_user, "id", None)
+
+    return {
+        "update_id": update.update_id,
+        "has_message": has_message,
+        "message_text": message_text,
+        "chat_id": chat_id,
+    }
+
+
 @app.post("/webhook")
 async def handle_update(request: Request):
-    if _dp is None:
+    if _dp is None or _bot is None:
+        logger.warning("Dispatcher is not ready to handle webhook update")
         return {"status": "dispatcher not ready"}
+
     data = await request.json()
     update = types.Update(**data)
-    await _dp.process_update(update)
+    details = _extract_update_details(update)
+
+    log_event("webhook_received", **details)
+
+    try:
+        await _dp.feed_update(_bot, update)
+    except Exception as exc:
+        logger.exception("Failed to process webhook update")
+        log_event("webhook_error", level="ERROR", err=str(exc), **details)
+        raise
+
+    log_event("webhook_dispatched", **details)
     return {"status": "ok"}
 
 
