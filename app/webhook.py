@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, types
@@ -126,25 +127,58 @@ def _extract_update_details(update: types.Update) -> dict[str, object | None]:
 
 @app.post("/webhook")
 async def handle_update(request: Request):
-    if _dp is None or _bot is None:
-        logger.warning("Dispatcher is not ready to handle webhook update")
-        return {"status": "dispatcher not ready"}
-
-    data = await request.json()
-    update = types.Update(**data)
-    details = _extract_update_details(update)
-
-    log_event("webhook_received", **details)
+    correlation_id = str(uuid.uuid4())
 
     try:
-        await _dp.feed_update(_bot, update)
+        payload = await request.json()
+    except Exception as exc:
+        logger.exception("Failed to decode webhook payload")
+        log_event(
+            "webhook_error",
+            level="ERROR",
+            correlation_id=correlation_id,
+            err=str(exc),
+        )
+        return {"ok": True}
+
+    try:
+        update = types.Update(**payload)
+    except Exception as exc:
+        logger.exception("Failed to parse webhook update")
+        log_event(
+            "webhook_error",
+            level="ERROR",
+            correlation_id=correlation_id,
+            err=str(exc),
+        )
+        return {"ok": True}
+
+    details = _extract_update_details(update)
+    log_details = {**details, "correlation_id": correlation_id}
+
+    log_event("webhook_received", **log_details)
+
+    if _dp is None or _bot is None:
+        logger.error("Dispatcher is not ready to handle webhook update")
+        log_event(
+            "webhook_error",
+            level="ERROR",
+            message="Dispatcher is not ready",
+            **log_details,
+        )
+        return {"ok": True}
+
+    try:
+        Bot.set_current(_bot)
+        Dispatcher.set_current(_dp)
+        await _dp.process_update(update)
     except Exception as exc:
         logger.exception("Failed to process webhook update")
-        log_event("webhook_error", level="ERROR", err=str(exc), **details)
-        raise
+        log_event("webhook_error", level="ERROR", err=str(exc), **log_details)
+    else:
+        log_event("webhook_dispatched", **log_details)
 
-    log_event("webhook_dispatched", **details)
-    return {"status": "ok"}
+    return {"ok": True}
 
 
 async def setup_webhook(bot: Bot) -> None:
