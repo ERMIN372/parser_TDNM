@@ -850,12 +850,11 @@ async def _send_report_with_analytics(
     file_name_override: str | None = None,
 ) -> SendReportResult:
     register_context(path, title=title, city=city)
-    share_kb = _report_actions_keyboard()
     send_result = await send_report(
         message.bot,
         message.chat.id,
         path,
-        reply_markup=share_kb,
+        reply_markup=None,
         diagnostic_path=diagnostic_path,
         diagnostic_caption=diagnostic_caption,
         file_name=file_name_override,
@@ -890,9 +889,16 @@ async def _send_report_with_analytics(
             top_companies=getattr(summary, "top_companies", None),
         )
     if text:
-        await message.answer(text, disable_web_page_preview=True, reply_markup=reply_markup)
-    elif reply_markup is not None:
-        await message.answer("Готово ✅", reply_markup=reply_markup)
+        await message.answer(
+            text,
+            disable_web_page_preview=True,
+            reply_markup=_report_actions_keyboard(),
+        )
+    else:
+        await message.answer("Готово ✅", reply_markup=_report_actions_keyboard())
+
+    if reply_markup is not None:
+        await message.answer("Главное меню:", reply_markup=reply_markup)
     activation = referrals.handle_activation_trigger(message.from_user.id, "report")
     if activation and activation.inviter_id:
         mention = _format_user_mention(message.from_user)
