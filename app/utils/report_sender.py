@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from aiogram import Bot, types
 from aiogram.types import InputFile
@@ -45,25 +45,48 @@ async def send_report(
         error_message = str(exc)
         log_event(
             "report.send_fail",
-            type=type(exc).__name__,
-            message=error_message,
+            level="ERROR",
+            stage="stat",
             path=str(report_path),
+            chat_id=chat_id,
+            **_exception_payload(exc),
         )
         return SendReportResult(False, None, exc, error_message, None)
+
+    log_event(
+        "report.send_prepare",
+        path=str(report_path),
+        chat_id=chat_id,
+        size=size,
+        file_name=file_name or report_path.name,
+        exists=True,
+        suffix=report_path.suffix,
+        modified_ts=int(stat.st_mtime),
+    )
 
     if size <= 0:
         log_event(
             "report.send_fail",
-            type="EmptyFile",
+            level="ERROR",
+            stage="validate",
+            error_type="EmptyFile",
             message="file_is_empty",
             size=size,
             path=str(report_path),
+            chat_id=chat_id,
         )
         return SendReportResult(False, None, None, "file_is_empty", size)
 
     try:
         with report_path.open("rb") as src:
             resolved_name = _resolve_file_name(report_path, file_name)
+            log_event(
+                "report.send_attempt",
+                path=str(report_path),
+                chat_id=chat_id,
+                file_name=resolved_name,
+                size=size,
+            )
             input_file = InputFile(src, filename=resolved_name)
             message = await bot.send_document(
                 chat_id,
@@ -75,12 +98,22 @@ async def send_report(
         error_message = str(exc)
         log_event(
             "report.send_fail",
-            type=type(exc).__name__,
-            message=error_message,
-            size=size,
+            level="ERROR",
+            stage="send",
             path=str(report_path),
+            chat_id=chat_id,
+            size=size,
+            file_name=file_name or report_path.name,
+            **_exception_payload(exc),
         )
         if size and size > MAX_TELEGRAM_FILE_SIZE:
+            log_event(
+                "report.send_too_big",
+                level="WARN",
+                path=str(report_path),
+                chat_id=chat_id,
+                size=size,
+            )
             await _notify_file_too_big(
                 bot,
                 chat_id,
@@ -92,10 +125,13 @@ async def send_report(
         error_message = str(exc)
         log_event(
             "report.send_fail",
-            type=type(exc).__name__,
-            message=error_message,
-            size=size,
+            level="ERROR",
+            stage="send",
             path=str(report_path),
+            chat_id=chat_id,
+            size=size,
+            file_name=file_name or report_path.name,
+            **_exception_payload(exc),
         )
         return SendReportResult(False, None, exc, error_message, size)
 
@@ -104,10 +140,39 @@ async def send_report(
         "report.send_ok",
         duration_ms=duration_ms,
         size=size,
-        file_name=report_path.name,
+        file_name=file_name or report_path.name,
         path=str(report_path),
+        chat_id=chat_id,
     )
     return SendReportResult(True, message, None, None, size)
+
+
+def _exception_payload(exc: BaseException) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+    }
+    if isinstance(exc, TelegramAPIError):
+        payload.setdefault("status_code", getattr(exc, "status_code", None))
+        description = getattr(exc, "message", None) or getattr(exc, "description", None)
+        if description:
+            payload.setdefault("description", description)
+        parameters = getattr(exc, "parameters", None)
+        if parameters:
+            parameters_data: Any
+            if hasattr(parameters, "to_python"):
+                parameters_data = parameters.to_python()
+            elif hasattr(parameters, "model_dump"):
+                parameters_data = parameters.model_dump()
+            else:
+                parameters_data = str(parameters)
+            payload.setdefault("parameters", parameters_data)
+    if isinstance(exc, NetworkError):
+        payload.setdefault("timeout", getattr(exc, "timeout", None))
+    args = getattr(exc, "args", None)
+    if args:
+        payload.setdefault("args", list(args))
+    return {k: v for k, v in payload.items() if v not in (None, "")}
 
 
 def _resolve_file_name(report_path: Path, override: str | None) -> str:
