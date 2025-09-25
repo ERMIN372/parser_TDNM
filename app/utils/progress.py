@@ -58,6 +58,10 @@ class Progress:
     def ui_strategy(self) -> str:
         return self._ui_strategy
 
+    @property
+    def last_percent(self) -> int:
+        return self._last_percent
+
     @classmethod
     async def create(
         cls,
