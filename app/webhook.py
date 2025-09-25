@@ -96,9 +96,17 @@ def _extract_update_details(update: types.Update) -> dict[str, object | None]:
     message_text = None
     chat_id = None
 
+    user_id = None
+    username = None
+    full_name = None
+
     if message:
         chat_id = getattr(message.chat, "id", None)
         message_text = getattr(message, "text", None) or getattr(message, "caption", None)
+        if message.from_user:
+            user_id = getattr(message.from_user, "id", None)
+            username = getattr(message.from_user, "username", None)
+            full_name = getattr(message.from_user, "full_name", None)
     elif update.callback_query:
         callback = update.callback_query
         if callback.message and callback.message.chat:
@@ -106,22 +114,45 @@ def _extract_update_details(update: types.Update) -> dict[str, object | None]:
         else:
             chat_id = getattr(callback.from_user, "id", None)
         message_text = callback.data
+        if callback.from_user:
+            user_id = getattr(callback.from_user, "id", None)
+            username = getattr(callback.from_user, "username", None)
+            full_name = getattr(callback.from_user, "full_name", None)
     elif update.inline_query:
         chat_id = getattr(update.inline_query.from_user, "id", None)
         message_text = update.inline_query.query
+        from_user = update.inline_query.from_user
+        user_id = getattr(from_user, "id", None)
+        username = getattr(from_user, "username", None)
+        full_name = getattr(from_user, "full_name", None)
     elif update.chosen_inline_result:
         chat_id = getattr(update.chosen_inline_result.from_user, "id", None)
         message_text = update.chosen_inline_result.query
+        from_user = update.chosen_inline_result.from_user
+        user_id = getattr(from_user, "id", None)
+        username = getattr(from_user, "username", None)
+        full_name = getattr(from_user, "full_name", None)
     elif update.shipping_query:
         chat_id = getattr(update.shipping_query.from_user, "id", None)
+        user = update.shipping_query.from_user
+        user_id = getattr(user, "id", None)
+        username = getattr(user, "username", None)
+        full_name = getattr(user, "full_name", None)
     elif update.pre_checkout_query:
         chat_id = getattr(update.pre_checkout_query.from_user, "id", None)
+        user = update.pre_checkout_query.from_user
+        user_id = getattr(user, "id", None)
+        username = getattr(user, "username", None)
+        full_name = getattr(user, "full_name", None)
 
     return {
         "update_id": update.update_id,
         "has_message": has_message,
         "message_text": message_text,
         "chat_id": chat_id,
+        "user_id": user_id,
+        "username": username,
+        "full_name": full_name,
     }
 
 
