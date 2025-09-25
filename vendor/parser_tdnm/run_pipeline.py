@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from typing import Iterable, List
 
+import shlex
+
 try:  # pragma: no cover - import shim for script execution
     from .constants import DEFAULT_HH_SEARCH_FIELD
 except ImportError:  # noqa: F401 - fallback for running as standalone script
@@ -59,6 +61,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
                         help="Оставить промежуточный raw.csv в выходном каталоге")
     parser.add_argument("--name-suffix", default=None, help="Доп. постфикс к имени файла")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--site", default=None, help="Источник вакансий (для адаптеров)")
     return parser.parse_args(list(argv))
 
 def run_pipeline(args: argparse.Namespace) -> List[Path]:
@@ -75,9 +78,20 @@ def run_pipeline(args: argparse.Namespace) -> List[Path]:
     tmp_csv = PARSERS_DIR / "raw.csv"
     tmp_csv.parent.mkdir(parents=True, exist_ok=True)
 
+    fetcher_path = PARSERS_DIR / "fetch_vacancies.py"
+    if args.site:
+        specialized_fetcher = PARSERS_DIR / f"fetch_{args.site}.py"
+        if specialized_fetcher.exists():
+            fetcher_path = specialized_fetcher
+        else:
+            print(
+                "WARNING: 'site' argument is ignored by the current fetcher; proceeding with default sources.",
+                file=sys.stderr,
+            )
+
     fetch_cmd = [
         sys.executable,
-        str(PARSERS_DIR / "fetch_vacancies.py"),
+        str(fetcher_path),
         "--query", args.query,
         "--area", str(args.area),
         "--city", args.city,
@@ -90,7 +104,33 @@ def run_pipeline(args: argparse.Namespace) -> List[Path]:
     if args.role:
         fetch_cmd.extend(["--role", args.role])
 
-    subprocess.run(fetch_cmd, check=True)
+    cmd_display = " ".join(shlex.quote(part) for part in fetch_cmd)
+    print(f"INFO: running fetcher command: {cmd_display}", file=sys.stderr)
+
+    try:
+        completed = subprocess.run(
+            fetch_cmd,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stdout_tail = "\n".join((exc.stdout or "").strip().splitlines()[-5:])
+        stderr_tail = "\n".join((exc.stderr or "").strip().splitlines()[-5:])
+        raise RuntimeError(
+            "Fetcher command failed"
+            f" (exit code {exc.returncode}).\n"
+            f"Command: {cmd_display}\n"
+            "STDOUT tail:\n"
+            f"{stdout_tail or '<empty>'}\n"
+            "STDERR tail:\n"
+            f"{stderr_tail or '<empty>'}"
+        ) from exc
+
+    if completed.stdout:
+        sys.stdout.write(completed.stdout)
+    if completed.stderr:
+        sys.stderr.write(completed.stderr)
     print(json.dumps({"status": "csv", "path": str(tmp_csv)}))
 
     outputs: List[Path] = []
