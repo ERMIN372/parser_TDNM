@@ -1242,6 +1242,18 @@ async def _run_parser_bypass_validation(
                 send_error_message = send_result.error_message
 
                 if not send_result.ok:
+                    log_event(
+                        "deliver.send_report_failed",
+                        level="ERROR",
+                        correlation_id=correlation,
+                        chat_id=chat_id,
+                        path=str(report_path),
+                        size_bytes=send_result.size,
+                        error_type=type(send_result.error).__name__
+                        if send_result.error
+                        else None,
+                        error_message=send_result.error_message,
+                    )
                     raise RuntimeError(send_result.error_message or "send_report_failed")
 
                 await _cleanup_inline_message(message)
