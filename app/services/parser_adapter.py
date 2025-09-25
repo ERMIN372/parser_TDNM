@@ -51,7 +51,7 @@ _SUPPORTED_CLI_FLAGS_FAILED = False
 _SUPPORTED_CLI_FLAGS_LOCK: asyncio.Lock | None = None
 _LOG_ONCE_EVENTS: set[str] = set()
 
-DEFAULT_FAIL_MESSAGE = "Не получилось… Попробуйте позже."
+DEFAULT_FAIL_MESSAGE = "Произошёл сбой. Попробуй позже. Диагностика приложена."
 ARGS_CHANGED_MESSAGE = "Обновился парсер, аргументы изменились; повторите позже"
 
 _parse_metrics = {"total": 0, "ok": 0, "failed": 0, "timeout": 0, "duration_sum": 0}
@@ -70,12 +70,13 @@ _EXPECTED_ARGUMENT_HINTS: dict[str, str] = {
     "exclude": "список слов через запятую",
     "pause": "число секунд, например 1.5",
     "site": "одно из значений: hh, gorodrabot, both",
-    "timeout": "целое число секунд",
 }
 
+BOT_VERSION = os.getenv("BOT_VERSION", "unknown")
+
 VALIDATION_FAIL_MESSAGE = (
-    "Не получилось запустить поиск: проверьте параметры — {details}. "
-    "Их можно исправить кнопкой «Назад»."
+    "Не получилось запустить поиск: проверь параметры{details}. "
+    "Их можно исправить кнопкой «Назад». Мы приложили файл с диагностикой (для разработчика)."
 )
 
 
@@ -164,7 +165,6 @@ def normalize_and_validate_overrides(
         "area",
         "include",
         "exclude",
-        "timeout",
     }
 
     def _mark_invalid(key: str, reason: str | None = None) -> None:
@@ -174,20 +174,32 @@ def normalize_and_validate_overrides(
         elif key not in reasons and key in _EXPECTED_ARGUMENT_HINTS:
             reasons[key] = _EXPECTED_ARGUMENT_HINTS[key]
 
+    cleaned_items: list[tuple[str, object]] = []
     for raw_key, raw_value in overrides.items():
         key = str(raw_key)
-        if key not in allowed_keys:
-            _mark_invalid(key, "неизвестный параметр")
-            continue
-
         value = raw_value
+
         if value is None or value is False:
             continue
 
         if isinstance(value, str):
-            value = value.strip()
-            if not value:
+            stripped = value.strip()
+            if not stripped:
                 continue
+            value = stripped
+
+        if isinstance(value, (list, tuple, set)):
+            seq = [str(item).strip() for item in value if str(item).strip()]
+            if not seq and key not in {"include", "exclude"}:
+                continue
+            value = seq
+
+        cleaned_items.append((key, value))
+
+    for key, value in cleaned_items:
+        if key not in allowed_keys:
+            _mark_invalid(key, "неизвестный параметр")
+            continue
 
         if key in {"include", "exclude"}:
             words = _to_list(value, lower=True)
@@ -247,18 +259,6 @@ def normalize_and_validate_overrides(
                 _mark_invalid(key)
                 continue
             normalized[key] = area_value
-            continue
-
-        if key == "timeout":
-            try:
-                timeout_value = int(value)  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                _mark_invalid(key)
-                continue
-            if timeout_value < 1:
-                _mark_invalid(key)
-                continue
-            normalized[key] = timeout_value
             continue
 
         if key in {"query", "city", "role"}:
@@ -603,6 +603,8 @@ async def preview_report(
         "normalized_overrides": normalized_overrides,
         "invalid_arguments": invalid_arguments,
     }
+
+    file_size: int | None = None
 
     if invalid_arguments:
         log_event(
@@ -1163,8 +1165,6 @@ async def run_report(
         "include": raw_include,
         "exclude": raw_exclude,
     }
-    if raw_timeout is not None:
-        raw_overrides_input["timeout"] = raw_timeout
     _ok_overrides, normalized_overrides, invalid_override_keys, override_details = normalize_and_validate_overrides(
         raw_overrides_input
     )
@@ -1206,7 +1206,6 @@ async def run_report(
         "area": raw_area,
         "include": _to_list(raw_include),
         "exclude": _to_list(raw_exclude),
-        "timeout": raw_timeout,
     }
     raw_overrides_logged = {
         "pages": raw_pages,
@@ -1216,7 +1215,6 @@ async def run_report(
         "area": raw_area,
         "include": _to_list(raw_include),
         "exclude": _to_list(raw_exclude),
-        "timeout": raw_timeout,
     }
     normalized_arguments_raw = {
         "query": query,
@@ -1229,12 +1227,7 @@ async def run_report(
         "area": area,
         "include": inc,
         "exclude": exc,
-        "timeout": timeout,
     }
-    if "timeout" in normalized_overrides and timeout is None:
-        timeout_val = normalized_overrides.get("timeout")
-        if isinstance(timeout_val, int):
-            timeout = timeout_val
     normalized_arguments_raw["timeout"] = timeout
     normalized_arguments = _clean_arguments_map(normalized_arguments_raw)
 
@@ -1337,17 +1330,18 @@ async def run_report(
             **common_log_fields,
         )
 
+    started_at_dt = datetime.now(timezone.utc)
+    started_perf = time.perf_counter()
+
     process_started = False
     if not invalid_arguments and not preflight_blocked:
         process_started = True
         log_event(
             "parse.started",
             command_line=command_text,
+            started_at=started_at_dt.isoformat(),
             **common_log_fields,
         )
-
-    started_at_dt = datetime.now(timezone.utc)
-    started_perf = time.perf_counter()
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
     csv_path: Path | None = None
@@ -1467,14 +1461,16 @@ async def run_report(
     if invalid_arguments:
         err_code = "E_BAD_ARGS"
         detail_text = validation_hint or ", ".join(invalid_arguments)
+        details_suffix = f" — {detail_text}" if detail_text else ""
         err_message = f"Invalid arguments: {detail_text}" if detail_text else "Invalid arguments"
-        user_message = VALIDATION_FAIL_MESSAGE.format(details=detail_text or "проверьте параметры")
+        user_message = VALIDATION_FAIL_MESSAGE.format(details=details_suffix)
         error_type = "Validation"
         error_code_for_log = "VALIDATION"
         log_event(
             "parse.validation_fail",
             level="WARN",
-            details=validation_hint or None,
+            problems=invalid_arguments or None,
+            advice=validation_hint or None,
             command_line=command_text,
             **common_log_fields,
         )
@@ -1537,7 +1533,6 @@ async def run_report(
         error_code_for_log = "PROCESS_EXIT_0"
     else:
         ok = True
-        file_size: int | None = None
         if out_path.exists():
             try:
                 file_size = out_path.stat().st_size
@@ -1581,6 +1576,8 @@ async def run_report(
             **common_log_fields,
         )
 
+    bundle_created_at_iso = datetime.now(timezone.utc).isoformat()
+
     meta: dict[str, object] = {
         "correlation_id": correlation,
         "started_at": started_iso,
@@ -1622,6 +1619,9 @@ async def run_report(
         "validation_details": validation_details,
         "validation_ok": not invalid_arguments,
         "process_started": process_started,
+        "bot_version": BOT_VERSION,
+        "bundle_created_at": bundle_created_at_iso,
+        "timestamp": finished_iso,
     }
     if csv_path:
         meta["csv_path"] = str(csv_path)
@@ -1644,8 +1644,25 @@ async def run_report(
     )
 
     if bundle_path:
+        bundle_size_bytes: int | None = None
+        bundle_files: list[str] | None = None
+        try:
+            bundle_size_bytes = bundle_path.stat().st_size
+        except OSError:
+            bundle_size_bytes = None
+        try:
+            bundle_files = sorted(entry.name for entry in bundle_dir.iterdir())
+        except OSError:
+            bundle_files = None
+
         remember_bundle(chat_id=None, correlation_id=correlation, bundle_path=bundle_path)
-        log_event("diagnostic_bundle_ready", bundle_path=str(bundle_path), **common_log_fields)
+        log_event(
+            "diagnostic_bundle_ready",
+            bundle_path=str(bundle_path),
+            size_bytes=bundle_size_bytes,
+            files=bundle_files or None,
+            **common_log_fields,
+        )
 
     result = RunReportResult(
         ok=ok,
@@ -1678,6 +1695,8 @@ async def run_report(
             "dropped_flags": dropped_flags or None,
             "error_type": error_type,
         }
+        if file_size is not None:
+            finished_payload["xlsx_size_bytes"] = file_size
         if not ok and stdout_lines:
             finished_payload["stdout_snippet"] = stdout_lines[:ERROR_SNIPPET_LINES]
         if not ok and stderr_lines:
