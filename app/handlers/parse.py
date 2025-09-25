@@ -261,6 +261,9 @@ def _ensure_str_list(values) -> list[str]:
     return result
 
 
+_REPORT_OVERRIDE_KEYS = {"pages", "per_page", "pause", "site", "area", "timeout"}
+
+
 def _build_args(
     title: str | None,
     city: str | None,
@@ -425,9 +428,9 @@ def _error_message_for_result(result: parser_adapter.RunReportResult) -> str:
         return FAIL_TEXT
     code = result.err_code or ""
     if code == "E_TIMEOUT":
-        return "Сайт долго отвечает, попробуй ещё раз позже."
+        return result.user_message or FAIL_TEXT
     if code == "E_NONZERO_RC":
-        return "Парсер завершился с ошибкой."
+        return result.user_message or FAIL_TEXT
     if code == "E_NO_FILE":
         return "Файл отчёта не сформировался. Попробуй ещё раз."
     if code == "E_BAD_ARGS":
@@ -643,6 +646,21 @@ async def _run_parser_bypass_validation(
             if tracker:
                 await tracker.handle_event(kind, payload)
 
+        allowed_kwargs = {k: v for k, v in overrides.items() if k in _REPORT_OVERRIDE_KEYS}
+        extra_keys = sorted(
+            k for k in overrides.keys() if k not in _REPORT_OVERRIDE_KEYS | {"include", "exclude"}
+        )
+        if extra_keys:
+            dropped_flags = [f"--{key.replace('_', '-')}" for key in extra_keys]
+            log_event(
+                "parser_cli_args_dropped",
+                level="WARN",
+                dropped_flags=dropped_flags,
+                query=query,
+                city=city,
+                user_id=uid,
+            )
+
         result = await parser_adapter.run_report(
             uid,
             query,
@@ -651,7 +669,7 @@ async def _run_parser_bypass_validation(
             include=include_list,
             exclude=exclude_list,
             progress=_progress,
-            **{k: v for k, v in overrides.items() if k not in {"include", "exclude"}},
+            **allowed_kwargs,
         )
     except Exception as e:  # pragma: no cover
         if tracker:
@@ -710,7 +728,6 @@ async def _run_with_amount(
 
     # ⚡ быстрый режим для больших объёмов
     if total > 200:
-        ov.setdefault("site", "hh")
         ov.setdefault("pause", 0.3)
         timeout = int(os.getenv("PARSER_TIMEOUT_LARGE", "1200"))
     else:

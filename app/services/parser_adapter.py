@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +43,17 @@ SNIPPET_LINES = max(1, int(os.getenv("LOG_SNIPPET_LINES", "15")))
 METRICS_FLUSH_EVERY = max(1, int(os.getenv("METRICS_FLUSH_INTERVAL", "10")))
 ERROR_SNIPPET_LINES = 30
 
+HELP_TIMEOUT = int(os.getenv("PARSER_HELP_TIMEOUT", "30"))
+
+_SUPPORTED_CLI_FLAGS: set[str] | None = None
+_SUPPORTED_CLI_FLAGS_FAILED = False
+_SUPPORTED_CLI_FLAGS_LOCK: asyncio.Lock | None = None
+_LOG_ONCE_EVENTS: set[str] = set()
+_SITE_DROP_LOGGED = False
+
+DEFAULT_FAIL_MESSAGE = "Не получилось (ошибка/таймаут). Попробуй позже."
+ARGS_CHANGED_MESSAGE = "Обновился парсер, аргументы изменились; повторите позже"
+
 _parse_metrics = {"total": 0, "ok": 0, "failed": 0, "timeout": 0, "duration_sum": 0}
 _preview_metrics = {"attempts": 0, "ok": 0, "timeout": 0}
 
@@ -53,6 +65,120 @@ def _to_list(val: Optional[Iterable[str] | str]) -> List[str]:
         parts = [p.strip() for p in val.replace(";", ",").split(",")]
         return [p for p in parts if p]
     return [str(x).strip() for x in val if str(x).strip()]
+
+
+def _log_once(event: str, *, level: str = "WARN", **payload: object) -> None:
+    if event in _LOG_ONCE_EVENTS:
+        return
+    _LOG_ONCE_EVENTS.add(event)
+    log_event(event, level=level, **payload)
+
+
+def _command_to_text(parts: Iterable[object]) -> str:
+    return " ".join(str(part) for part in parts)
+
+
+def _collect_supported_flags() -> tuple[set[str] | None, dict[str, object]]:
+    help_cmd = [PYBIN, PIPELINE, "--help"]
+    start = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            help_cmd,
+            capture_output=True,
+            text=True,
+            timeout=HELP_TIMEOUT,
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics best effort
+        duration = int((time.perf_counter() - start) * 1000)
+        payload = {
+            "command_line": _command_to_text(help_cmd),
+            "duration_ms": duration,
+            "err": str(exc),
+            "exc_type": exc.__class__.__name__,
+        }
+        return None, payload
+
+    duration = int((time.perf_counter() - start) * 1000)
+    payload: dict[str, object] = {
+        "command_line": _command_to_text(help_cmd),
+        "duration_ms": duration,
+        "returncode": proc.returncode,
+    }
+
+    stdout_lines = proc.stdout.splitlines() if proc.stdout else []
+    stderr_lines = proc.stderr.splitlines() if proc.stderr else []
+    if proc.returncode != 0:
+        payload["stdout_snippet"] = stdout_lines[:ERROR_SNIPPET_LINES]
+        payload["stderr_snippet"] = stderr_lines[:ERROR_SNIPPET_LINES]
+        return None, payload
+
+    help_text = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+    flags = set(re.findall(r"--[A-Za-z0-9][\w-]*", help_text or ""))
+    payload["flags_count"] = len(flags)
+    return flags, payload
+
+
+async def _get_supported_flags() -> set[str] | None:
+    global _SUPPORTED_CLI_FLAGS, _SUPPORTED_CLI_FLAGS_FAILED, _SUPPORTED_CLI_FLAGS_LOCK
+
+    if _SUPPORTED_CLI_FLAGS is not None or _SUPPORTED_CLI_FLAGS_FAILED:
+        return _SUPPORTED_CLI_FLAGS
+
+    if _SUPPORTED_CLI_FLAGS_LOCK is None:
+        _SUPPORTED_CLI_FLAGS_LOCK = asyncio.Lock()
+
+    async with _SUPPORTED_CLI_FLAGS_LOCK:
+        if _SUPPORTED_CLI_FLAGS is not None or _SUPPORTED_CLI_FLAGS_FAILED:
+            return _SUPPORTED_CLI_FLAGS
+
+        loop = asyncio.get_running_loop()
+        flags, payload = await loop.run_in_executor(None, _collect_supported_flags)
+        if flags is None:
+            _SUPPORTED_CLI_FLAGS_FAILED = True
+            _log_once("parser_preflight_failed", level="WARN", **payload)
+            return None
+
+        _SUPPORTED_CLI_FLAGS = flags
+        summary = {
+            "flags_count": payload.get("flags_count", len(flags)),
+            "duration_ms": payload.get("duration_ms"),
+            "command_line": payload.get("command_line"),
+        }
+        _log_once("parser_preflight_ok", level="INFO", **summary)
+        return _SUPPORTED_CLI_FLAGS
+
+
+@dataclass
+class _CommandBuildContext:
+    allowed_flags: set[str] | None
+    command: list[str]
+    dropped: list[str] = field(default_factory=list)
+    missing_required: list[str] = field(default_factory=list)
+
+    def add(self, flag: str, *values: object, required: bool = False) -> None:
+        if self.allowed_flags is not None and flag not in self.allowed_flags:
+            self.dropped.append(flag)
+            if required:
+                self.missing_required.append(flag)
+            return
+
+        self.command.append(flag)
+        for value in values:
+            self.command.append(str(value))
+
+
+def _count_csv_rows(csv_path: Path | None) -> int | None:
+    if not csv_path or not csv_path.exists():
+        return None
+    try:
+        with csv_path.open("r", encoding="utf-8", errors="ignore") as fh:
+            total = sum(1 for _ in fh)
+    except Exception:  # pragma: no cover - diagnostics best effort
+        return None
+
+    if total <= 0:
+        return 0
+    return max(0, total - 1)
 
 
 def _load_table(path_csv: Path, path_xlsx: Optional[Path] = None):
@@ -251,30 +377,52 @@ async def preview_report(
         uid_dir = REPORT_DIR / str(user_id)
         uid_dir.mkdir(parents=True, exist_ok=True)
 
+        allowed_flags = await _get_supported_flags()
+
         for attempt in range(1, PREVIEW_RETRIES + 1):
             attempt_index += 1
             out = uid_dir / f"_preview_{attempt}.xlsx"
-            cmd = [
-                PYBIN,
-                PIPELINE,
-                "--query",
-                query,
-                "--city",
-                city,
-                "--pages",
-                "1",
-                "--per_page",
-                str(PREVIEW_PER_PAGE),
-                "--output",
-                str(out),
-                "--formats",
-                "csv",
-                "--keep-csv",
-                "--site",
-                "hh",
-            ]
+            builder = _CommandBuildContext(allowed_flags, [PYBIN, PIPELINE])
+            builder.add("--query", query or "", required=True)
+            builder.add("--city", city or "", required=True)
+            builder.add("--pages", "1")
+            builder.add("--per_page", str(PREVIEW_PER_PAGE))
+            builder.add("--output", str(out), required=True)
+            builder.add("--formats", "csv")
+            builder.add("--keep-csv")
             if area is not None:
-                cmd += ["--area", str(area)]
+                builder.add("--area", str(area))
+
+            cmd = builder.command
+            dropped_flags = sorted(set(builder.dropped))
+            missing_flags = sorted(set(builder.missing_required))
+            command_text = _command_to_text(cmd)
+
+            if missing_flags or len(cmd) <= 2:
+                log_event(
+                    "parser_preflight_blocked",
+                    level="ERROR",
+                    source="pipeline_preview",
+                    attempt=attempt_index,
+                    missing_flags=missing_flags or None,
+                    dropped_flags=dropped_flags or None,
+                    command_line=command_text,
+                    **common_log_fields,
+                )
+                _register_preview_attempt(ok=False, timeout=False)
+                failure_reasons.append("pipeline:preflight")
+                return None
+
+            if dropped_flags:
+                log_event(
+                    "parser_cli_args_dropped",
+                    level="WARN",
+                    source="pipeline_preview",
+                    attempt=attempt_index,
+                    dropped_flags=dropped_flags,
+                    command_line=command_text,
+                    **common_log_fields,
+                )
 
             start = time.perf_counter()
             log_event(
@@ -282,7 +430,7 @@ async def preview_report(
                 source="pipeline",
                 attempt=attempt_index,
                 internal_attempt=attempt,
-                command_line=" ".join(map(str, cmd)),
+                command_line=command_text,
                 **common_log_fields,
             )
             try:
@@ -301,7 +449,9 @@ async def preview_report(
                     source="pipeline",
                     attempt=attempt_index,
                     duration_ms=duration,
-                    timeout=PREVIEW_TIMEOUT,
+                    timeout=True,
+                    timeout_limit=PREVIEW_TIMEOUT,
+                    waited_ms=duration,
                     **common_log_fields,
                 )
                 _register_preview_attempt(ok=False, timeout=True)
@@ -704,32 +854,32 @@ async def run_report(
     ts = datetime.utcnow()
     out_path = user_dir / f"data_{ts.strftime('%Y%m%d_%H%M%S')}.xlsx"
 
-    command: list[str] = [
-        PYBIN,
-        PIPELINE,
-        "--query",
-        query or "",
-        "--city",
-        city or "",
-        "--output",
-        str(out_path),
-        "--formats",
-        "xlsx",
-        "csv",
-        "--keep-csv",
-    ]
+    allowed_flags = await _get_supported_flags()
+    builder = _CommandBuildContext(allowed_flags, [PYBIN, PIPELINE])
+    builder.add("--query", query or "", required=True)
+    builder.add("--city", city or "", required=True)
+    builder.add("--output", str(out_path), required=True)
+    builder.add("--formats", "xlsx", "csv")
+    builder.add("--keep-csv")
     if role:
-        command += ["--role", role]
+        builder.add("--role", role)
     if pages is not None:
-        command += ["--pages", str(pages)]
+        builder.add("--pages", str(pages))
     if per_page is not None:
-        command += ["--per_page", str(per_page)]
+        builder.add("--per_page", str(per_page))
     if pause is not None:
-        command += ["--pause", str(pause)]
-    if site is not None:
-        command += ["--site", site]
+        builder.add("--pause", str(pause))
     if area is not None:
-        command += ["--area", str(area)]
+        builder.add("--area", str(area))
+
+    command = builder.command
+    dropped_flags = list(builder.dropped)
+    if site is not None:
+        _log_once("parser_site_deprecated", level="WARN", site=site)
+        dropped_flags.append("--site")
+    dropped_flags = sorted(set(dropped_flags))
+    missing_flags = sorted(set(builder.missing_required))
+    command_text = _command_to_text(command)
 
     eff_timeout = timeout or (
         LARGE_TIMEOUT if (pages or 0) > 2 or (per_page or 0) >= 100 else DEFAULT_TIMEOUT
@@ -763,14 +913,46 @@ async def run_report(
         "site": site,
         "area": area,
         "timeout": eff_timeout,
+        "user_id": user_id,
+        "correlation_id": correlation,
     }
 
-    log_event(
-        "parser_start",
-        action="run_report",
-        command_line=" ".join(str(part) for part in command),
-        **common_log_fields,
-    )
+    preflight_blocked = bool(missing_flags or len(command) <= 2)
+
+    should_log_dropped = bool(dropped_flags)
+    if dropped_flags == ["--site"]:
+        global _SITE_DROP_LOGGED
+        if _SITE_DROP_LOGGED:
+            should_log_dropped = False
+        else:
+            _SITE_DROP_LOGGED = True
+
+    if should_log_dropped and not preflight_blocked:
+        log_event(
+            "parser_cli_args_dropped",
+            level="WARN",
+            dropped_flags=dropped_flags,
+            command_line=command_text,
+            **common_log_fields,
+        )
+
+    if preflight_blocked:
+        log_event(
+            "parser_preflight_blocked",
+            level="ERROR",
+            missing_flags=missing_flags or None,
+            dropped_flags=dropped_flags or None,
+            command_line=command_text,
+            **common_log_fields,
+        )
+
+    if not invalid_arguments and not preflight_blocked:
+        log_event(
+            "parser_start",
+            action="run_report",
+            command_line=command_text,
+            **common_log_fields,
+        )
 
     started_at_dt = datetime.now(timezone.utc)
     started_perf = time.perf_counter()
@@ -785,7 +967,7 @@ async def run_report(
     invalid_arguments = not query or not city
     spawn_error: Exception | None = None
 
-    if not invalid_arguments:
+    if not invalid_arguments and not preflight_blocked:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *command,
@@ -887,23 +1069,35 @@ async def run_report(
         err_code = "E_BAD_ARGS"
         err_message = "Missing query or city"
         user_message = "Укажи должность и город для поиска."
+    elif preflight_blocked:
+        err_code = "E_BAD_ARGS"
+        err_message = "Unsupported CLI arguments filtered by preflight"
+        user_message = ARGS_CHANGED_MESSAGE
     elif timeout_hit:
         err_code = "E_TIMEOUT"
         err_message = f"Parser timeout after {eff_timeout}s"
-        user_message = "Сайт долго отвечает, попробуй ещё раз позже."
-        log_event("parser_timeout", level="WARN", duration_ms=duration_ms, **common_log_fields)
+        user_message = DEFAULT_FAIL_MESSAGE
+        log_event(
+            "parser_timeout",
+            level="WARN",
+            duration_ms=duration_ms,
+            timeout=True,
+            timeout_limit=eff_timeout,
+            waited_ms=duration_ms,
+            **common_log_fields,
+        )
     elif spawn_error is not None:
         err_code = "E_NONZERO_RC"
         err_message = str(spawn_error) or spawn_error.__class__.__name__
-        user_message = "Парсер завершился с ошибкой."
+        user_message = DEFAULT_FAIL_MESSAGE
     elif rc is None:
         err_code = "E_NONZERO_RC"
         err_message = "Parser process did not start"
-        user_message = "Парсер завершился с ошибкой."
+        user_message = DEFAULT_FAIL_MESSAGE
     elif rc != 0:
         err_code = "E_NONZERO_RC"
         err_message = f"Parser exited with code {rc}"
-        user_message = "Парсер завершился с ошибкой."
+        user_message = DEFAULT_FAIL_MESSAGE
         combined = "\n".join(stdout_lines + stderr_lines).lower()
         if any(pattern in combined for pattern in BAD_ARGS_PATTERNS):
             err_code = "E_BAD_ARGS"
@@ -914,6 +1108,26 @@ async def run_report(
         user_message = "Файл отчёта не сформировался. Попробуй ещё раз."
     else:
         ok = True
+        file_size: int | None = None
+        if out_path.exists():
+            try:
+                file_size = out_path.stat().st_size
+            except OSError:
+                file_size = None
+        csv_source = (
+            csv_path if csv_path and csv_path.exists() else out_path.parent / "raw.csv"
+        )
+        rows_count = _count_csv_rows(csv_source)
+        log_event(
+            "parser_xlsx_ready",
+            level="INFO",
+            path=str(out_path),
+            size_bytes=file_size,
+            rows=rows_count,
+            duration_ms=duration_ms,
+            command_line=command_text,
+            **common_log_fields,
+        )
 
     snippet_limit = ERROR_SNIPPET_LINES if not ok else SNIPPET_LINES
     if (DEBUG_ENABLED or not ok) and stdout_lines:
@@ -948,6 +1162,10 @@ async def run_report(
         "area": area,
         "role": role,
         "timeout": eff_timeout,
+        "preflight_blocked": preflight_blocked,
+        "dropped_cli_flags": dropped_flags,
+        "timeout_hit": timeout_hit,
+        "command_line": command_text,
         "command": command,
         "stdout_lines": len(stdout_lines),
         "stderr_lines": len(stderr_lines),
@@ -996,16 +1214,23 @@ async def run_report(
 
     level = "INFO" if ok else ("WARN" if err_code == "E_TIMEOUT" else "ERROR")
     event_name = "parser_finished" if ok else "parser_failed"
-    log_event(
-        event_name,
-        level=level,
-        duration_ms=duration_ms,
-        rc=rc,
-        err_code=err_code,
-        err_message=err_message,
-        bundle_path=str(bundle_path) if bundle_path else None,
-        **common_log_fields,
-    )
+    event_payload: dict[str, object | None] = {
+        "duration_ms": duration_ms,
+        "rc": rc,
+        "err_code": err_code,
+        "err_message": err_message,
+        "bundle_path": str(bundle_path) if bundle_path else None,
+        "command_line": command_text,
+        "timeout": timeout_hit,
+        "timeout_limit": eff_timeout,
+        "dropped_flags": dropped_flags or None,
+    }
+    if not ok and stdout_lines:
+        event_payload["stdout_snippet"] = stdout_lines[:ERROR_SNIPPET_LINES]
+    if not ok and stderr_lines:
+        event_payload["stderr_snippet"] = stderr_lines[:ERROR_SNIPPET_LINES]
+
+    log_event(event_name, level=level, **event_payload, **common_log_fields)
 
     _register_parse_result(result)
     return result

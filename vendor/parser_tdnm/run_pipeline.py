@@ -46,8 +46,6 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--per_page", dest="per_page", type=int, help="alias", metavar="N")
     parser.add_argument("--pause", type=float, default=0.6,
                         help="Пауза между запросами к HH")
-    parser.add_argument("--site", choices=["hh", "gorodrabot", "both"], default="hh",
-                        help="Ограничить источники вакансий")
     parser.add_argument("--search-in", dest="search_in", default=DEFAULT_HH_SEARCH_FIELD,
                         choices=["name", "description", "company_name", "everything"],
                         help="Поле поиска HH")
@@ -88,7 +86,6 @@ def run_pipeline(args: argparse.Namespace) -> List[Path]:
         "--pause", str(args.pause),
         "--out_csv", str(tmp_csv),
         "--search_in", args.search_in,
-        "--site", args.site,
     ]
     if args.role:
         fetch_cmd.extend(["--role", args.role])
