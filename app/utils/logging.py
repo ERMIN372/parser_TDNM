@@ -282,11 +282,47 @@ def _prepare_payload(event: str, level: str, extra: Dict[str, Any]) -> Dict[str,
     return payload
 
 
-def log_event(event: str, level: str = "INFO", message: str | None = None, **extra: Any) -> None:
-    logger = _ensure_logger()
-    payload = _prepare_payload(event, level, extra)
-    record_message = message or extra.get("message") or event
-    logger.log(getattr(logging, level, logging.INFO), record_message, extra={"event_data": payload})
+def log_event(*args: Any, **extra: Any) -> None:
+    if not args:
+        raise TypeError("log_event requires at least an event name")
+
+    message = extra.pop("message", None)
+
+    level_arg = args[0]
+    event: str
+    level: str
+
+    if (
+        len(args) >= 2
+        and isinstance(level_arg, str)
+        and level_arg.upper() in {"DEBUG", "INFO", "WARN", "WARNING", "ERROR", "CRITICAL"}
+    ):
+        level = level_arg.upper()
+        event = str(args[1])
+    else:
+        event = str(level_arg)
+        level = str(extra.pop("level", "INFO")).upper()
+
+    payload_extra = dict(extra)
+    if message is not None:
+        payload_extra["message"] = message
+
+    payload = _prepare_payload(event, level, payload_extra)
+
+    ts = payload.pop("ts", _iso_ts())
+    lvl = payload.pop("level", level)
+    evt = payload.pop("event", event)
+
+    line = {"ts": ts, "level": lvl, "event": evt, "data": payload}
+
+    try:
+        text = json.dumps(line, ensure_ascii=False, separators=(",", ":"), default=str)
+    except TypeError:
+        safe_data = json.loads(json.dumps(payload, default=str))
+        line["data"] = safe_data
+        text = json.dumps(line, ensure_ascii=False, separators=(",", ":"))
+
+    print(text, file=sys.stdout, flush=True)
 
 
 def log_exception(event: str, err: Exception, message: str | None = None, **extra: Any) -> None:
