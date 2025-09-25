@@ -835,6 +835,29 @@ async def _run_parser(
         await message.answer(BUSY_TEXT)
         return
 
+    overrides = overrides or {}
+    ok_overrides, normalized_overrides, invalid_override_keys, _ = (
+        parser_adapter.normalize_and_validate_overrides(overrides)
+    )
+    if invalid_override_keys:
+        log_event(
+            "overrides_validation_failed",
+            level="WARN",
+            invalid_arguments=invalid_override_keys,
+            args=_build_args(query, city, overrides),
+        )
+        await message.answer(parser_adapter.format_invalid_arguments(invalid_override_keys))
+        complete_operation(ok=False, err="invalid_arguments")
+        return
+
+    clean_overrides: dict[str, object] = {}
+    for key in ("include", "exclude", "pages", "per_page", "pause", "site", "area", "timeout"):
+        if key in normalized_overrides:
+            value = normalized_overrides[key]
+            if value is not None or key in {"include", "exclude"}:
+                clean_overrides[key] = value
+    overrides = clean_overrides
+
     # 1) Мягкая валидация
     ok, norm_title, area_id, canonical_city, bad_msg = validator.validate_request(query, city)
     if not ok:
@@ -1307,15 +1330,57 @@ async def cb_preview(call: types.CallbackQuery):
             return
 
         title, city, area_id, overrides, _max_total = payload
-        include = (overrides or {}).get("include") or []
-        exclude = (overrides or {}).get("exclude") or []
+        overrides = overrides or {}
+        invalid_arguments: list[str] = []
+        if not (title or "").strip():
+            invalid_arguments.append("query")
+        if not (city or "").strip():
+            invalid_arguments.append("city")
+
+        override_payload: dict[str, object] = {
+            "include": overrides.get("include"),
+            "exclude": overrides.get("exclude"),
+        }
+        area_source = overrides.get("area", area_id)
+        if area_source is not None:
+            override_payload["area"] = area_source
+
+        _ok_overrides, normalized_overrides, invalid_override_keys, _ = (
+            parser_adapter.normalize_and_validate_overrides(override_payload)
+        )
+        invalid_arguments.extend(invalid_override_keys)
+        if invalid_arguments:
+            log_event(
+                "preview_validation_failed",
+                level="WARN",
+                invalid_arguments=invalid_arguments,
+                args=_build_args(title, city, overrides),
+            )
+            await call.message.answer(
+                parser_adapter.format_invalid_arguments(invalid_arguments)
+            )
+            return
+
+        include = normalized_overrides.get("include", [])
+        exclude = normalized_overrides.get("exclude", [])
+        area_norm = normalized_overrides.get("area")
+        area_id = area_norm if area_norm is not None else area_source
+
+        clean_overrides = dict(overrides)
+        clean_overrides["include"] = include
+        clean_overrides["exclude"] = exclude
+        if area_id is not None:
+            clean_overrides["area"] = area_id
+        elif "area" in clean_overrides:
+            clean_overrides.pop("area", None)
+        overrides = clean_overrides
 
         if not ALLOW_FREE_PREVIEW:
             snapshot = paywall.SavedRequest(
                 kind="preview",
                 query=title,
                 city=city,
-                overrides=overrides or {},
+                overrides=overrides,
                 area_id=area_id,
             )
             decision = await _ensure_quota(
@@ -1339,6 +1404,11 @@ async def cb_preview(call: types.CallbackQuery):
                 include=include,
                 exclude=exclude,
             )
+        except parser_adapter.ValidationError as exc:
+            if progress:
+                await progress.fail()
+            await call.message.answer(exc.user_message)
+            return
         except asyncio.TimeoutError as exc:
             _log_preview_timeout(title, city, overrides, err=str(exc))
             if progress:

@@ -14,7 +14,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Iterable, List, Optional, Tuple
+from typing import Awaitable, Callable, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from app.services.diagnostics import remember_bundle
 from app.utils.logging import current_correlation_id, log_event, update_context
@@ -56,6 +56,103 @@ ARGS_CHANGED_MESSAGE = "Обновился парсер, аргументы из
 
 _parse_metrics = {"total": 0, "ok": 0, "failed": 0, "timeout": 0, "duration_sum": 0}
 _preview_metrics = {"attempts": 0, "ok": 0, "timeout": 0}
+
+SUPPORTED_SITES = {"hh", "gorodrabot", "both"}
+
+
+class ValidationError(Exception):
+    """Raised when input arguments fail validation."""
+
+    def __init__(self, invalid: Sequence[str] | None = None, message: str | None = None) -> None:
+        invalid_list = list(invalid or [])
+        self.invalid_arguments: list[str] = sorted({item for item in invalid_list if item})
+        self.user_message = message or format_invalid_arguments(self.invalid_arguments)
+        super().__init__(self.user_message)
+
+
+def format_invalid_arguments(invalid: Sequence[str] | None) -> str:
+    items = sorted({str(item) for item in invalid or [] if str(item).strip()})
+    if not items:
+        return "⚠️ Некорректные параметры запроса. Исправь и попробуй снова."
+    joined = ", ".join(items)
+    return f"⚠️ Некорректные параметры запроса: {joined}. Исправь и попробуй снова."
+
+
+def normalize_and_validate_overrides(
+    overrides: Mapping[str, object] | None,
+) -> tuple[bool, dict[str, object], list[str], str | None]:
+    """Normalize user-provided overrides and collect validation errors."""
+
+    invalid: list[str] = []
+    normalized: dict[str, object] = {
+        "include": [],
+        "exclude": [],
+    }
+    if not overrides:
+        return True, normalized, invalid, None
+
+    def _require_int(key: str, raw: object, *, min_value: int | None = None, max_value: int | None = None) -> None:
+        nonlocal normalized
+        try:
+            value = int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            invalid.append(key)
+            return
+        if (min_value is not None and value < min_value) or (
+            max_value is not None and value > max_value
+        ):
+            invalid.append(key)
+            return
+        normalized[key] = value
+
+    def _require_float(key: str, raw: object, *, min_value: float | None = None) -> None:
+        nonlocal normalized
+        try:
+            value = float(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            invalid.append(key)
+            return
+        if min_value is not None and value < min_value:
+            invalid.append(key)
+            return
+        normalized[key] = value
+
+    allowed_keys = {"pages", "per_page", "pause", "site", "area", "include", "exclude", "timeout"}
+
+    for key, raw_value in overrides.items():
+        if key not in allowed_keys:
+            invalid.append(str(key))
+            continue
+
+        if key == "pages":
+            _require_int(key, raw_value, min_value=1)
+        elif key == "per_page":
+            _require_int(key, raw_value, min_value=1, max_value=100)
+        elif key == "pause":
+            _require_float(key, raw_value, min_value=0.0)
+        elif key == "site":
+            value = str(raw_value or "").strip().lower()
+            if not value:
+                invalid.append(key)
+            elif value not in SUPPORTED_SITES:
+                invalid.append(key)
+            else:
+                normalized[key] = value
+        elif key == "area":
+            _require_int(key, raw_value, min_value=1)
+        elif key == "timeout":
+            _require_int(key, raw_value, min_value=1)
+        elif key == "include":
+            normalized[key] = _to_list(raw_value)
+        elif key == "exclude":
+            normalized[key] = _to_list(raw_value)
+
+    unique_invalid = sorted({item for item in invalid if item})
+    error = format_invalid_arguments(unique_invalid) if unique_invalid else None
+    if unique_invalid:
+        return False, normalized, unique_invalid, error
+
+    return True, normalized, [], None
 
 
 def _to_list(val: Optional[Iterable[str] | str]) -> List[str]:
@@ -308,17 +405,64 @@ async def preview_report(
     2) Если выбран режим *first* и он неудачный — пробуем второй вариант.
     Возвращает список [(title, company, url)] или None при полном фэйле/таймауте.
     """
-    if not query or not city:
-        return None
+    raw_query = query
+    raw_city = city
+    raw_overrides = {"area": area, "include": include, "exclude": exclude}
+    ok_overrides, normalized_overrides, invalid_override_keys, _ = normalize_and_validate_overrides(
+        raw_overrides
+    )
 
-    inc_list = _to_list(include)
-    exc_list = _to_list(exclude)
+    query = (query or "").strip()
+    city = (city or "").strip()
+    area_norm = normalized_overrides.get("area") if ok_overrides else raw_overrides.get("area")
+    inc_list = normalized_overrides.get("include", [])
+    exc_list = normalized_overrides.get("exclude", [])
+
+    invalid_arguments: list[str] = []
+    if not query:
+        invalid_arguments.append("query")
+    if not city:
+        invalid_arguments.append("city")
+    invalid_arguments.extend(invalid_override_keys)
+    invalid_arguments = sorted({item for item in invalid_arguments if item})
+
+    raw_arguments = {
+        "query": raw_query,
+        "city": raw_city,
+        "area": raw_overrides.get("area"),
+        "include": _to_list(include),
+        "exclude": _to_list(exclude),
+    }
+    normalized_arguments = {
+        "query": query,
+        "city": city,
+        "area": area_norm,
+        "include": inc_list,
+        "exclude": exc_list,
+    }
+
     common_log_fields = {
         "query": query,
         "city": city,
         "include": inc_list,
         "exclude": exc_list,
+        "area": area_norm,
+        "raw_arguments": raw_arguments,
+        "raw_overrides": raw_overrides,
+        "normalized_arguments": normalized_arguments,
+        "normalized_overrides": normalized_overrides,
+        "invalid_arguments": invalid_arguments,
     }
+
+    if invalid_arguments:
+        log_event(
+            "preview_validation_failed",
+            level="WARN",
+            **common_log_fields,
+        )
+        raise ValidationError(invalid_arguments, format_invalid_arguments(invalid_arguments))
+
+    area = area_norm  # use normalized area downstream
 
     attempt_index = 0
     failure_reasons: list[str] = []
@@ -846,8 +990,92 @@ async def run_report(
     timeout: int | None = None,
     progress: ProgressCallback | None = None,
 ) -> RunReportResult:
-    inc = _to_list(include)
-    exc = _to_list(exclude)
+    raw_query = query
+    raw_city = city
+    raw_pages = pages
+    raw_per_page = per_page
+    raw_pause = pause
+    raw_site = site
+    raw_area = area
+    raw_include = include
+    raw_exclude = exclude
+    raw_timeout = timeout
+
+    raw_overrides_input = {
+        "pages": raw_pages,
+        "per_page": raw_per_page,
+        "pause": raw_pause,
+        "site": raw_site,
+        "area": raw_area,
+        "include": raw_include,
+        "exclude": raw_exclude,
+    }
+    if raw_timeout is not None:
+        raw_overrides_input["timeout"] = raw_timeout
+    _ok_overrides, normalized_overrides, invalid_override_keys, _ = normalize_and_validate_overrides(
+        raw_overrides_input
+    )
+
+    query = (query or "").strip()
+    city = (city or "").strip()
+
+    inc = normalized_overrides.get("include", [])
+    exc = normalized_overrides.get("exclude", [])
+    pages = normalized_overrides.get("pages")
+    per_page = normalized_overrides.get("per_page")
+    pause = normalized_overrides.get("pause")
+    site = normalized_overrides.get("site")
+    area = normalized_overrides.get("area")
+
+    invalid_arguments: list[str] = []
+    if not query:
+        invalid_arguments.append("query")
+    if not city:
+        invalid_arguments.append("city")
+    invalid_arguments.extend(invalid_override_keys)
+    invalid_arguments = sorted({item for item in invalid_arguments if item})
+
+    raw_arguments = {
+        "query": raw_query,
+        "city": raw_city,
+        "role": role,
+        "pages": raw_pages,
+        "per_page": raw_per_page,
+        "pause": raw_pause,
+        "site": raw_site,
+        "area": raw_area,
+        "include": _to_list(raw_include),
+        "exclude": _to_list(raw_exclude),
+        "timeout": raw_timeout,
+    }
+    raw_overrides_logged = {
+        "pages": raw_pages,
+        "per_page": raw_per_page,
+        "pause": raw_pause,
+        "site": raw_site,
+        "area": raw_area,
+        "include": _to_list(raw_include),
+        "exclude": _to_list(raw_exclude),
+        "timeout": raw_timeout,
+    }
+    normalized_arguments = {
+        "query": query,
+        "city": city,
+        "role": role,
+        "pages": pages,
+        "per_page": per_page,
+        "pause": pause,
+        "site": site,
+        "area": area,
+        "include": inc,
+        "exclude": exc,
+        "timeout": timeout,
+    }
+    if "timeout" in normalized_overrides and timeout is None:
+        timeout_val = normalized_overrides.get("timeout")
+        if isinstance(timeout_val, int):
+            timeout = timeout_val
+    normalized_arguments["timeout"] = timeout
 
     user_dir = REPORT_DIR / str(user_id)
     user_dir.mkdir(parents=True, exist_ok=True)
@@ -915,6 +1143,12 @@ async def run_report(
         "timeout": eff_timeout,
         "user_id": user_id,
         "correlation_id": correlation,
+        "raw_arguments": raw_arguments,
+        "raw_overrides": raw_overrides_logged,
+        "normalized_overrides": normalized_overrides,
+        "normalized_arguments": normalized_arguments,
+        "invalid_arguments": invalid_arguments,
+        "validation_ok": not invalid_arguments,
     }
 
     preflight_blocked = bool(missing_flags or len(command) <= 2)
@@ -964,7 +1198,6 @@ async def run_report(
     stderr_task: asyncio.Task | None = None
     timeout_hit = False
 
-    invalid_arguments = not query or not city
     spawn_error: Exception | None = None
 
     if not invalid_arguments and not preflight_blocked:
@@ -1033,7 +1266,8 @@ async def run_report(
                 return_exceptions=True,
             )
     else:
-        spawn_error = ValueError("invalid search parameters")
+        if not invalid_arguments:
+            spawn_error = ValueError("invalid search parameters")
 
     rc = proc.returncode if proc else None
     finished_at_dt = datetime.now(timezone.utc)
@@ -1065,14 +1299,24 @@ async def run_report(
     err_message: str | None = None
     user_message: str | None = None
 
+    error_type: str | None = None
+
     if invalid_arguments:
         err_code = "E_BAD_ARGS"
-        err_message = "Missing query or city"
-        user_message = "Укажи должность и город для поиска."
+        err_message = f"Invalid arguments: {', '.join(invalid_arguments)}"
+        user_message = format_invalid_arguments(invalid_arguments)
+        error_type = "Validation"
+        log_event(
+            "parser_validation_failed",
+            level="WARN",
+            command_line=command_text,
+            **common_log_fields,
+        )
     elif preflight_blocked:
         err_code = "E_BAD_ARGS"
         err_message = "Unsupported CLI arguments filtered by preflight"
         user_message = ARGS_CHANGED_MESSAGE
+        error_type = "Validation"
     elif timeout_hit:
         err_code = "E_TIMEOUT"
         err_message = f"Parser timeout after {eff_timeout}s"
@@ -1086,14 +1330,17 @@ async def run_report(
             waited_ms=duration_ms,
             **common_log_fields,
         )
+        error_type = "Timeout"
     elif spawn_error is not None:
         err_code = "E_NONZERO_RC"
         err_message = str(spawn_error) or spawn_error.__class__.__name__
         user_message = DEFAULT_FAIL_MESSAGE
+        error_type = "ProcessExit"
     elif rc is None:
         err_code = "E_NONZERO_RC"
         err_message = "Parser process did not start"
         user_message = DEFAULT_FAIL_MESSAGE
+        error_type = "ProcessExit"
     elif rc != 0:
         err_code = "E_NONZERO_RC"
         err_message = f"Parser exited with code {rc}"
@@ -1102,10 +1349,14 @@ async def run_report(
         if any(pattern in combined for pattern in BAD_ARGS_PATTERNS):
             err_code = "E_BAD_ARGS"
             user_message = "Некорректные параметры запуска парсера."
+            error_type = "Validation"
+        else:
+            error_type = "ProcessExit"
     elif not out_path.exists():
         err_code = "E_NO_FILE"
         err_message = "Parser reported success but XLSX missing"
         user_message = "Файл отчёта не сформировался. Попробуй ещё раз."
+        error_type = "ProcessExit"
     else:
         ok = True
         file_size: int | None = None
@@ -1128,6 +1379,9 @@ async def run_report(
             command_line=command_text,
             **common_log_fields,
         )
+        error_type = None
+
+    common_log_fields["error_type"] = error_type
 
     snippet_limit = ERROR_SNIPPET_LINES if not ok else SNIPPET_LINES
     if (DEBUG_ENABLED or not ok) and stdout_lines:
@@ -1175,6 +1429,12 @@ async def run_report(
             "err_message": err_message,
             "rc": rc,
         },
+        "raw_arguments": raw_arguments,
+        "normalized_arguments": normalized_arguments,
+        "raw_overrides": raw_overrides_logged,
+        "invalid_arguments": invalid_arguments,
+        "normalized_overrides": normalized_overrides,
+        "error_type": error_type,
     }
     if csv_path:
         meta["csv_path"] = str(csv_path)
@@ -1224,6 +1484,7 @@ async def run_report(
         "timeout": timeout_hit,
         "timeout_limit": eff_timeout,
         "dropped_flags": dropped_flags or None,
+        "error_type": error_type,
     }
     if not ok and stdout_lines:
         event_payload["stdout_snippet"] = stdout_lines[:ERROR_SNIPPET_LINES]
