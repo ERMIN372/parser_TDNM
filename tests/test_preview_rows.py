@@ -29,13 +29,13 @@ def test_preview_rows_converts_to_dict(monkeypatch):
 
 
 def test_normalize_overrides_ok():
-    ok, normalized, invalid, error = parser_adapter.normalize_and_validate_overrides(
+    ok, normalized, invalid, details = parser_adapter.normalize_and_validate_overrides(
         {"pages": "2", "per_page": 5, "include": ["python", ""], "pause": "0.5"}
     )
 
     assert ok is True
     assert invalid == []
-    assert error is None
+    assert details == {}
     assert normalized["pages"] == 2
     assert normalized["per_page"] == 5
     assert normalized["pause"] == 0.5
@@ -43,12 +43,12 @@ def test_normalize_overrides_ok():
 
 
 def test_normalize_overrides_invalid_site():
-    ok, normalized, invalid, error = parser_adapter.normalize_and_validate_overrides({"site": "xxx"})
+    ok, normalized, invalid, details = parser_adapter.normalize_and_validate_overrides({"site": "xxx"})
 
     assert ok is False
     assert normalized["include"] == []
     assert invalid == ["site"]
-    assert error and "site" in error
+    assert details == {"site": parser_adapter._EXPECTED_ARGUMENT_HINTS["site"]}
 
 
 def test_preview_rows_handles_empty():
