@@ -41,18 +41,22 @@ async def send_report(
         stat = report_path.stat()
         size = stat.st_size
     except OSError as exc:
+        error_message = str(exc)
         log_event(
-            "send_report.check_failed",
+            "report.send_fail",
+            type=type(exc).__name__,
+            message=error_message,
             path=str(report_path),
-            err=str(exc),
         )
-        return SendReportResult(False, None, exc, str(exc), None)
+        return SendReportResult(False, None, exc, error_message, None)
 
     if size <= 0:
         log_event(
-            "send_report.check_failed",
-            path=str(report_path),
+            "report.send_fail",
+            type="EmptyFile",
+            message="file_is_empty",
             size=size,
+            path=str(report_path),
         )
         return SendReportResult(False, None, None, "file_is_empty", size)
 
@@ -68,13 +72,13 @@ async def send_report(
     except (TelegramAPIError, NetworkError, TypeError, TimeoutError) as exc:
         error_message = str(exc)
         log_event(
-            "send_report.failed",
-            exc=error_message,
-            exc_type=type(exc).__name__,
+            "report.send_fail",
+            type=type(exc).__name__,
+            message=error_message,
             size=size,
             path=str(report_path),
         )
-        if size > MAX_TELEGRAM_FILE_SIZE:
+        if size and size > MAX_TELEGRAM_FILE_SIZE:
             await _notify_file_too_big(
                 bot,
                 chat_id,
@@ -85,9 +89,9 @@ async def send_report(
     except Exception as exc:  # pragma: no cover - defensive fallback
         error_message = str(exc)
         log_event(
-            "send_report.failed",
-            exc=error_message,
-            exc_type=type(exc).__name__,
+            "report.send_fail",
+            type=type(exc).__name__,
+            message=error_message,
             size=size,
             path=str(report_path),
         )
@@ -95,10 +99,11 @@ async def send_report(
 
     duration_ms = int((time.monotonic() - started) * 1000)
     log_event(
-        "send_report.ok",
+        "report.send_ok",
         duration_ms=duration_ms,
         size=size,
         file_name=report_path.name,
+        path=str(report_path),
     )
     return SendReportResult(True, message, None, None, size)
 
@@ -111,7 +116,10 @@ async def _notify_file_too_big(
     diagnostic_caption: str | None,
 ) -> None:
     try:
-        await bot.send_message(chat_id, "Файл слишком большой для Telegram")
+        await bot.send_message(
+            chat_id,
+            "Файл слишком большой для Telegram. Я приложил диагностический ZIP и передал информацию поддержке. Напиши нам, чтобы получить ссылку на скачивание отчёта.",
+        )
     except Exception as exc:  # pragma: no cover - notification best effort
         log_event(
             "send_report.notify_failed",

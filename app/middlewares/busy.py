@@ -10,7 +10,7 @@ from aiogram.dispatcher.middlewares import BaseMiddleware
 from app.utils.logging import log_event
 
 # Текст уведомления
-BUSY_TEXT = "⏳ Уже выполняю твой запрос — дождись, пожалуйста."
+BUSY_TEXT = "Идёт выгрузка, подожди пожалуйста…"
 
 # Глобальный реестр «занятых» пользователей
 BUSY_USERS: Set[int] = set()
@@ -57,7 +57,22 @@ class BusyMiddleware(BaseMiddleware):
             return
         if is_busy(uid):
             # короткий ответ без алерта, чтобы не мешать UX
-            await call.answer(BUSY_TEXT, show_alert=False)
+            dedup_payload = {"callback_data": call.data, "user_id": uid}
+            try:
+                await call.answer(BUSY_TEXT, show_alert=False)
+                log_event(
+                    "callback_ack_sent",
+                    callback="busy_middleware",
+                    status="ok",
+                    latency_ms=0,
+                )
+            except Exception as exc:  # pragma: no cover - best effort logging
+                log_event(
+                    "callback_ack_failed",
+                    callback="busy_middleware",
+                    err=str(exc),
+                )
+            log_event("job.deduped", **dedup_payload)
             log_event(
                 "busy_reject",
                 message="User is busy (callback)",
