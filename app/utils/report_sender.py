@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from aiogram import Bot, types
+from aiogram.types import InputFile
+from aiogram.utils.exceptions import NetworkError, TelegramAPIError
+
+from app.utils.logging import log_event
+
+MAX_TELEGRAM_FILE_SIZE = 45 * 1024 * 1024
+
+
+@dataclass
+class SendReportResult:
+    ok: bool
+    message: Optional[types.Message]
+    error: Optional[BaseException]
+    error_message: Optional[str]
+    size: Optional[int]
+
+
+async def send_report(
+    bot: Bot,
+    chat_id: int,
+    path: Path | str,
+    *,
+    caption: str | None = None,
+    reply_markup=None,
+    diagnostic_path: Path | None = None,
+    diagnostic_caption: str | None = None,
+) -> SendReportResult:
+    """Send a report file to Telegram with diagnostics and structured logging."""
+
+    started = time.monotonic()
+    report_path = Path(path)
+    try:
+        stat = report_path.stat()
+        size = stat.st_size
+    except OSError as exc:
+        log_event(
+            "send_report.check_failed",
+            path=str(report_path),
+            err=str(exc),
+        )
+        return SendReportResult(False, None, exc, str(exc), None)
+
+    if size <= 0:
+        log_event(
+            "send_report.check_failed",
+            path=str(report_path),
+            size=size,
+        )
+        return SendReportResult(False, None, None, "file_is_empty", size)
+
+    try:
+        with report_path.open("rb") as src:
+            input_file = InputFile(src, filename=report_path.name)
+            message = await bot.send_document(
+                chat_id,
+                input_file,
+                caption=caption,
+                reply_markup=reply_markup,
+            )
+    except (TelegramAPIError, NetworkError, TypeError, TimeoutError) as exc:
+        error_message = str(exc)
+        log_event(
+            "send_report.failed",
+            exc=error_message,
+            exc_type=type(exc).__name__,
+            size=size,
+            path=str(report_path),
+        )
+        if size > MAX_TELEGRAM_FILE_SIZE:
+            await _notify_file_too_big(
+                bot,
+                chat_id,
+                diagnostic_path=diagnostic_path,
+                diagnostic_caption=diagnostic_caption,
+            )
+        return SendReportResult(False, None, exc, error_message, size)
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        error_message = str(exc)
+        log_event(
+            "send_report.failed",
+            exc=error_message,
+            exc_type=type(exc).__name__,
+            size=size,
+            path=str(report_path),
+        )
+        return SendReportResult(False, None, exc, error_message, size)
+
+    duration_ms = int((time.monotonic() - started) * 1000)
+    log_event(
+        "send_report.ok",
+        duration_ms=duration_ms,
+        size=size,
+        file_name=report_path.name,
+    )
+    return SendReportResult(True, message, None, None, size)
+
+
+async def _notify_file_too_big(
+    bot: Bot,
+    chat_id: int,
+    *,
+    diagnostic_path: Path | None,
+    diagnostic_caption: str | None,
+) -> None:
+    try:
+        await bot.send_message(chat_id, "Файл слишком большой для Telegram")
+    except Exception as exc:  # pragma: no cover - notification best effort
+        log_event(
+            "send_report.notify_failed",
+            level="WARN",
+            err=str(exc),
+            reason="file_too_big",
+        )
+
+    if diagnostic_path and diagnostic_path.exists():
+        try:
+            with diagnostic_path.open("rb") as diag_src:
+                diag_file = InputFile(diag_src, filename=diagnostic_path.name)
+                await bot.send_document(chat_id, diag_file, caption=diagnostic_caption)
+            log_event(
+                "send_report.diag_shared",
+                path=str(diagnostic_path),
+            )
+        except Exception as exc:  # pragma: no cover - diagnostics best effort
+            log_event(
+                "send_report.diag_failed",
+                level="WARN",
+                err=str(exc),
+                path=str(diagnostic_path),
+            )
