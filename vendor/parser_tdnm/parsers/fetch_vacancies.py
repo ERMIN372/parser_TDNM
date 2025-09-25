@@ -1,5 +1,5 @@
 # parsers/fetch_vacancies.py
-import time, argparse, requests, pandas as pd, re, urllib.parse, html
+import time, argparse, requests, pandas as pd, re, urllib.parse, html, sys
 from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
 
@@ -327,22 +327,48 @@ def pick_benefits(text: str) -> Optional[str]:
     return ", ".join(out) if out else None
 
 # =================== HH.RU ===================
+def _warn(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
 def hh_search(query: str, area: int, pages: int, per_page: int, pause: float, search_in: str) -> List[Dict[str, Any]]:
     items=[]
     for page in range(pages):
         p={"text":query,"area":area,"page":page,"per_page":per_page,"only_with_salary":"false"}
         if search_in in ("name","description","company_name","everything"):
             p["search_field"]=search_in
-        r=requests.get("https://api.hh.ru/vacancies", params=p, headers=HEADERS, timeout=20)
-        if r.status_code!=200: break
-        data=r.json(); items+=data.get("items",[])
+        try:
+            r=requests.get("https://api.hh.ru/vacancies", params=p, headers=HEADERS, timeout=20)
+        except requests.RequestException as exc:
+            _warn(f"hh_search: request failed on page {page}: {exc}")
+            break
+        if r.status_code!=200:
+            _warn(f"hh_search: unexpected status {r.status_code} on page {page}")
+            break
+        try:
+            data=r.json()
+        except ValueError as exc:
+            _warn(f"hh_search: invalid JSON on page {page}: {exc}")
+            break
+        items+=data.get("items",[])
         if page>=data.get("pages",0)-1: break
         time.sleep(pause)
     return items
 
 def hh_details(vac_id: str) -> dict:
-    r=requests.get(f"https://api.hh.ru/vacancies/{vac_id}", headers=HEADERS, timeout=20)
-    return r.json() if r.status_code==200 else {}
+    try:
+        r=requests.get(f"https://api.hh.ru/vacancies/{vac_id}", headers=HEADERS, timeout=20)
+    except requests.RequestException as exc:
+        _warn(f"hh_details: request failed for id {vac_id}: {exc}")
+        return {}
+    if r.status_code!=200:
+        _warn(f"hh_details: unexpected status {r.status_code} for id {vac_id}")
+        return {}
+    try:
+        return r.json()
+    except ValueError as exc:
+        _warn(f"hh_details: invalid JSON for id {vac_id}: {exc}")
+        return {}
 
 def map_hh(items: List[Dict[str, Any]], pause_detail: float = 0.2) -> List[Dict[str, Any]]:
     rows = []
