@@ -10,6 +10,7 @@ from aiogram.types import InputFile
 from aiogram.utils.exceptions import NetworkError, TelegramAPIError
 
 from app.utils.logging import log_event
+from app.utils.xlsx_diagnostics import XlsxDiagnostics, collect_xlsx_diagnostics
 
 MAX_TELEGRAM_FILE_SIZE = 45 * 1024 * 1024
 
@@ -21,6 +22,7 @@ class SendReportResult:
     error: Optional[BaseException]
     error_message: Optional[str]
     size: Optional[int]
+    diagnostics: XlsxDiagnostics | None = None
 
 
 async def send_report(
@@ -38,20 +40,27 @@ async def send_report(
 
     started = time.monotonic()
     report_path = Path(path)
+    diagnostics: XlsxDiagnostics | None = None
+
     try:
         stat = report_path.stat()
         size = stat.st_size
     except OSError as exc:
         error_message = str(exc)
+        diagnostics = collect_xlsx_diagnostics(report_path)
         log_event(
             "report.send_fail",
             level="ERROR",
             stage="stat",
             path=str(report_path),
             chat_id=chat_id,
+            diagnostics=diagnostics.to_event_payload() if diagnostics else None,
             **_exception_payload(exc),
         )
-        return SendReportResult(False, None, exc, error_message, None)
+        return SendReportResult(False, None, exc, error_message, None, diagnostics)
+
+    diagnostics = collect_xlsx_diagnostics(report_path)
+    diag_payload = diagnostics.to_event_payload() if diagnostics else None
 
     log_event(
         "report.send_prepare",
@@ -62,6 +71,7 @@ async def send_report(
         exists=True,
         suffix=report_path.suffix,
         modified_ts=int(stat.st_mtime),
+        diagnostics=diag_payload,
     )
 
     if size <= 0:
@@ -74,8 +84,9 @@ async def send_report(
             size=size,
             path=str(report_path),
             chat_id=chat_id,
+            diagnostics=diag_payload,
         )
-        return SendReportResult(False, None, None, "file_is_empty", size)
+        return SendReportResult(False, None, None, "file_is_empty", size, diagnostics)
 
     try:
         with report_path.open("rb") as src:
@@ -86,6 +97,7 @@ async def send_report(
                 chat_id=chat_id,
                 file_name=resolved_name,
                 size=size,
+                diagnostics=diag_payload,
             )
             input_file = InputFile(src, filename=resolved_name)
             message = await bot.send_document(
@@ -104,6 +116,7 @@ async def send_report(
             chat_id=chat_id,
             size=size,
             file_name=file_name or report_path.name,
+            diagnostics=diag_payload,
             **_exception_payload(exc),
         )
         if size and size > MAX_TELEGRAM_FILE_SIZE:
@@ -113,6 +126,7 @@ async def send_report(
                 path=str(report_path),
                 chat_id=chat_id,
                 size=size,
+                diagnostics=diag_payload,
             )
             await _notify_file_too_big(
                 bot,
@@ -120,7 +134,7 @@ async def send_report(
                 diagnostic_path=diagnostic_path,
                 diagnostic_caption=diagnostic_caption,
             )
-        return SendReportResult(False, None, exc, error_message, size)
+        return SendReportResult(False, None, exc, error_message, size, diagnostics)
     except Exception as exc:  # pragma: no cover - defensive fallback
         error_message = str(exc)
         log_event(
@@ -131,9 +145,10 @@ async def send_report(
             chat_id=chat_id,
             size=size,
             file_name=file_name or report_path.name,
+            diagnostics=diag_payload,
             **_exception_payload(exc),
         )
-        return SendReportResult(False, None, exc, error_message, size)
+        return SendReportResult(False, None, exc, error_message, size, diagnostics)
 
     duration_ms = int((time.monotonic() - started) * 1000)
     log_event(
@@ -143,8 +158,9 @@ async def send_report(
         file_name=file_name or report_path.name,
         path=str(report_path),
         chat_id=chat_id,
+        diagnostics=diag_payload,
     )
-    return SendReportResult(True, message, None, None, size)
+    return SendReportResult(True, message, None, None, size, diagnostics)
 
 
 def _exception_payload(exc: BaseException) -> dict[str, Any]:

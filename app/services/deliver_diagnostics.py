@@ -34,6 +34,7 @@ class DeliverDiagContext:
     stderr_path: Path | None
     cmd_line: str | None
     progress_last_percent: int | None
+    xlsx_diagnostics: dict | None = None
 
 
 def build_diag_bundle(correlation_id: str | None, context: DeliverDiagContext) -> Path:
@@ -64,6 +65,7 @@ def build_diag_bundle(correlation_id: str | None, context: DeliverDiagContext) -
         "xlsx_size": context.xlsx_size,
         "cmd_line": context.cmd_line,
         "progress_last_percent": context.progress_last_percent,
+        "xlsx_diagnostics": context.xlsx_diagnostics,
         "user": {
             "id": context.user_id,
             "username": context.username,
