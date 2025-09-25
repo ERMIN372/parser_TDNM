@@ -1,8 +1,10 @@
 from __future__ import annotations
-import logging
 import asyncio
+import json
+import logging
 import math
 import os
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from aiogram import Bot, Dispatcher, types
@@ -30,6 +32,7 @@ from ..services.quota import FREE_PER_MONTH, QuotaDecision, check_quota, commit_
 from ..services.diagnostics import get_bundle_by_correlation, remember_bundle
 from app import keyboards
 from app.utils.admins import is_admin
+from app.utils.diag import make_diag_dir, save_text, zip_dir
 from app.utils.logging import complete_operation, log_event, update_context
 from app.utils.progress import ProgressMessage
 from app.utils.normalize import normalize_city, normalize_role
@@ -51,6 +54,77 @@ PROGRESS_STEPS_3 = (
 PREVIEW_TEMPLATE = "Готовлю превью (5 вакансий)… {spinner}"
 DONE_TEXT = "Готово ✅"
 FAIL_TEXT = "❌ Не получилось (ошибка/таймаут). Попробуй позже."
+
+_DIAG_ENV_KEYS = [
+    "PYBIN",
+    "PARSER_PIPELINE",
+    "REPORT_DIR",
+    "AREA",
+    "PAGES",
+    "PER_PAGE",
+    "SITE",
+    "PAUSE",
+]
+
+
+def _collect_diag_env() -> str:
+    lines = []
+    for key in _DIAG_ENV_KEYS:
+        value = os.getenv(key)
+        lines.append(f"{key}={value if value is not None else ''}")
+    return "\n".join(lines)
+
+
+def _save_parser_diag(
+    user_id: int,
+    *,
+    exc: parser_adapter.ParserRunError,
+    query: str,
+    city: str,
+    area_id: int | None,
+    include: list[str] | None,
+    exclude: list[str] | None,
+    amount: int | None,
+    mode: str,
+) -> Path:
+    diag_dir = make_diag_dir(user_id)
+    command_text = " ".join(str(part) for part in exc.cmd)
+    save_text(diag_dir, "command.txt", command_text)
+    save_text(diag_dir, "stdout.log", exc.stdout or "")
+    save_text(diag_dir, "stderr.log", exc.stderr or "")
+    save_text(diag_dir, "env.txt", _collect_diag_env())
+
+    meta = {
+        "query": query,
+        "city": city,
+        "area_id": area_id,
+        "include": include or [],
+        "exclude": exclude or [],
+        "amount": amount,
+        "mode": mode,
+        "error": repr(exc),
+        "returncode": exc.returncode,
+    }
+    save_text(diag_dir, "meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
+    try:
+        zip_dir(diag_dir)
+    except Exception:
+        pass
+
+    log_event("ERROR", "parse.diag_saved", dir=str(diag_dir))
+    return diag_dir
+
+
+def _format_failure_message(
+    *,
+    invalid_arguments: str | None,
+    diag_dir: Path | None,
+    user: types.User | None,
+) -> str:
+    text = invalid_arguments or FAIL_TEXT
+    if diag_dir and user and is_admin(user.id):
+        text += f"\nДиагностика сохранена: {diag_dir.name}"
+    return text
 
 
 class ReportProgressTracker:
@@ -627,6 +701,10 @@ async def _run_parser_bypass_validation(
     tracker: ReportProgressTracker | None = None
     decision: QuotaDecision | None = None
     result: parser_adapter.RunReportResult | None = None
+    invalid_arguments: str | None = None
+    diag_dir: Path | None = None
+    include_list: list[str] = []
+    exclude_list: list[str] = []
     try:
         decision = await _ensure_quota(
             message,
@@ -641,6 +719,15 @@ async def _run_parser_bypass_validation(
         exclude_list = _ensure_str_list(overrides.get("exclude"))
         tracker = await _start_report_progress(message, include_list, exclude_list)
         _log_parse_start(query, city, overrides)
+        log_event(
+            "INFO",
+            "parse.start",
+            user_id=uid,
+            mode="report",
+            query=query,
+            city=city,
+            overrides=overrides,
+        )
 
         async def _progress(kind: str, payload: dict) -> None:
             if tracker:
@@ -671,13 +758,60 @@ async def _run_parser_bypass_validation(
             progress=_progress,
             **allowed_kwargs,
         )
+    except parser_adapter.ParserRunError as exc:
+        if tracker:
+            await tracker.fail()
+        hint = "parser timeout" if exc.returncode == -1 else "rc != 0"
+        log_event(
+            "ERROR",
+            "parse.error",
+            user_id=uid,
+            mode="report",
+            query=query,
+            city=city,
+            hint=hint,
+            exc=repr(exc),
+        )
+        diag_dir = _save_parser_diag(
+            uid,
+            exc=exc,
+            query=query,
+            city=city,
+            area_id=overrides.get("area") if isinstance(overrides.get("area"), int) else None,
+            include=include_list,
+            exclude=exclude_list,
+            amount=None,
+            mode="report",
+        )
+        failure_text = _format_failure_message(
+            invalid_arguments=invalid_arguments,
+            diag_dir=diag_dir,
+            user=user,
+        )
+        await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
+        complete_operation(ok=False, err="parser_error")
+        return
     except Exception as e:  # pragma: no cover
         if tracker:
             await tracker.fail()
         event = "parse_timeout" if _is_timeout_error(e) else "parse_error"
         err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
-        log_event(event, level="ERROR", err=err_text)
-        await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
+        log_event(
+            "ERROR",
+            "parse.error",
+            user_id=uid,
+            mode="report",
+            query=query,
+            city=city,
+            hint=event,
+            exc=repr(e),
+        )
+        failure_text = _format_failure_message(
+            invalid_arguments=invalid_arguments,
+            diag_dir=diag_dir,
+            user=user,
+        )
+        await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
         complete_operation(ok=False, err=err_text)
         return
     else:
@@ -686,6 +820,16 @@ async def _run_parser_bypass_validation(
         else:
             await _finalize_quota_usage(message, uid, decision)
             _log_parse_ready(query, city, overrides)
+            log_event(
+                "INFO",
+                "parse.ok",
+                user_id=uid,
+                mode="report",
+                query=query,
+                city=city,
+                path=str(result.xlsx_path),
+                duration_ms=result.duration_ms if result else None,
+            )
             await _send_report_with_analytics(
                 message,
                 result.xlsx_path,
@@ -745,6 +889,10 @@ async def _run_with_amount(
     decision: QuotaDecision | None = None
     tracker: ReportProgressTracker | None = None
     result: parser_adapter.RunReportResult | None = None
+    invalid_arguments: str | None = None
+    diag_dir: Path | None = None
+    include_list: list[str] = []
+    exclude_list: list[str] = []
 
     try:
         decision = await _ensure_quota(
@@ -761,6 +909,15 @@ async def _run_with_amount(
         exclude_list = _ensure_str_list(ov.get("exclude"))
         tracker = await _start_report_progress(message, include_list, exclude_list)
         _log_parse_start(title, city, ov, approx_total=total)
+        log_event(
+            "INFO",
+            "parse.start",
+            user_id=uid,
+            mode="report",
+            query=title,
+            city=city,
+            amount=total,
+        )
 
         async def _progress(kind: str, payload: dict) -> None:
             if tracker:
@@ -778,13 +935,53 @@ async def _run_with_amount(
             progress=_progress,
             **run_kwargs,
         )
+    except parser_adapter.ParserRunError as exc:
+        if tracker:
+            await tracker.fail()
+        hint = "parser timeout" if exc.returncode == -1 else "rc != 0"
+        log_event(
+            "ERROR",
+            "parse.error",
+            user_id=uid,
+            mode="report",
+            query=title,
+            city=city,
+            amount=total,
+            hint=hint,
+            exc=repr(exc),
+        )
+        diag_dir = _save_parser_diag(
+            uid,
+            exc=exc,
+            query=title,
+            city=city,
+            area_id=area_id,
+            include=include_list,
+            exclude=exclude_list,
+            amount=total,
+            mode="report",
+        )
+        failure_text = _format_failure_message(
+            invalid_arguments=invalid_arguments,
+            diag_dir=diag_dir,
+            user=user,
+        )
+        await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
+        complete_operation(ok=False, err="parser_error")
+        return
     except Exception as e:
         if tracker:
             await tracker.fail()
         err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
         event = "parse_timeout" if _is_timeout_error(e) else "parse_error"
-        log_event(event, level="ERROR", err=err_text)
-        await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
+        log_event("ERROR", "parse.error", user_id=uid, mode="report", query=title, city=city, amount=total, hint=event, exc=repr(e))
+        diag_dir = None
+        failure_text = _format_failure_message(
+            invalid_arguments=invalid_arguments,
+            diag_dir=diag_dir,
+            user=user,
+        )
+        await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
         complete_operation(ok=False, err=err_text)
         return
     else:
@@ -794,6 +991,17 @@ async def _run_with_amount(
             if decision:
                 await _finalize_quota_usage(message, uid, decision)
             _log_parse_ready(title, city, ov, approx_total=total)
+            log_event(
+                "INFO",
+                "parse.ok",
+                user_id=uid,
+                mode="report",
+                query=title,
+                city=city,
+                amount=total,
+                path=str(result.xlsx_path),
+                duration_ms=result.duration_ms if result else None,
+            )
             await _send_report_with_analytics(
                 message,
                 result.xlsx_path,
@@ -1322,6 +1530,8 @@ async def cb_preview(call: types.CallbackQuery):
     await call.answer("Готовлю превью…", show_alert=False)
 
     progress: ProgressMessage | None = None
+    invalid_arguments: str | None = None
+    diag_dir: Path | None = None
     try:
         payload = _PENDING_QTY.get(uid)   # ВАЖНО: .get(), НЕ .pop()!
         if not payload:
@@ -1331,11 +1541,11 @@ async def cb_preview(call: types.CallbackQuery):
 
         title, city, area_id, overrides, _max_total = payload
         overrides = overrides or {}
-        invalid_arguments: list[str] = []
+        invalid_keys: list[str] = []
         if not (title or "").strip():
-            invalid_arguments.append("query")
+            invalid_keys.append("query")
         if not (city or "").strip():
-            invalid_arguments.append("city")
+            invalid_keys.append("city")
 
         override_payload: dict[str, object] = {
             "include": overrides.get("include"),
@@ -1348,17 +1558,16 @@ async def cb_preview(call: types.CallbackQuery):
         _ok_overrides, normalized_overrides, invalid_override_keys, _ = (
             parser_adapter.normalize_and_validate_overrides(override_payload)
         )
-        invalid_arguments.extend(invalid_override_keys)
-        if invalid_arguments:
+        invalid_keys.extend(invalid_override_keys)
+        if invalid_keys:
             log_event(
                 "preview_validation_failed",
                 level="WARN",
-                invalid_arguments=invalid_arguments,
+                invalid_arguments=invalid_keys,
                 args=_build_args(title, city, overrides),
             )
-            await call.message.answer(
-                parser_adapter.format_invalid_arguments(invalid_arguments)
-            )
+            invalid_arguments = parser_adapter.format_invalid_arguments(invalid_keys)
+            await call.message.answer(invalid_arguments)
             return
 
         include = normalized_overrides.get("include", [])
@@ -1395,6 +1604,14 @@ async def cb_preview(call: types.CallbackQuery):
 
         progress = await ProgressMessage.create(call.message.bot, call.message.chat.id, PREVIEW_TEMPLATE)
         _log_preview_start(title, city, overrides)
+        log_event(
+            "INFO",
+            "preview.start",
+            user_id=uid,
+            query=title,
+            city=city,
+            area_id=area_id,
+        )
         try:
             rows = await parser_adapter.preview_rows(
                 uid,
@@ -1404,6 +1621,37 @@ async def cb_preview(call: types.CallbackQuery):
                 include=include,
                 exclude=exclude,
             )
+        except parser_adapter.ParserRunError as exc:
+            hint = "parser timeout" if exc.returncode == -1 else "rc != 0"
+            log_event(
+                "ERROR",
+                "preview.error",
+                user_id=uid,
+                query=title,
+                city=city,
+                hint=hint,
+                exc=repr(exc),
+            )
+            if progress:
+                await progress.fail()
+            diag_dir = _save_parser_diag(
+                uid,
+                exc=exc,
+                query=title,
+                city=city,
+                area_id=area_id if isinstance(area_id, int) else None,
+                include=include,
+                exclude=exclude,
+                amount=parser_adapter.PREVIEW_ROWS,
+                mode="preview",
+            )
+            failure_text = _format_failure_message(
+                invalid_arguments=invalid_arguments,
+                diag_dir=diag_dir,
+                user=call.from_user,
+            )
+            await call.message.answer(failure_text)
+            return
         except parser_adapter.ValidationError as exc:
             if progress:
                 await progress.fail()
@@ -1411,21 +1659,62 @@ async def cb_preview(call: types.CallbackQuery):
             return
         except asyncio.TimeoutError as exc:
             _log_preview_timeout(title, city, overrides, err=str(exc))
+            log_event(
+                "ERROR",
+                "preview.error",
+                user_id=uid,
+                query=title,
+                city=city,
+                hint="timeout",
+                exc=repr(exc),
+            )
             if progress:
                 await progress.fail()
-            await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
+            failure_text = _format_failure_message(
+                invalid_arguments=invalid_arguments,
+                diag_dir=diag_dir,
+                user=call.from_user,
+            )
+            await call.message.answer(failure_text)
             return
         except Exception as exc:
             _log_preview_timeout(title, city, overrides, err=str(exc))
+            log_event(
+                "ERROR",
+                "preview.error",
+                user_id=uid,
+                query=title,
+                city=city,
+                hint="exception",
+                exc=repr(exc),
+            )
             if progress:
                 await progress.fail()
-            await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
+            failure_text = _format_failure_message(
+                invalid_arguments=invalid_arguments,
+                diag_dir=diag_dir,
+                user=call.from_user,
+            )
+            await call.message.answer(failure_text)
             return
 
         if rows is None:
             if progress:
                 await progress.fail()
-            await call.message.answer("Не удалось получить превью. Попробуй ещё раз позже.")
+            failure_text = _format_failure_message(
+                invalid_arguments=invalid_arguments,
+                diag_dir=diag_dir,
+                user=call.from_user,
+            )
+            log_event(
+                "ERROR",
+                "preview.error",
+                user_id=uid,
+                query=title,
+                city=city,
+                hint="no_result",
+            )
+            await call.message.answer(failure_text)
             return
 
         if not rows:
@@ -1433,6 +1722,14 @@ async def cb_preview(call: types.CallbackQuery):
             _log_preview_ready(title, city, 0, overrides)
             if progress:
                 await progress.finish(DONE_TEXT, delete_after=45.0)
+            log_event(
+                "INFO",
+                "preview.ok",
+                user_id=uid,
+                query=title,
+                city=city,
+                count=0,
+            )
             return
 
         # аккуратный текст превью
@@ -1449,6 +1746,14 @@ async def cb_preview(call: types.CallbackQuery):
 
         txt = "<b>Предпросмотр (первые совпадения):</b>\n" + "\n".join(lines)
         await call.message.answer(txt, disable_web_page_preview=True)
+        log_event(
+            "INFO",
+            "preview.ok",
+            user_id=uid,
+            query=title,
+            city=city,
+            count=len(rows),
+        )
         _log_preview_ready(title, city, len(rows), overrides)
         if progress:
             await progress.finish(DONE_TEXT, delete_after=45.0)

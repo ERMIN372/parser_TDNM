@@ -70,6 +70,23 @@ class ValidationError(Exception):
         super().__init__(self.user_message)
 
 
+class ParserRunError(Exception):
+    """Raised when the external parser process fails to complete successfully."""
+
+    def __init__(
+        self,
+        cmd: Sequence[str],
+        stdout: str,
+        stderr: str,
+        returncode: int,
+    ) -> None:
+        self.cmd = list(cmd)
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+        super().__init__(f"Parser failed with return code {returncode}")
+
+
 def format_invalid_arguments(invalid: Sequence[str] | None) -> str:
     items = sorted({str(item) for item in invalid or [] if str(item).strip()})
     if not items:
@@ -1494,4 +1511,21 @@ async def run_report(
     log_event(event_name, level=level, **event_payload, **common_log_fields)
 
     _register_parse_result(result)
+
+    should_raise = (
+        not ok
+        and not invalid_arguments
+        and not preflight_blocked
+        and (
+            timeout_hit
+            or spawn_error is not None
+            or rc is None
+            or (rc is not None and rc != 0)
+        )
+    )
+    if should_raise:
+        stdout_text = "\n".join(stdout_lines)
+        stderr_text = "\n".join(stderr_lines)
+        raise ParserRunError(command, stdout_text, stderr_text, int(rc) if rc is not None else -1)
+
     return result
