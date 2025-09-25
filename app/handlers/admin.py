@@ -13,6 +13,8 @@ from app.storage.models import User
 from app.services import referrals as referral_service
 from app.utils.backup import make_sqlite_backup
 from app.utils.admins import is_admin
+from app.utils.diag import get_last_diag_dir, zip_dir
+from app.utils.logging import log_event
 
 # --- доступ ---
 def _guard(uid: int) -> bool: return is_admin(uid)
@@ -392,6 +394,47 @@ async def cb_backup(call: types.CallbackQuery):
         await call.message.reply(f"Не удалось сделать бэкап: {e}")
     await call.answer("Готово")
 
+
+async def cmd_diag_last(message: types.Message) -> None:
+    if not _guard(message.from_user.id):
+        return
+
+    raw_args = message.get_args() if hasattr(message, "get_args") else ""
+    raw_args = raw_args.strip() if raw_args else ""
+
+    if raw_args:
+        try:
+            target_id = int(raw_args)
+        except ValueError:
+            await message.reply("Некорректный ID пользователя.")
+            log_event("INFO", "diag.send", ok=False, reason="bad_args", raw=raw_args)
+            return
+    else:
+        target_id = message.chat.id
+
+    try:
+        diag_dir = get_last_diag_dir(target_id)
+    except Exception as exc:
+        await message.reply("Не удалось получить диагностику.")
+        log_event("INFO", "diag.send", ok=False, user_id=target_id, err=str(exc))
+        return
+
+    if not diag_dir:
+        await message.reply("Диагностики пока нет.")
+        log_event("INFO", "diag.send", ok=False, user_id=target_id)
+        return
+
+    try:
+        zip_path = zip_dir(diag_dir)
+    except Exception as exc:
+        await message.reply("Не удалось упаковать диагностику.")
+        log_event("INFO", "diag.send", ok=False, user_id=target_id, err=str(exc), dir=str(diag_dir))
+        return
+
+    await message.reply_document(InputFile(zip_path), caption=diag_dir.name)
+    log_event("INFO", "diag.send", ok=True, user_id=target_id, file=str(zip_path))
+
+
 # -------- регистрация --------
 def register(dp: Dispatcher):
     # вход в админку
@@ -430,6 +473,9 @@ def register(dp: Dispatcher):
 
     # команда точечной рассылки
     dp.register_message_handler(cast_cmd, commands=["cast"])
+
+    # диагностика
+    dp.register_message_handler(cmd_diag_last, commands=["diag_last"])
 
     # бэкап
     dp.register_callback_query_handler(cb_backup, lambda c: c.data == "admin_backup")
