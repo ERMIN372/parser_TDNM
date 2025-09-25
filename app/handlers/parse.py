@@ -7,6 +7,7 @@ import math
 import os
 import shutil
 import time
+import traceback
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -52,6 +53,24 @@ from app.utils.normalize import normalize_city, normalize_role
 _WARN_CACHE: Dict[int, Tuple[str, str, dict]] = {}
 # Кеш шага выбора объёма: user_id -> (norm_title, city, area_id, overrides, max_total)
 _PENDING_QTY: Dict[int, Tuple[str, str, int, dict, int]] = {}
+# Активные задачи выгрузки: user_id -> asyncio.Task
+_ACTIVE_REPORT_JOBS: dict[int, asyncio.Task] = {}
+
+
+def _is_report_job_active(uid: int) -> bool:
+    task = _ACTIVE_REPORT_JOBS.get(uid)
+    return bool(task) and not task.done()
+
+
+def _register_report_job(uid: int, task: asyncio.Task) -> None:
+    _ACTIVE_REPORT_JOBS[uid] = task
+
+    def _cleanup(_task: asyncio.Task, *, user_id: int = uid) -> None:
+        existing = _ACTIVE_REPORT_JOBS.get(user_id)
+        if existing is _task:
+            _ACTIVE_REPORT_JOBS.pop(user_id, None)
+
+    task.add_done_callback(_cleanup)
 
 PROGRESS_STEPS = (
     ProgressStep("fetch", "парсинг страниц hh…"),
@@ -878,6 +897,11 @@ async def _run_parser_bypass_validation(
     """Запуск парсера без доп. проверок (по кнопке «Всё равно искать»)."""
     uid = _resolve_requester_id(message, uid)
     if not set_busy(uid):
+        if tracker:
+            try:
+                await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Уже выполняю другой запрос")
+            except Exception:
+                pass
         await message.answer(BUSY_TEXT)
         return
     snapshot = paywall.SavedRequest(
@@ -1022,7 +1046,9 @@ async def _run_parser_bypass_validation(
             hint=error_info.hint_for_log,
         )
         if tracker:
-            await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}")
+            await tracker.fail(
+                f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}"
+            )
         failure_text = _format_failure_message(
             invalid_arguments=None,
             diag_dir=diag_dir,
@@ -1079,8 +1105,7 @@ async def _run_parser_bypass_validation(
                 complete_operation(ok=True)
             else:
                 failure_text = (
-                    "Не удалось отправить отчёт в Telegram. Мы прислали диагностический архив,"
-                    " чтобы помочь с разбором."
+                    "Не получилось отправить файл. Я приложил диагностический ZIP и уведомил поддержку."
                 )
                 if tracker:
                     await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Не удалось отправить файл")
@@ -1108,10 +1133,16 @@ async def _run_with_amount(
     uid: int | None = None,
     user: types.User | None = None,
     ui_ack_sent: bool | None = None,
+    tracker: ReportProgressTracker | None = None,
 ):
     """Считает pages/per_page под нужный объём total и запускает парсер с блокировкой пользователя."""
     uid = _resolve_requester_id(message, uid)
     if not set_busy(uid):
+        if tracker:
+            try:
+                await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Уже выполняю другой запрос")
+            except Exception:
+                pass
         await message.answer(BUSY_TEXT)
         return
 
@@ -1140,7 +1171,7 @@ async def _run_with_amount(
         approx_total=total,
     )
     decision: QuotaDecision | None = None
-    tracker: ReportProgressTracker | None = None
+    tracker_obj: ReportProgressTracker | None = tracker
     result: parser_adapter.RunReportResult | None = None
     diag_dir: Path | None = None
     include_list: list[str] = []
@@ -1157,12 +1188,18 @@ async def _run_with_amount(
             reason="parse_amount",
         )
         if not decision:
+            if tracker_obj:
+                try:
+                    await tracker_obj.fail(f"{PROGRESS_FAILURE_PREFIX} Недостаточно лимитов")
+                except Exception:
+                    pass
             return
 
         include_list = _ensure_str_list(ov.get("include"))
         exclude_list = _ensure_str_list(ov.get("exclude"))
-        tracker = await _start_report_progress(message, include_list, exclude_list)
-        await tracker.mark_command_ready()
+        if tracker_obj is None:
+            tracker_obj = await _start_report_progress(message, include_list, exclude_list)
+        await tracker_obj.mark_command_ready()
         _log_parse_start(title, city, ov, approx_total=total)
         log_event(
             "INFO",
@@ -1173,19 +1210,27 @@ async def _run_with_amount(
             city=city,
             amount=total,
         )
+        log_event(
+            "parse.started",
+            user_id=uid,
+            query=title,
+            city=city,
+            amount=total,
+            overrides=ov,
+        )
 
         async def _progress(kind: str, payload: dict) -> None:
-            if tracker:
-                await tracker.handle_event(kind, payload)
+            if tracker_obj:
+                await tracker_obj.handle_event(kind, payload)
 
         run_kwargs = {k: v for k, v in ov.items() if k not in {"include", "exclude"}}
         while True:
             try:
-                if tracker:
+                if tracker_obj:
                     if retries_done > 0:
-                        await tracker.clear_retry()
-                        await tracker.mark_command_ready()
-                    await tracker.mark_process_started()
+                        await tracker_obj.clear_retry()
+                        await tracker_obj.mark_command_ready()
+                    await tracker_obj.mark_process_started()
                 result = await parser_adapter.run_report(
                     uid,
                     title,
@@ -1196,6 +1241,15 @@ async def _run_with_amount(
                     exclude=exclude_list,
                     progress=_progress,
                     **run_kwargs,
+                )
+                log_event(
+                    "parse.finished",
+                    user_id=uid,
+                    ok=result.ok if result else False,
+                    duration_ms=result.duration_ms if result else None,
+                    cmd_line=(result.meta or {}).get("command_line") if result else None,
+                    rows=(result.meta or {}).get("result", {}).get("rows") if result else None,
+                    xlsx_path=str(result.xlsx_path) if result and result.xlsx_path else None,
                 )
                 break
             except parser_adapter.ParserRunError as exc:
@@ -1214,14 +1268,18 @@ async def _run_with_amount(
                 )
                 if is_retryable(error_info.code) and retries_done < len(backoffs):
                     retries_done += 1
-                    if tracker:
-                        await tracker.show_retry(retries_done, len(backoffs))
+                    if tracker_obj:
+                        await tracker_obj.show_retry(retries_done, len(backoffs))
                     await asyncio.sleep(backoffs[retries_done - 1])
                     continue
 
-                progress_last_step = tracker.progress.last_step if tracker else None
-                if tracker:
-                    await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}")
+                progress_last_step = (
+                    tracker_obj.progress.last_step if tracker_obj else None
+                )
+                if tracker_obj:
+                    await tracker_obj.fail(
+                        f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}"
+                    )
                 diag_dir = _save_parser_diag(
                     uid,
                     exc=exc,
@@ -1250,6 +1308,15 @@ async def _run_with_amount(
                     user_chat_id=getattr(message.chat, "id", None),
                     user_id=getattr(user, "id", None),
                 )
+                log_event(
+                    "parse.finished",
+                    user_id=uid,
+                    ok=False,
+                    duration_ms=None,
+                    cmd_line=" ".join(str(part) for part in getattr(exc, "cmd", []) or []).strip() or None,
+                    rows=None,
+                    xlsx_path=None,
+                )
                 complete_operation(ok=False, err=error_info.code.lower())
                 return
     except Exception as e:
@@ -1265,8 +1332,10 @@ async def _run_with_amount(
             error_code=error_info.code,
             hint=error_info.hint_for_log,
         )
-        if tracker:
-            await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}")
+        if tracker_obj:
+            await tracker_obj.fail(
+                f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}"
+            )
         failure_text = _format_failure_message(
             invalid_arguments=None,
             diag_dir=None,
@@ -1274,6 +1343,15 @@ async def _run_with_amount(
             default_message=error_info.message_for_user,
         )
         await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
+        log_event(
+            "parse.finished",
+            user_id=uid,
+            ok=False,
+            duration_ms=None,
+            cmd_line=" ".join(str(part) for part in getattr(e, "cmd", []) or []).strip() or None,
+            rows=None,
+            xlsx_path=None,
+        )
         complete_operation(ok=False, err=error_info.code.lower())
         return
     else:
@@ -1311,7 +1389,7 @@ async def _run_with_amount(
                 diagnostic_path=diagnostic_path,
                 diagnostic_caption=diagnostic_caption if diagnostic_path else None,
             )
-            progress_strategy = tracker.ui_strategy if tracker else "edit"
+            progress_strategy = tracker_obj.ui_strategy if tracker_obj else "edit"
             ack_for_meta = ui_ack_sent if ui_ack_sent is not None else True
             _update_ui_meta(
                 result,
@@ -1322,16 +1400,17 @@ async def _run_with_amount(
             )
             if send_result.ok:
                 await _cleanup_inline_message(message)
-                if tracker:
-                    await tracker.finish_success()
+                if tracker_obj:
+                    await tracker_obj.finish_success()
                 complete_operation(ok=True)
             else:
                 failure_text = (
-                    "Не удалось отправить отчёт в Telegram. Мы прислали диагностический архив,"
-                    " чтобы помочь с разбором."
+                    "Не получилось отправить файл. Я приложил диагностический ZIP и уведомил поддержку."
                 )
-                if tracker:
-                    await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Не удалось отправить файл")
+                if tracker_obj:
+                    await tracker_obj.fail(
+                        f"{PROGRESS_FAILURE_PREFIX} Не удалось отправить файл"
+                    )
                 await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
                 await _send_diagnostic_bundle_if_needed(
                     message.bot,
@@ -1576,8 +1655,7 @@ async def _run_parser(
                     complete_operation(ok=True)
                 else:
                     failure_text = (
-                        "Не удалось отправить отчёт в Telegram. Мы прислали диагностический архив,"
-                        " чтобы помочь с разбором."
+                        "Не получилось отправить файл. Я приложил диагностический ZIP и уведомил поддержку."
                     )
                     if tracker:
                         await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Не удалось отправить файл")
@@ -1905,13 +1983,40 @@ async def cb_parse_fix(call: types.CallbackQuery):
 
 
 async def cb_qty(call: types.CallbackQuery):
+    uid = call.from_user.id
+
+    if _is_report_job_active(uid):
+        ack_started = time.monotonic()
+        try:
+            await call.answer(BUSY_TEXT, show_alert=False, cache_time=1)
+            log_event(
+                "callback_ack_sent",
+                callback="cb_qty_dedup",
+                status="ok",
+                latency_ms=int((time.monotonic() - ack_started) * 1000),
+            )
+        except Exception as exc:  # pragma: no cover - best effort logging
+            stack = traceback.format_exc()
+            log_event(
+                "callback_ack_sent",
+                callback="cb_qty_dedup",
+                status="err",
+                latency_ms=int((time.monotonic() - ack_started) * 1000),
+                err=str(exc),
+                stack=stack,
+            )
+            log_event("callback_ack_failed", callback="cb_qty_dedup", err=str(exc), stack=stack)
+        log_event("job.deduped", callback="cb_qty", user_id=uid)
+        return
+
     # если занят — просто подсказка и выходим
-    if is_busy(call.from_user.id):
+    if is_busy(uid):
         await call.answer(BUSY_TEXT, show_alert=False)
         return
 
     ack_started = time.monotonic()
     ack_sent = False
+    ack_stack: str | None = None
     try:
         await call.answer(
             "Запускаю выгрузку… это займёт пару минут",
@@ -1926,16 +2031,18 @@ async def cb_qty(call: types.CallbackQuery):
             latency_ms=int((time.monotonic() - ack_started) * 1000),
         )
     except Exception as exc:
+        ack_stack = traceback.format_exc()
         log_event(
             "callback_ack_sent",
             callback="cb_qty",
             status="err",
             latency_ms=int((time.monotonic() - ack_started) * 1000),
             err=str(exc),
+            stack=ack_stack,
         )
-        log_event("callback_ack_failed", callback="cb_qty", err=str(exc))
+        log_event("callback_ack_failed", callback="cb_qty", err=str(exc), stack=ack_stack)
 
-    payload = _PENDING_QTY.get(call.from_user.id)
+    payload = _PENDING_QTY.get(uid)
     if not payload:
         await call.message.answer("Не нашёл предыдущий запрос. Введи должность ещё раз:")
         await ParseForm.waiting_query.set()
@@ -1950,8 +2057,22 @@ async def cb_qty(call: types.CallbackQuery):
     else:  # "all"
         total = max_total
 
+    include_list = _ensure_str_list((overrides or {}).get("include"))
+    exclude_list = _ensure_str_list((overrides or {}).get("exclude"))
+
+    try:
+        tracker = await _start_report_progress(call.message, include_list, exclude_list)
+    except Exception as exc:
+        log_event(
+            "progress.start_failed",
+            level="ERROR",
+            err=str(exc),
+            callback="cb_qty",
+        )
+        tracker = None
+
     # фикс: после старта выгрузки «забываем» pending, чтобы старые кнопки не плодили ошибки
-    _PENDING_QTY.pop(call.from_user.id, None)
+    _PENDING_QTY.pop(uid, None)
     update_context(dialog_step=_dialog_step("qty", str(total)))
     log_event(
         "qty_chosen",
@@ -1959,17 +2080,38 @@ async def cb_qty(call: types.CallbackQuery):
         quantity=total,
         args=_build_args(title, city, overrides, qty=total),
     )
-    await _run_with_amount(
-        call.message,
-        title,
-        city,
-        area_id,
-        overrides,
-        total,
-        uid=call.from_user.id,
-        user=call.from_user,
-        ui_ack_sent=ack_sent,
-    )
+
+    async def _job() -> None:
+        try:
+            await _run_with_amount(
+                call.message,
+                title,
+                city,
+                area_id,
+                overrides,
+                total,
+                uid=uid,
+                user=call.from_user,
+                ui_ack_sent=ack_sent,
+                tracker=tracker,
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging
+            stack = traceback.format_exc()
+            log_event(
+                "report.job_failed",
+                level="ERROR",
+                err=str(exc),
+                stack=stack,
+                user_id=uid,
+            )
+            if tracker:
+                try:
+                    await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Внутренняя ошибка")
+                except Exception:
+                    pass
+
+    task = asyncio.create_task(_job(), name=f"report:{uid}:{total}")
+    _register_report_job(uid, task)
 
 
 async def cb_preview(call: types.CallbackQuery):
