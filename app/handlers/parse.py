@@ -52,6 +52,7 @@ from app.utils.errors import (
 )
 from app.utils.progress import Progress, ProgressStep
 from app.utils.report_sender import SendReportResult, send_report
+from app.utils.xlsx_diagnostics import collect_xlsx_diagnostics
 from app.utils.normalize import normalize_city, normalize_role
 
 # Кеш последнего «сомнительного» запроса: user_id -> (query, city, overrides)
@@ -1179,14 +1180,13 @@ async def _run_parser_bypass_validation(
             deliver_status = "fail"
             safe_name, name_ok = _safe_document_name(report_path)
             progress_strategy = tracker.ui_strategy if tracker else "edit"
+            diag_snapshot = collect_xlsx_diagnostics(report_path)
+            diag_payload = diag_snapshot.to_event_payload()
+            if diag_snapshot.size_bytes is not None:
+                report_size = diag_snapshot.size_bytes
+            send_result: SendReportResult | None = None
 
             try:
-                if report_path.exists():
-                    try:
-                        report_size = report_path.stat().st_size
-                    except OSError:
-                        report_size = None
-
                 started_payload = {
                     "correlation_id": correlation,
                     "chat_id": chat_id,
@@ -1195,6 +1195,7 @@ async def _run_parser_bypass_validation(
                 }
                 if report_size is not None:
                     started_payload["size_bytes"] = report_size
+                started_payload["diagnostics"] = diag_payload
                 if _DIAG_ENABLED:
                     started_payload["cmd_line"] = (result.meta or {}).get("command_line") if result else None
                     started_payload["progress_last_percent"] = (
@@ -1210,6 +1211,10 @@ async def _run_parser_bypass_validation(
 
                 if report_size is None:
                     report_size = report_path.stat().st_size
+                    diag_snapshot = collect_xlsx_diagnostics(report_path)
+                    diag_payload = diag_snapshot.to_event_payload()
+                    if diag_snapshot.size_bytes is not None:
+                        report_size = diag_snapshot.size_bytes
 
                 if report_size <= 0:
                     raise ValueError("report_file_empty")
@@ -1240,6 +1245,11 @@ async def _run_parser_bypass_validation(
                 )
                 ack_sent = True
                 send_error_message = send_result.error_message
+                if send_result.size is not None:
+                    report_size = send_result.size
+                if send_result.diagnostics:
+                    diag_snapshot = send_result.diagnostics
+                    diag_payload = diag_snapshot.to_event_payload()
 
                 if not send_result.ok:
                     log_event(
@@ -1253,6 +1263,7 @@ async def _run_parser_bypass_validation(
                         if send_result.error
                         else None,
                         error_message=send_result.error_message,
+                        diagnostics=diag_payload,
                     )
                     raise RuntimeError(send_result.error_message or "send_report_failed")
 
@@ -1263,6 +1274,11 @@ async def _run_parser_bypass_validation(
                 deliver_status = "ok"
             except Exception as exc:
                 deliver_status = "fail"
+                if send_result and send_result.diagnostics:
+                    diag_snapshot = send_result.diagnostics
+                else:
+                    diag_snapshot = collect_xlsx_diagnostics(report_path)
+                diag_payload = diag_snapshot.to_event_payload()
                 stack_full = build_stack(exc)
                 stack_lines = [line for line in stack_full.strip().splitlines() if line.strip()]
                 stack_short = stack_lines[-1] if stack_lines else type(exc).__name__
@@ -1274,6 +1290,7 @@ async def _run_parser_bypass_validation(
                     "exception_type": type(exc).__name__,
                     "message": str(exc),
                     "stack_short": stack_short,
+                    "diagnostics": diag_payload,
                 }
                 if _DIAG_ENABLED:
                     fail_payload["cmd_line"] = (result.meta or {}).get("command_line") if result else None
@@ -1317,6 +1334,7 @@ async def _run_parser_bypass_validation(
                         stderr_path=result.stderr_path if result else None,
                         cmd_line=(result.meta or {}).get("command_line") if result else None,
                         progress_last_percent=tracker.last_percent if tracker else None,
+                        xlsx_diagnostics=diag_payload,
                     )
                     bundle_path = build_diag_bundle(correlation, context)
                     bundle_correlation = _extract_correlation_from_bundle(bundle_path) or correlation
@@ -1358,6 +1376,7 @@ async def _run_parser_bypass_validation(
                     correlation_id=correlation,
                     status="ok" if deliver_status == "ok" else "fail",
                     chat_id=chat_id,
+                    diagnostics=diag_payload,
                 )
     finally:
         clear_busy(uid)
@@ -1618,6 +1637,7 @@ async def _run_with_amount(
                 correlation = str(result.meta.get("correlation_id") or "").strip() or None
             diagnostic_path = result.bundle_path if SEND_DIAG_BUNDLES else None
             diagnostic_caption = f"diag {correlation}" if correlation else "diagnostic bundle"
+            chat_id = getattr(message.chat, "id", None)
             send_result = await _send_report_with_analytics(
                 message,
                 result.xlsx_path,
@@ -1639,12 +1659,38 @@ async def _run_with_amount(
                 report_path=result.xlsx_path,
                 send_error=send_result.error_message,
             )
+            diag_payload = (
+                send_result.diagnostics.to_event_payload()
+                if send_result.diagnostics
+                else collect_xlsx_diagnostics(Path(result.xlsx_path)).to_event_payload()
+            )
+            log_event(
+                "deliver.done",
+                correlation_id=correlation,
+                status="ok" if send_result.ok else "fail",
+                chat_id=chat_id,
+                diagnostics=diag_payload,
+                size_bytes=send_result.size,
+            )
             if send_result.ok:
                 await _cleanup_inline_message(message)
                 if tracker_obj:
                     await tracker_obj.finish_success()
                 complete_operation(ok=True)
             else:
+                log_event(
+                    "deliver.send_report_failed",
+                    level="ERROR",
+                    correlation_id=correlation,
+                    chat_id=chat_id,
+                    path=str(result.xlsx_path),
+                    size_bytes=send_result.size,
+                    error_type=type(send_result.error).__name__
+                    if send_result.error
+                    else None,
+                    error_message=send_result.error_message,
+                    diagnostics=diag_payload,
+                )
                 failure_text = (
                     "Не получилось отправить файл. Я приложил диагностический ZIP и уведомил поддержку."
                 )
@@ -1870,6 +1916,7 @@ async def _run_parser(
                     correlation = str(result.meta.get("correlation_id") or "").strip() or None
                 diagnostic_path = result.bundle_path if SEND_DIAG_BUNDLES else None
                 diagnostic_caption = f"diag {correlation}" if correlation else "diagnostic bundle"
+                chat_id = getattr(message.chat, "id", None)
                 send_result = await _send_report_with_analytics(
                     message,
                     result.xlsx_path,
@@ -1889,12 +1936,38 @@ async def _run_parser(
                     report_path=result.xlsx_path,
                     send_error=send_result.error_message,
                 )
+                diag_payload = (
+                    send_result.diagnostics.to_event_payload()
+                    if send_result.diagnostics
+                    else collect_xlsx_diagnostics(Path(result.xlsx_path)).to_event_payload()
+                )
+                log_event(
+                    "deliver.done",
+                    correlation_id=correlation,
+                    status="ok" if send_result.ok else "fail",
+                    chat_id=chat_id,
+                    diagnostics=diag_payload,
+                    size_bytes=send_result.size,
+                )
                 if send_result.ok:
                     await _cleanup_inline_message(message)
                     if tracker:
                         await tracker.finish_success()
                     complete_operation(ok=True)
                 else:
+                    log_event(
+                        "deliver.send_report_failed",
+                        level="ERROR",
+                        correlation_id=correlation,
+                        chat_id=chat_id,
+                        path=str(result.xlsx_path),
+                        size_bytes=send_result.size,
+                        error_type=type(send_result.error).__name__
+                        if send_result.error
+                        else None,
+                        error_message=send_result.error_message,
+                        diagnostics=diag_payload,
+                    )
                     failure_text = (
                         "Не получилось отправить файл. Я приложил диагностический ZIP и уведомил поддержку."
                     )
