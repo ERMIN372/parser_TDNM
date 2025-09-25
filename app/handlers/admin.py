@@ -14,6 +14,7 @@ from app.storage.models import User
 from app.services import referrals as referral_service
 from app.utils.backup import make_sqlite_backup
 from app.utils.admins import is_admin
+from app.services.diagnostics import get_last_bundle
 from app.utils.diag import get_last_diag_dir, zip_dir
 from app.utils.logging import log_event
 
@@ -413,27 +414,44 @@ async def cmd_diag_last(message: types.Message) -> None:
     else:
         target_id = message.chat.id
 
+    bundle = get_last_bundle(target_id)
+    if bundle and bundle.exists():
+        await message.reply_document(InputFile(bundle), caption=bundle.name)
+        log_event(
+            "diag.manual_dump",
+            ok=True,
+            chat_id=target_id,
+            path=str(bundle),
+        )
+        return
+
     try:
         diag_dir = get_last_diag_dir(target_id)
     except Exception as exc:
         await message.reply("Не удалось получить диагностику.")
-        log_event("INFO", "diag.send", ok=False, user_id=target_id, err=str(exc))
+        log_event("diag.manual_dump", ok=False, chat_id=target_id, err=str(exc))
         return
 
     if not diag_dir:
         await message.reply("Диагностики пока нет.")
-        log_event("INFO", "diag.send", ok=False, user_id=target_id)
+        log_event("diag.manual_dump", ok=False, chat_id=target_id)
         return
 
     try:
         zip_path = zip_dir(diag_dir)
     except Exception as exc:
         await message.reply("Не удалось упаковать диагностику.")
-        log_event("INFO", "diag.send", ok=False, user_id=target_id, err=str(exc), dir=str(diag_dir))
+        log_event(
+            "diag.manual_dump",
+            ok=False,
+            chat_id=target_id,
+            err=str(exc),
+            dir=str(diag_dir),
+        )
         return
 
     await message.reply_document(InputFile(zip_path), caption=diag_dir.name)
-    log_event("INFO", "diag.send", ok=True, user_id=target_id, file=str(zip_path))
+    log_event("diag.manual_dump", ok=True, chat_id=target_id, path=str(zip_path))
 
 
 # -------- регистрация --------

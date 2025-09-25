@@ -32,6 +32,7 @@ async def send_report(
     reply_markup=None,
     diagnostic_path: Path | None = None,
     diagnostic_caption: str | None = None,
+    file_name: str | None = None,
 ) -> SendReportResult:
     """Send a report file to Telegram with diagnostics and structured logging."""
 
@@ -62,7 +63,8 @@ async def send_report(
 
     try:
         with report_path.open("rb") as src:
-            input_file = InputFile(src, filename=report_path.name)
+            resolved_name = _resolve_file_name(report_path, file_name)
+            input_file = InputFile(src, filename=resolved_name)
             message = await bot.send_document(
                 chat_id,
                 input_file,
@@ -106,6 +108,21 @@ async def send_report(
         path=str(report_path),
     )
     return SendReportResult(True, message, None, None, size)
+
+
+def _resolve_file_name(report_path: Path, override: str | None) -> str:
+    candidate = (override or report_path.name or "").strip()
+    if not candidate or candidate in {".", ".."}:
+        return _fallback(report_path)
+    if any(sep in candidate for sep in ("/", "\\", "\n", "\r", "\t")):
+        return _fallback(report_path)
+    if len(candidate) > 120:
+        return _fallback(report_path)
+    return candidate
+
+
+def _fallback(path: Path) -> str:
+    return "report.csv" if path.suffix.lower() == ".csv" else "report.xlsx"
 
 
 async def _notify_file_too_big(

@@ -34,6 +34,11 @@ from ..services import report_share
 from ..services import paywall
 from ..services.quota import FREE_PER_MONTH, QuotaDecision, check_quota, commit_usage
 from ..services.diagnostics import get_bundle_by_correlation, remember_bundle
+from app.services.deliver_diagnostics import (
+    DeliverDiagContext,
+    build_diag_bundle,
+    build_stack,
+)
 from app import keyboards
 from app.utils.admins import admin_ids, is_admin
 from app.utils.diag import make_diag_dir, save_text, zip_dir
@@ -100,6 +105,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 SEND_DIAG_BUNDLES = _env_bool("SEND_DIAG_BUNDLES", True)
+_DIAG_ENABLED = _env_bool("DIAG", False)
 _ADMIN_FORWARD_IDS = tuple(admin_ids())
 
 
@@ -109,6 +115,35 @@ def _collect_diag_env() -> str:
         value = os.getenv(key)
         lines.append(f"{key}={value if value is not None else ''}")
     return "\n".join(lines)
+
+
+def _safe_document_name(path: Path) -> tuple[str, bool]:
+    original = path.name
+    cleaned = original.strip()
+    if not cleaned or cleaned in {".", ".."}:
+        return _fallback_name(path), False
+    if any(sep in cleaned for sep in ("/", "\\", "\n", "\r", "\t")):
+        return _fallback_name(path), False
+    if len(cleaned) > 120:
+        return _fallback_name(path), False
+    return cleaned, True
+
+
+def _fallback_name(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return "report.csv"
+    return "report.xlsx"
+
+
+def _extract_correlation_from_bundle(path: Path | None) -> str | None:
+    if not path:
+        return None
+    stem = path.stem
+    if stem.startswith("bundle_"):
+        remainder = stem[len("bundle_") :].strip()
+        return remainder or None
+    return None
 
 
 def _save_parser_diag(
@@ -216,6 +251,58 @@ async def _send_diagnostic_bundle_if_needed(
             )
 
 
+async def _dispatch_deliver_bundle(
+    bot: Bot,
+    *,
+    bundle_path: Path,
+    correlation_id: str | None,
+    user_chat_id: int | None,
+    user_id: int | None,
+) -> None:
+    if not bundle_path.exists():
+        return
+
+    caption = (
+        "⚠️ Ошибка доставки отчёта. Диагностика во вложении. Мы уже смотрим"
+    )
+    if correlation_id:
+        caption += f" (ID: {correlation_id})"
+    targets: list[tuple[int, str]] = []
+    delivered: set[int] = set()
+
+    if user_chat_id is not None:
+        targets.append((user_chat_id, "user"))
+        delivered.add(user_chat_id)
+
+    for admin_id in _ADMIN_FORWARD_IDS:
+        if admin_id == user_id or admin_id in delivered:
+            continue
+        targets.append((admin_id, "admin"))
+        delivered.add(admin_id)
+
+    for chat_id, target in targets:
+        try:
+            await bot.send_document(chat_id, InputFile(bundle_path), caption=caption)
+            event_name = (
+                "diagnostic_bundle_sent_user" if target == "user" else "diagnostic_bundle_sent_admin"
+            )
+            log_event(
+                event_name,
+                chat_id=chat_id,
+                correlation_id=correlation_id,
+                path=str(bundle_path),
+            )
+        except Exception as exc:
+            log_event(
+                "diagnostic_bundle_send_failed",
+                level="WARN",
+                target=target,
+                chat_id=chat_id,
+                correlation_id=correlation_id,
+                err=str(exc),
+            )
+
+
 def _update_ui_meta(
     result: parser_adapter.RunReportResult | None,
     *,
@@ -297,6 +384,10 @@ class ReportProgressTracker:
     @property
     def ui_strategy(self) -> str:
         return self._progress.ui_strategy
+
+    @property
+    def last_percent(self) -> int | None:
+        return getattr(self._progress, "last_percent", None)
 
     async def mark_command_ready(self) -> None:
         await self._progress.set("fetch", 10, force=True)
@@ -755,6 +846,7 @@ async def _send_report_with_analytics(
     reply_markup=None,
     diagnostic_path: Path | None = None,
     diagnostic_caption: str | None = None,
+    file_name_override: str | None = None,
 ) -> SendReportResult:
     register_context(path, title=title, city=city)
     share_kb = _report_actions_keyboard()
@@ -765,6 +857,7 @@ async def _send_report_with_analytics(
         reply_markup=share_kb,
         diagnostic_path=diagnostic_path,
         diagnostic_caption=diagnostic_caption,
+        file_name=file_name_override,
     )
     if not send_result.ok:
         return send_result
@@ -1077,47 +1170,183 @@ async def _run_parser_bypass_validation(
             correlation = None
             if result and result.meta:
                 correlation = str(result.meta.get("correlation_id") or "").strip() or None
-            diagnostic_path = result.bundle_path if SEND_DIAG_BUNDLES else None
-            diagnostic_caption = f"diag {correlation}" if correlation else "diagnostic bundle"
-            send_result = await _send_report_with_analytics(
-                message,
-                result.xlsx_path,
-                title=query,
-                city=city,
-                include=overrides.get("include"),
-                exclude=overrides.get("exclude"),
-                reply_markup=_main_menu_kb(message, user=user),
-                diagnostic_path=diagnostic_path,
-                diagnostic_caption=diagnostic_caption if diagnostic_path else None,
-            )
+            report_path = Path(result.xlsx_path)
+            chat_id = getattr(message.chat, "id", None)
+            user_id = getattr(user, "id", None)
+            report_size: int | None = None
+            send_error_message: str | None = None
+            ack_sent = False
+            deliver_status = "fail"
+            safe_name, name_ok = _safe_document_name(report_path)
             progress_strategy = tracker.ui_strategy if tracker else "edit"
-            _update_ui_meta(
-                result,
-                ack_sent=True,
-                progress_strategy=progress_strategy,
-                report_path=result.xlsx_path,
-                send_error=send_result.error_message,
-            )
-            if send_result.ok:
+
+            try:
+                if report_path.exists():
+                    try:
+                        report_size = report_path.stat().st_size
+                    except OSError:
+                        report_size = None
+
+                started_payload = {
+                    "correlation_id": correlation,
+                    "chat_id": chat_id,
+                    "path": str(report_path),
+                    "file_name": safe_name if safe_name else report_path.name,
+                }
+                if report_size is not None:
+                    started_payload["size_bytes"] = report_size
+                if _DIAG_ENABLED:
+                    started_payload["cmd_line"] = (result.meta or {}).get("command_line") if result else None
+                    started_payload["progress_last_percent"] = (
+                        tracker.last_percent if tracker else None
+                    )
+                log_event(
+                    "deliver.started",
+                    **{k: v for k, v in started_payload.items() if v is not None},
+                )
+
+                if not report_path.exists():
+                    raise FileNotFoundError("report_file_missing")
+
+                if report_size is None:
+                    report_size = report_path.stat().st_size
+
+                if report_size <= 0:
+                    raise ValueError("report_file_empty")
+
+                if not name_ok:
+                    log_event(
+                        "deliver.file_name_adjusted",
+                        correlation_id=correlation,
+                        chat_id=chat_id,
+                        original=report_path.name,
+                        new=safe_name,
+                    )
+
+                diagnostic_path = result.bundle_path if SEND_DIAG_BUNDLES else None
+                diagnostic_caption = f"diag {correlation}" if correlation else "diagnostic bundle"
+
+                send_result = await _send_report_with_analytics(
+                    message,
+                    result.xlsx_path,
+                    title=query,
+                    city=city,
+                    include=overrides.get("include"),
+                    exclude=overrides.get("exclude"),
+                    reply_markup=_main_menu_kb(message, user=user),
+                    diagnostic_path=diagnostic_path,
+                    diagnostic_caption=diagnostic_caption if diagnostic_path else None,
+                    file_name_override=safe_name,
+                )
+                ack_sent = True
+                send_error_message = send_result.error_message
+
+                if not send_result.ok:
+                    raise RuntimeError(send_result.error_message or "send_report_failed")
+
                 await _cleanup_inline_message(message)
                 if tracker:
                     await tracker.finish_success()
                 complete_operation(ok=True)
-            else:
-                failure_text = (
-                    "Не получилось отправить файл. Я приложил диагностический ZIP и уведомил поддержку."
+                deliver_status = "ok"
+            except Exception as exc:
+                deliver_status = "fail"
+                stack_full = build_stack(exc)
+                stack_lines = [line for line in stack_full.strip().splitlines() if line.strip()]
+                stack_short = stack_lines[-1] if stack_lines else type(exc).__name__
+                fail_payload = {
+                    "correlation_id": correlation,
+                    "chat_id": chat_id,
+                    "path": str(report_path),
+                    "size_bytes": report_size,
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc),
+                    "stack_short": stack_short,
+                }
+                if _DIAG_ENABLED:
+                    fail_payload["cmd_line"] = (result.meta or {}).get("command_line") if result else None
+                    fail_payload["progress_last_percent"] = (
+                        tracker.last_percent if tracker else None
+                    )
+                log_event(
+                    "deliver.fail",
+                    level="ERROR",
+                    **{k: v for k, v in fail_payload.items() if v is not None},
                 )
+
+                if send_error_message is None:
+                    send_error_message = str(exc)
+
                 if tracker:
-                    await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Не удалось отправить файл")
-                await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
-                await _send_diagnostic_bundle_if_needed(
-                    message.bot,
-                    bundle_path=result.bundle_path,
-                    correlation=correlation,
-                    user_chat_id=getattr(message.chat, "id", None),
-                    user_id=getattr(user, "id", None),
+                    await tracker.fail(
+                        f"{PROGRESS_FAILURE_PREFIX} Ошибка доставки файла"
+                    )
+
+                failure_text = "Не получилось… прикладываю диагностику, команда уже уведомлена"
+                await message.answer(
+                    failure_text,
+                    reply_markup=_main_menu_kb(message, user=user),
                 )
+
+                bundle_path: Path | None = None
+                bundle_correlation: str | None = None
+                try:
+                    context = DeliverDiagContext(
+                        user_id=user_id,
+                        username=getattr(user, "username", None),
+                        chat_id=chat_id,
+                        exception_type=type(exc).__name__,
+                        exception_message=str(exc),
+                        stack=stack_full,
+                        xlsx_path=report_path,
+                        xlsx_size=report_size,
+                        csv_path=result.csv_path if result else None,
+                        stdout_path=result.stdout_path if result else None,
+                        stderr_path=result.stderr_path if result else None,
+                        cmd_line=(result.meta or {}).get("command_line") if result else None,
+                        progress_last_percent=tracker.last_percent if tracker else None,
+                    )
+                    bundle_path = build_diag_bundle(correlation, context)
+                    bundle_correlation = _extract_correlation_from_bundle(bundle_path) or correlation
+                    remember_bundle(
+                        chat_id=chat_id,
+                        correlation_id=bundle_correlation,
+                        bundle_path=bundle_path,
+                    )
+                    if bundle_correlation:
+                        correlation = bundle_correlation
+                except Exception as bundle_exc:
+                    log_event(
+                        "diagnostic_bundle_failed",
+                        level="ERROR",
+                        correlation_id=correlation,
+                        path=str(report_path),
+                        err=str(bundle_exc),
+                    )
+                else:
+                    await _dispatch_deliver_bundle(
+                        message.bot,
+                        bundle_path=bundle_path,
+                        correlation_id=bundle_correlation or correlation,
+                        user_chat_id=chat_id,
+                        user_id=user_id,
+                    )
+
                 complete_operation(ok=False, err="send_report_failed")
+            finally:
+                _update_ui_meta(
+                    result,
+                    ack_sent=ack_sent,
+                    progress_strategy=progress_strategy,
+                    report_path=result.xlsx_path,
+                    send_error=send_error_message,
+                )
+                log_event(
+                    "deliver.done",
+                    correlation_id=correlation,
+                    status="ok" if deliver_status == "ok" else "fail",
+                    chat_id=chat_id,
+                )
     finally:
         clear_busy(uid)
 
