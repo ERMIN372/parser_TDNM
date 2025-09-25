@@ -9,7 +9,7 @@ import shutil
 import time
 import traceback
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.dispatcher import FSMContext
@@ -116,6 +116,122 @@ def _collect_diag_env() -> str:
         value = os.getenv(key)
         lines.append(f"{key}={value if value is not None else ''}")
     return "\n".join(lines)
+
+
+def _extract_csv_path(stdout: str | None) -> Path | None:
+    if not stdout:
+        return None
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if payload.get("status") != "report" or payload.get("format") != "csv":
+            continue
+        csv_path = payload.get("path")
+        if not csv_path:
+            continue
+        try:
+            path = Path(csv_path)
+        except (TypeError, ValueError):
+            continue
+        if path.exists():
+            return path
+    return None
+
+
+def _extract_output_path_from_cmd(command: Sequence[str] | None) -> Path | None:
+    if not command:
+        return None
+    for idx, token in enumerate(command):
+        if token == "--output" and idx + 1 < len(command):
+            try:
+                return Path(command[idx + 1])
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                return None
+    return None
+
+
+def _make_unique_xlsx_path(path: Path) -> Path:
+    target = path
+    if not target.suffix:
+        target = target.with_suffix(".xlsx")
+    if not target.exists():
+        return target
+    stem = target.stem
+    suffix = target.suffix or ".xlsx"
+    parent = target.parent
+    for idx in range(1, 1000):  # pragma: no cover - deterministic upper bound
+        candidate = parent / f"{stem}_fallback{idx}{suffix}"
+        if not candidate.exists():
+            return candidate
+    return parent / f"{stem}_fallback{int(time.time())}{suffix}"
+
+
+def _convert_csv_to_xlsx(csv_path: Path, xlsx_path: Path) -> None:
+    import pandas as pd
+
+    df = pd.read_csv(csv_path)
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False)
+
+
+async def _recover_report_from_error(
+    error: parser_adapter.ParserRunError,
+    *,
+    query: str,
+    city: str,
+    user_id: int,
+) -> parser_adapter.RunReportResult | None:
+    csv_path = _extract_csv_path(getattr(error, "stdout", ""))
+    if not csv_path:
+        return None
+
+    expected_out = _extract_output_path_from_cmd(getattr(error, "cmd", None))
+    target_path = _make_unique_xlsx_path(expected_out or csv_path.with_suffix(".xlsx"))
+
+    try:
+        await asyncio.to_thread(_convert_csv_to_xlsx, csv_path, target_path)
+    except Exception as exc:  # pragma: no cover - recovery best effort
+        log_event(
+            "parse.fallback_failed",
+            level="ERROR",
+            err=str(exc),
+            stack=traceback.format_exc(),
+            user_id=user_id,
+            query=query,
+            city=city,
+            csv_path=str(csv_path),
+            target_path=str(target_path),
+        )
+        return None
+
+    log_event(
+        "parse.fallback_recovered",
+        level="WARN",
+        user_id=user_id,
+        query=query,
+        city=city,
+        csv_path=str(csv_path),
+        xlsx_path=str(target_path),
+    )
+
+    return parser_adapter.RunReportResult(
+        ok=True,
+        xlsx_path=target_path,
+        csv_path=csv_path,
+        duration_ms=0,
+        meta={
+            "fallback_recovery": True,
+            "command_line": " ".join(
+                str(part) for part in (getattr(error, "cmd", []) or [])
+            ),
+        },
+    )
 
 
 def _safe_document_name(path: Path) -> tuple[str, bool]:
@@ -1081,6 +1197,29 @@ async def _run_parser_bypass_validation(
                 )
                 break
             except parser_adapter.ParserRunError as exc:
+                fallback_result = await _recover_report_from_error(
+                    exc,
+                    query=title,
+                    city=city,
+                    user_id=uid,
+                )
+                if fallback_result:
+                    result = fallback_result
+                    if tracker_obj:
+                        await tracker_obj.clear_retry()
+                        await tracker_obj.mark_command_ready()
+                    log_event(
+                        "parse.fallback_used",
+                        level="WARN",
+                        user_id=uid,
+                        query=title,
+                        city=city,
+                        amount=total,
+                        xlsx_path=str(fallback_result.xlsx_path)
+                        if fallback_result.xlsx_path
+                        else None,
+                    )
+                    break
                 error_info = classify_error(exc, exc.stdout, exc.stderr)
                 log_event(
                     "ERROR",
@@ -1519,6 +1658,29 @@ async def _run_with_amount(
                 )
                 break
             except parser_adapter.ParserRunError as exc:
+                fallback_result = await _recover_report_from_error(
+                    exc,
+                    query=title,
+                    city=city,
+                    user_id=uid,
+                )
+                if fallback_result:
+                    result = fallback_result
+                    if tracker_obj:
+                        await tracker_obj.clear_retry()
+                        await tracker_obj.mark_command_ready()
+                    log_event(
+                        "parse.fallback_used",
+                        level="WARN",
+                        user_id=uid,
+                        query=title,
+                        city=city,
+                        amount=total,
+                        xlsx_path=str(fallback_result.xlsx_path)
+                        if fallback_result.xlsx_path
+                        else None,
+                    )
+                    break
                 error_info = classify_error(exc, exc.stdout, exc.stderr)
                 log_event(
                     "ERROR",
