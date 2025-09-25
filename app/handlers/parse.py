@@ -32,7 +32,7 @@ from ..services import paywall
 from ..services.quota import FREE_PER_MONTH, QuotaDecision, check_quota, commit_usage
 from ..services.diagnostics import get_bundle_by_correlation, remember_bundle
 from app import keyboards
-from app.utils.admins import is_admin
+from app.utils.admins import admin_ids, is_admin
 from app.utils.diag import make_diag_dir, save_text, zip_dir
 from app.utils.logging import complete_operation, log_event, update_context
 from app.utils.errors import (
@@ -68,6 +68,17 @@ _DIAG_ENV_KEYS = [
     "SITE",
     "PAUSE",
 ]
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+SEND_DIAG_BUNDLES = _env_bool("SEND_DIAG_BUNDLES", True)
+_ADMIN_FORWARD_IDS = tuple(admin_ids())
 
 
 def _collect_diag_env() -> str:
@@ -135,6 +146,52 @@ def _format_failure_message(
     if diag_dir and user and is_admin(user.id):
         text += f"\nДиагностика сохранена: {diag_dir.name}"
     return text
+
+
+async def _send_diagnostic_bundle_if_needed(
+    bot: Bot,
+    *,
+    bundle_path: Path | None,
+    correlation: str | None,
+    user_chat_id: int | None,
+    user_id: int | None,
+) -> None:
+    if not SEND_DIAG_BUNDLES or not bundle_path or not bundle_path.exists():
+        return
+
+    caption = f"diag {correlation}" if correlation else "diagnostic bundle"
+    targets: list[tuple[int, str, str]] = []
+    seen: set[int] = set()
+
+    if user_chat_id is not None and user_chat_id not in seen:
+        targets.append((user_chat_id, caption, "user"))
+        seen.add(user_chat_id)
+
+    for admin_id in _ADMIN_FORWARD_IDS:
+        if admin_id in seen or admin_id == user_id:
+            continue
+        targets.append((admin_id, caption, "admin"))
+        seen.add(admin_id)
+
+    for chat_id, doc_caption, target in targets:
+        try:
+            await bot.send_document(chat_id, InputFile(bundle_path), caption=doc_caption)
+            log_event(
+                "diagnostic_bundle_sent",
+                action="auto_send",
+                target=target,
+                chat_id=chat_id,
+                correlation_id=correlation,
+            )
+        except Exception as exc:
+            log_event(
+                "diagnostic_bundle_send_failed",
+                level="WARN",
+                target=target,
+                chat_id=chat_id,
+                correlation_id=correlation,
+                err=str(exc),
+            )
 
 
 class ReportProgressTracker:
@@ -366,7 +423,7 @@ def _ensure_str_list(values) -> list[str]:
     return result
 
 
-_REPORT_OVERRIDE_KEYS = {"pages", "per_page", "pause", "site", "area", "timeout"}
+_REPORT_OVERRIDE_KEYS = {"pages", "per_page", "pause", "site", "area"}
 
 
 def _build_args(
@@ -578,6 +635,15 @@ async def _send_failure_response(
         await message.answer("Главное меню:", reply_markup=menu_markup)
     else:
         await message.answer(text, reply_markup=menu_markup)
+
+    chat_id = getattr(message.chat, "id", None)
+    await _send_diagnostic_bundle_if_needed(
+        message.bot,
+        bundle_path=result.bundle_path if result else None,
+        correlation=correlation,
+        user_chat_id=chat_id,
+        user_id=user_id,
+    )
 
     complete_operation(ok=False, err=result.err_code or result.err_message)
 
@@ -843,6 +909,13 @@ async def _run_parser_bypass_validation(
                     default_message=error_info.message_for_user,
                 )
                 await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
+                await _send_diagnostic_bundle_if_needed(
+                    message.bot,
+                    bundle_path=diag_dir.with_suffix(".zip") if diag_dir else None,
+                    correlation=None,
+                    user_chat_id=getattr(message.chat, "id", None),
+                    user_id=getattr(user, "id", None),
+                )
                 complete_operation(ok=False, err=error_info.code.lower())
                 return
     except Exception as e:  # pragma: no cover
@@ -1044,6 +1117,13 @@ async def _run_with_amount(
                     default_message=error_info.message_for_user,
                 )
                 await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
+                await _send_diagnostic_bundle_if_needed(
+                    message.bot,
+                    bundle_path=diag_dir.with_suffix(".zip") if diag_dir else None,
+                    correlation=None,
+                    user_chat_id=getattr(message.chat, "id", None),
+                    user_id=getattr(user, "id", None),
+                )
                 complete_operation(ok=False, err=error_info.code.lower())
                 return
     except Exception as e:
@@ -1130,22 +1210,12 @@ async def _run_parser(
         return
 
     overrides = overrides or {}
-    ok_overrides, normalized_overrides, invalid_override_keys, _ = (
+    _, normalized_overrides, _, _ = (
         parser_adapter.normalize_and_validate_overrides(overrides)
     )
-    if invalid_override_keys:
-        log_event(
-            "overrides_validation_failed",
-            level="WARN",
-            invalid_arguments=invalid_override_keys,
-            args=_build_args(query, city, overrides),
-        )
-        await message.answer(parser_adapter.format_invalid_arguments(invalid_override_keys))
-        complete_operation(ok=False, err="invalid_arguments")
-        return
 
     clean_overrides: dict[str, object] = {}
-    for key in ("include", "exclude", "pages", "per_page", "pause", "site", "area", "timeout"):
+    for key in ("include", "exclude", "pages", "per_page", "pause", "site", "area"):
         if key in normalized_overrides:
             value = normalized_overrides[key]
             if value is not None or key in {"include", "exclude"}:
@@ -1278,6 +1348,13 @@ async def _run_parser(
                         default_message=error_info.message_for_user,
                     )
                     await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
+                    await _send_diagnostic_bundle_if_needed(
+                        message.bot,
+                        bundle_path=diag_dir.with_suffix(".zip") if diag_dir else None,
+                        correlation=None,
+                        user_chat_id=getattr(message.chat, "id", None),
+                        user_id=getattr(user, "id", None),
+                    )
                     complete_operation(ok=False, err=error_info.code.lower())
                     return
         except Exception as e:
@@ -1838,6 +1915,13 @@ async def cb_preview(call: types.CallbackQuery):
                     default_message=error_info.message_for_user,
                 )
                 await call.message.answer(failure_text)
+                await _send_diagnostic_bundle_if_needed(
+                    call.message.bot,
+                    bundle_path=diag_dir.with_suffix(".zip") if diag_dir else None,
+                    correlation=None,
+                    user_chat_id=getattr(call.message.chat, "id", None),
+                    user_id=getattr(call.from_user, "id", None),
+                )
                 return
             except validator.ValidationError as exc:
                 await progress.close(
@@ -1869,6 +1953,13 @@ async def cb_preview(call: types.CallbackQuery):
                     default_message=error_info.message_for_user,
                 )
                 await call.message.answer(failure_text)
+                await _send_diagnostic_bundle_if_needed(
+                    call.message.bot,
+                    bundle_path=diag_dir.with_suffix(".zip") if diag_dir else None,
+                    correlation=None,
+                    user_chat_id=getattr(call.message.chat, "id", None),
+                    user_id=getattr(call.from_user, "id", None),
+                )
                 return
 
         if not rows:
