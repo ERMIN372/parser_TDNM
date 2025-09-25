@@ -27,6 +27,7 @@ from ..services.mini_analytics import register_context, render_mini_analytics
 from ..services import report_share
 from ..services import paywall
 from ..services.quota import FREE_PER_MONTH, QuotaDecision, check_quota, commit_usage
+from ..services.diagnostics import get_bundle_by_correlation, remember_bundle
 from app import keyboards
 from app.utils.admins import is_admin
 from app.utils.logging import complete_operation, log_event, update_context
@@ -383,12 +384,20 @@ def _log_parse_start(title: str, city: str, overrides: dict | None = None, *, ap
 def _log_parse_ready(title: str, city: str, overrides: dict | None = None, *, approx_total: int | None = None) -> None:
     args = _build_args(title, city, overrides, qty=approx_total)
     update_context(args=args)
-    log_event("parse_ready", message=f"parse_ready title='{title}' city='{city}'", args=args)
+    log_event(
+        "report_ready",
+        message=f"report_ready title='{title}' city='{city}'",
+        args=args,
+    )
 
 
 def _log_preview_start(title: str, city: str, overrides: dict | None = None) -> None:
     args = _build_args(title, city, overrides)
-    log_event("preview_start", message=f"preview_start title='{title}' city='{city}'", args=args)
+    log_event(
+        "preview_requested",
+        message=f"preview_requested title='{title}' city='{city}'",
+        args=args,
+    )
 
 
 def _log_preview_ready(title: str, city: str, rows: int, overrides: dict | None = None) -> None:
@@ -409,6 +418,60 @@ def _log_preview_timeout(title: str, city: str, overrides: dict | None = None, e
         args=args,
         err=err,
     )
+
+
+def _error_message_for_result(result: parser_adapter.RunReportResult) -> str:
+    if not result:
+        return FAIL_TEXT
+    code = result.err_code or ""
+    if code == "E_TIMEOUT":
+        return "Сайт долго отвечает, попробуй ещё раз позже."
+    if code == "E_NONZERO_RC":
+        return "Парсер завершился с ошибкой."
+    if code == "E_NO_FILE":
+        return "Файл отчёта не сформировался. Попробуй ещё раз."
+    if code == "E_BAD_ARGS":
+        return result.user_message or "Некорректные параметры запуска парсера."
+    return result.user_message or FAIL_TEXT
+
+
+def _remember_bundle_for_chat(
+    message: types.Message,
+    result: parser_adapter.RunReportResult,
+) -> str | None:
+    if not result.bundle_path or not result.meta:
+        return None
+    correlation = str(result.meta.get("correlation_id") or "").strip()
+    chat_id = getattr(message.chat, "id", None)
+    if not correlation or chat_id is None:
+        return None
+    remember_bundle(chat_id=chat_id, correlation_id=correlation, bundle_path=result.bundle_path)
+    return correlation
+
+
+async def _send_failure_response(
+    message: types.Message,
+    result: parser_adapter.RunReportResult,
+    *,
+    user: types.User | None = None,
+    tracker: ReportProgressTracker | None = None,
+) -> None:
+    if tracker:
+        await tracker.fail()
+
+    correlation = _remember_bundle_for_chat(message, result)
+    text = _error_message_for_result(result)
+    menu_markup = _main_menu_kb(message, user=user)
+    user_id = getattr(user, "id", None)
+    if is_admin(user_id) and result.bundle_path and correlation:
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("📎 Логи (zip)", callback_data=f"diag_bundle:{correlation}"))
+        await message.answer(text, reply_markup=kb)
+        await message.answer("Главное меню:", reply_markup=menu_markup)
+    else:
+        await message.answer(text, reply_markup=menu_markup)
+
+    complete_operation(ok=False, err=result.err_code or result.err_message)
 
 
 async def _send_report_with_analytics(
@@ -516,6 +579,28 @@ async def cb_report_menu(call: types.CallbackQuery):
     await call.message.answer("Главное меню:", reply_markup=kb)
 
 
+async def cb_diag_bundle(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    if not call.data:
+        await call.answer("Некорректный запрос", show_alert=True)
+        return
+    try:
+        _, correlation = call.data.split(":", 1)
+    except ValueError:
+        await call.answer("Некорректный запрос", show_alert=True)
+        return
+    bundle = get_bundle_by_correlation(correlation)
+    if not bundle or not bundle.exists():
+        await call.answer("Бандл не найден", show_alert=True)
+        return
+
+    await call.answer()
+    log_event("diagnostic_bundle_sent", action="send_bundle", correlation_id=correlation)
+    await call.message.answer_document(InputFile(bundle), caption=f"diag {correlation}")
+
+
 async def _run_parser_bypass_validation(
     message: types.Message,
     query: str,
@@ -538,7 +623,7 @@ async def _run_parser_bypass_validation(
     )
     tracker: ReportProgressTracker | None = None
     decision: QuotaDecision | None = None
-    result: parser_adapter.ReportResult | None = None
+    result: parser_adapter.RunReportResult | None = None
     try:
         decision = await _ensure_quota(
             message,
@@ -578,13 +663,14 @@ async def _run_parser_bypass_validation(
         complete_operation(ok=False, err=err_text)
         return
     else:
-        path = result.xlsx_path if result else None
-        if path and path.exists():
+        if not result or not result.ok or not (result.xlsx_path and result.xlsx_path.exists()):
+            await _send_failure_response(message, result, user=user, tracker=tracker)
+        else:
             await _finalize_quota_usage(message, uid, decision)
             _log_parse_ready(query, city, overrides)
             await _send_report_with_analytics(
                 message,
-                path,
+                result.xlsx_path,
                 title=query,
                 city=city,
                 include=overrides.get("include"),
@@ -593,12 +679,6 @@ async def _run_parser_bypass_validation(
             )
             if tracker:
                 await tracker.finish_success()
-        else:
-            if tracker:
-                await tracker.fail()
-            await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
-            log_event("parse_error", level="ERROR", err="report_missing")
-            complete_operation(ok=False, err="report_missing")
     finally:
         clear_busy(uid)
 
@@ -647,7 +727,7 @@ async def _run_with_amount(
     )
     decision: QuotaDecision | None = None
     tracker: ReportProgressTracker | None = None
-    result: parser_adapter.ReportResult | None = None
+    result: parser_adapter.RunReportResult | None = None
 
     try:
         decision = await _ensure_quota(
@@ -691,14 +771,15 @@ async def _run_with_amount(
         complete_operation(ok=False, err=err_text)
         return
     else:
-        path = result.xlsx_path if result else None
-        if path and path.exists():
+        if not result or not result.ok or not (result.xlsx_path and result.xlsx_path.exists()):
+            await _send_failure_response(message, result, user=user, tracker=tracker)
+        else:
             if decision:
                 await _finalize_quota_usage(message, uid, decision)
             _log_parse_ready(title, city, ov, approx_total=total)
             await _send_report_with_analytics(
                 message,
-                path,
+                result.xlsx_path,
                 title=title,
                 city=city,
                 approx_total=total,
@@ -708,12 +789,6 @@ async def _run_with_amount(
             )
             if tracker:
                 await tracker.finish_success()
-        else:
-            if tracker:
-                await tracker.fail()
-            await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
-            log_event("parse_error", level="ERROR", err="report_missing")
-            complete_operation(ok=False, err="report_missing")
     finally:
         clear_busy(uid)
 
@@ -782,7 +857,7 @@ async def _run_parser(
         )
         decision: QuotaDecision | None = None
         tracker: ReportProgressTracker | None = None
-        result: parser_adapter.ReportResult | None = None
+        result: parser_adapter.RunReportResult | None = None
         try:
             decision = await _ensure_quota(
                 message,
@@ -823,14 +898,15 @@ async def _run_parser(
             complete_operation(ok=False, err=err_text)
             return
         else:
-            path = result.xlsx_path if result else None
-            if path and path.exists():
+            if not result or not result.ok or not (result.xlsx_path and result.xlsx_path.exists()):
+                await _send_failure_response(message, result, user=user, tracker=tracker)
+            else:
                 if decision:
                     await _finalize_quota_usage(message, requester_id, decision)
                 _log_parse_ready(norm_title, city_to_use, ov)
                 await _send_report_with_analytics(
                     message,
-                    path,
+                    result.xlsx_path,
                     title=norm_title,
                     city=city_to_use,
                     include=ov.get("include"),
@@ -839,12 +915,6 @@ async def _run_parser(
                 )
                 if tracker:
                     await tracker.finish_success()
-            else:
-                if tracker:
-                    await tracker.fail()
-                await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
-                log_event("parse_error", level="ERROR", err="report_missing")
-                complete_operation(ok=False, err="report_missing")
         finally:
             clear_busy(requester_id)
         return
@@ -901,11 +971,16 @@ async def cmd_parse(message: types.Message, state: FSMContext):
                 )
                 complete_operation(ok=False, err=str(exc))
                 return
+        log_event(
+            "parse_dialog_start",
+            command="/parse",
+            args=_build_args(query, city, overrides),
+        )
         await _run_parser(message, query, city, overrides)
         return
 
     update_context(command="parse_dialog")
-    log_event("request_parsed", message="parse dialog start", command="parse_dialog")
+    log_event("parse_dialog_start", command="parse_dialog")
     prompt = await message.answer("Введите должность:", reply_markup=ReplyKeyboardRemove())
     await ParseForm.waiting_query.set()
     await chips.render_role_chips(prompt, message.from_user.id)
@@ -1179,6 +1254,12 @@ async def cb_qty(call: types.CallbackQuery):
     # фикс: после старта выгрузки «забываем» pending, чтобы старые кнопки не плодили ошибки
     _PENDING_QTY.pop(call.from_user.id, None)
     update_context(dialog_step=_dialog_step("qty", str(total)))
+    log_event(
+        "qty_chosen",
+        action=f"qty_{total}",
+        quantity=total,
+        args=_build_args(title, city, overrides, qty=total),
+    )
     await _run_with_amount(
         call.message,
         title,
@@ -1252,6 +1333,12 @@ async def cb_preview(call: types.CallbackQuery):
             if progress:
                 await progress.fail()
             await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
+            return
+
+        if rows is None:
+            if progress:
+                await progress.fail()
+            await call.message.answer("Не удалось получить превью. Попробуй ещё раз позже.")
             return
 
         if not rows:
@@ -1405,5 +1492,6 @@ def register(dp: Dispatcher):
     dp.register_callback_query_handler(cb_report_share_copy, lambda c: c.data == "report_share_copy", state="*")
     dp.register_callback_query_handler(cb_report_again, lambda c: c.data == "report_again", state="*")
     dp.register_callback_query_handler(cb_report_menu, lambda c: c.data == "report_menu", state="*")
+    dp.register_callback_query_handler(cb_diag_bundle, lambda c: c.data and c.data.startswith("diag_bundle:"), state="*")
     dp.register_callback_query_handler(cb_resume_yes,  lambda c: c.data == "resume:last", state="*")
     dp.register_callback_query_handler(cb_resume_skip, lambda c: c.data == "resume:skip", state="*")

@@ -56,6 +56,7 @@ class OperationContext:
     update_type: str | None = None
     user_message_raw: str | None = None
     command: str | None = None
+    action: str | None = None
     args: Dict[str, Any] | None = None
     dialog_step: str | None = None
     bot_reply_type: str | None = None
@@ -79,6 +80,7 @@ class OperationContext:
             "update_type",
             "user_message_raw",
             "command",
+            "action",
             "args",
             "dialog_step",
             "bot_reply_type",
@@ -145,22 +147,6 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(event, ensure_ascii=False, separators=(",", ":"))
 
 
-class ConsoleFormatter(logging.Formatter):
-    def __init__(self) -> None:
-        super().__init__("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-
-    def format(self, record: logging.LogRecord) -> str:
-        message = super().format(record)
-        event: Dict[str, Any] | None = getattr(record, "event_data", None)
-        if event:
-            try:
-                extra = json.dumps(event, ensure_ascii=False, sort_keys=True)
-            except Exception:
-                extra = str(event)
-            return f"{message} | data={extra}"
-        return message
-
-
 def _ensure_logger() -> Logger:
     global _logger
     if _logger is None:
@@ -187,7 +173,7 @@ def setup_logging() -> None:
     handlers: list[logging.Handler] = []
 
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(ConsoleFormatter())
+    console_handler.setFormatter(JsonFormatter())
     handlers.append(console_handler)
 
     if os.getenv("LOG_JSON", "true").lower() in {"1", "true", "yes"}:
@@ -238,19 +224,45 @@ def update_context(**fields: Any) -> None:
             setattr(ctx, key, value)
 
 
+def current_correlation_id() -> str | None:
+    ctx = get_operation_context()
+    return ctx.correlation_id if ctx else None
+
+
 def _prepare_payload(event: str, level: str, extra: Dict[str, Any]) -> Dict[str, Any]:
     ctx = get_operation_context()
+    correlation = extra.get("correlation_id")
+    if ctx and not correlation:
+        correlation = ctx.correlation_id
     payload: Dict[str, Any] = {
         "ts": _iso_ts(),
         "level": level,
         "event": event,
-        "correlation_id": ctx.correlation_id if ctx else extra.get("correlation_id", str(uuid.uuid4())),
+        "correlation_id": correlation or str(uuid.uuid4()),
     }
 
     if ctx:
-        payload.update(ctx.to_payload())
+        ctx_payload = ctx.to_payload()
+        if ctx_payload:
+            payload.update(ctx_payload)
 
     payload.update(extra)
+
+    if "command" in payload and isinstance(payload["command"], str):
+        payload["command"] = _truncate(payload["command"], limit=64)
+    if "action" in payload and isinstance(payload["action"], str):
+        payload["action"] = _truncate(payload["action"], limit=64)
+
+    for key in ("query", "city", "site"):
+        if key in payload and isinstance(payload[key], str):
+            payload[key] = _truncate(_mask_text(payload[key]), limit=256)
+
+    for key in ("include", "exclude"):
+        if key in payload and isinstance(payload[key], list):
+            payload[key] = [
+                _truncate(_mask_text(str(item)), limit=128)
+                for item in payload[key][:50]
+            ]
 
     for field in ("user_message_raw", "bot_reply_preview"):
         if field in payload and isinstance(payload[field], str):
