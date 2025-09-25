@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 from aiogram import Bot
-from aiogram.utils.exceptions import MessageCantBeEdited, MessageNotModified
+from aiogram.utils.exceptions import (
+    BadRequest,
+    MessageCantBeEdited,
+    MessageNotModified,
+    RetryAfter,
+)
 
 from app.utils.logging import log_event
 
@@ -43,10 +48,15 @@ class Progress:
         self._last_percent: int = 0
         self._last_update_ts: float = 0.0
         self._closed = False
+        self._ui_strategy: str = "edit"
 
     @property
     def last_step(self) -> str | None:
         return self._last_step
+
+    @property
+    def ui_strategy(self) -> str:
+        return self._ui_strategy
 
     @classmethod
     async def create(
@@ -83,10 +93,11 @@ class Progress:
         inst._last_percent = initial_percent
         inst._last_update_ts = time.monotonic()
         log_event(
-            "progress.create",
+            "progress.start",
             mode=mode,
             progress_step=initial_step,
             percent=initial_percent,
+            ui_action="send",
         )
         return inst
 
@@ -111,19 +122,7 @@ class Progress:
             return
         self._last_update_ts = now
         text = self._compose_current()
-        try:
-            await self._bot.edit_message_text(text, self._chat_id, self._message_id)
-        except (MessageNotModified, MessageCantBeEdited):
-            return
-        except Exception:  # pragma: no cover - best effort
-            return
-        log_event(
-            "progress.update",
-            mode=self._mode,
-            progress_step=step_name,
-            percent=percent,
-            extra=extra_text,
-        )
+        await self._deliver(text, step_name, percent, extra_text=extra_text)
 
     async def show_retry(self, attempt: int, total: int) -> None:
         if self._closed:
@@ -154,20 +153,20 @@ class Progress:
             self._last_step = self._last_step or "complete"
             self._last_percent = 100
         final_text = text
-        try:
-            await self._bot.edit_message_text(final_text, self._chat_id, self._message_id)
-        except (MessageNotModified, MessageCantBeEdited):
-            pass
-        except Exception:  # pragma: no cover - best effort
-            pass
-        else:
-            log_event(
-                "progress.close",
-                mode=self._mode,
-                progress_step=self._last_step,
-                percent=self._last_percent,
-                ok=ok,
-            )
+        action = await self._deliver(
+            final_text,
+            self._last_step or "complete",
+            self._last_percent,
+            allow_skip_logging=False,
+        )
+        log_event(
+            "progress.close",
+            mode=self._mode,
+            progress_step=self._last_step,
+            percent=self._last_percent,
+            ok=ok,
+            ui_action=action,
+        )
         if ok and delete_after:
             asyncio.create_task(self._delete_later(delete_after))
 
@@ -179,12 +178,7 @@ class Progress:
             return
         self._last_update_ts = now
         text = self._compose_current()
-        try:
-            await self._bot.edit_message_text(text, self._chat_id, self._message_id)
-        except (MessageNotModified, MessageCantBeEdited):
-            return
-        except Exception:  # pragma: no cover - best effort
-            return
+        await self._deliver(text, self._last_step or "unknown", self._last_percent)
 
     def _compose_current(self) -> str:
         return self._compose_text(
@@ -195,6 +189,80 @@ class Progress:
             extra=self._extra_text,
             retry_text=self._retry_text,
         )
+
+    async def _deliver(
+        self,
+        text: str,
+        step_name: str,
+        percent: int,
+        *,
+        extra_text: str | None = None,
+        allow_skip_logging: bool = True,
+    ) -> str:
+        """Try to update progress message, falling back to sending a new one."""
+
+        payload = {
+            "mode": self._mode,
+            "progress_step": step_name,
+            "percent": percent,
+            "extra": extra_text,
+        }
+
+        try:
+            await self._bot.edit_message_text(text, self._chat_id, self._message_id)
+        except MessageNotModified:
+            if allow_skip_logging:
+                log_event("progress.update", ui_action="skip", **payload)
+            return "skip"
+        except RetryAfter as exc:  # pragma: no cover - network timing dependant
+            await asyncio.sleep(getattr(exc, "timeout", 1))
+            return await self._deliver(
+                text,
+                step_name,
+                percent,
+                extra_text=extra_text,
+                allow_skip_logging=allow_skip_logging,
+            )
+        except (MessageCantBeEdited, BadRequest) as exc:
+            if isinstance(exc, BadRequest) and _is_message_not_modified_error(exc):
+                if allow_skip_logging:
+                    log_event("progress.update", ui_action="skip", **payload)
+                return "skip"
+            if isinstance(exc, BadRequest) and not _should_fallback_on_bad_request(exc):
+                if allow_skip_logging:
+                    log_event(
+                        "progress.update",
+                        ui_action="skip",
+                        err=str(exc),
+                        **payload,
+                    )
+                return "skip"
+            message = await self._bot.send_message(self._chat_id, text)
+            self._message_id = message.message_id
+            self._ui_strategy = "send"
+            log_event("progress.update", ui_action="send", **payload)
+            return "send"
+        except Exception as exc:  # pragma: no cover - best effort
+            try:
+                message = await self._bot.send_message(self._chat_id, text)
+            except Exception:  # pragma: no cover - best effort
+                if allow_skip_logging:
+                    log_event(
+                        "progress.update",
+                        ui_action="skip",
+                        err=str(exc),
+                        **payload,
+                    )
+                return "skip"
+            else:
+                self._message_id = message.message_id
+                self._ui_strategy = "send"
+                log_event("progress.update", ui_action="send", **payload)
+                return "send"
+        else:
+            log_event("progress.update", ui_action="edit", **payload)
+            return "edit"
+
 
     @staticmethod
     def _compose_text(
@@ -222,3 +290,13 @@ class Progress:
             await self._bot.delete_message(self._chat_id, self._message_id)
         except Exception:  # pragma: no cover - best effort
             pass
+
+
+def _is_message_not_modified_error(exc: BadRequest) -> bool:
+    message = str(exc).lower()
+    return "message is not modified" in message
+
+
+def _should_fallback_on_bad_request(exc: BadRequest) -> bool:
+    message = str(exc).lower()
+    return "message can't be edited" in message or "message to edit not found" in message

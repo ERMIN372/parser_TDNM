@@ -5,6 +5,8 @@ import json
 import logging
 import math
 import os
+import shutil
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -17,7 +19,7 @@ from aiogram.types import (
     InputFile,
     ReplyKeyboardRemove,
 )
-from aiogram.utils.exceptions import MessageCantBeEdited, MessageNotModified
+from aiogram.utils.exceptions import BadRequest, MessageCantBeEdited, MessageNotModified
 
 # анти-спам / занятость пользователя
 from ..middlewares.busy import BUSY_TEXT, clear_busy, is_busy, set_busy
@@ -43,6 +45,7 @@ from app.utils.errors import (
     user_message_for_no_data,
 )
 from app.utils.progress import Progress, ProgressStep
+from app.utils.report_sender import SendReportResult, send_report
 from app.utils.normalize import normalize_city, normalize_role
 
 # Кеш последнего «сомнительного» запроса: user_id -> (query, city, overrides)
@@ -55,7 +58,7 @@ PROGRESS_STEPS = (
     ProgressStep("normalize", "нормализация…"),
     ProgressStep("write_xlsx", "сбор XLSX…"),
 )
-PROGRESS_SUCCESS_TEXT = "✅ Готово"
+PROGRESS_SUCCESS_TEXT = "Готово ✅"
 PROGRESS_FAILURE_PREFIX = "❌ Не получилось…"
 
 _DIAG_ENV_KEYS = [
@@ -194,6 +197,75 @@ async def _send_diagnostic_bundle_if_needed(
             )
 
 
+def _update_ui_meta(
+    result: parser_adapter.RunReportResult | None,
+    *,
+    ack_sent: bool | None,
+    progress_strategy: str | None,
+    report_path: Path | None,
+    send_error: str | None = None,
+) -> None:
+    if not result or not result.meta:
+        return
+
+    ui_payload: dict[str, object] = {
+        "ack_sent": bool(ack_sent) if ack_sent is not None else False,
+        "progress_strategy": progress_strategy or "edit",
+        "report_path": str(report_path) if report_path else None,
+    }
+    if send_error:
+        ui_payload["send_error"] = send_error
+
+    result.meta["ui"] = {k: v for k, v in ui_payload.items() if v is not None}
+
+    bundle_path = getattr(result, "bundle_path", None)
+    if not bundle_path:
+        return
+    bundle_dir = bundle_path.with_suffix("")
+    meta_path = bundle_dir / "meta.json"
+    if not meta_path.exists():
+        return
+    try:
+        try:
+            meta_data = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta_data = {}
+        meta_data["ui"] = result.meta["ui"]
+        meta_path.write_text(
+            json.dumps(meta_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        shutil.make_archive(str(bundle_dir), "zip", root_dir=bundle_dir, base_dir=".")
+    except Exception as exc:  # pragma: no cover - diagnostics best effort
+        log_event(
+            "diagnostic_meta_update_failed",
+            level="WARN",
+            bundle=str(bundle_path),
+            err=str(exc),
+        )
+
+
+async def _cleanup_inline_message(message: types.Message) -> None:
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except MessageNotModified:
+        pass
+    except (MessageCantBeEdited, BadRequest) as exc:
+        log_event(
+            "ui.cleanup_failed",
+            level="WARN",
+            err=str(exc),
+            reason="remove_inline_markup",
+        )
+    except Exception as exc:  # pragma: no cover - UI cleanup best effort
+        log_event(
+            "ui.cleanup_failed",
+            level="WARN",
+            err=str(exc),
+            reason="remove_inline_markup",
+        )
+
+
 class ReportProgressTracker:
     def __init__(self, progress: Progress, *, has_filter: bool):
         self._progress = progress
@@ -202,6 +274,10 @@ class ReportProgressTracker:
     @property
     def progress(self) -> Progress:
         return self._progress
+
+    @property
+    def ui_strategy(self) -> str:
+        return self._progress.ui_strategy
 
     async def mark_command_ready(self) -> None:
         await self._progress.set("fetch", 10, force=True)
@@ -658,10 +734,22 @@ async def _send_report_with_analytics(
     include=None,
     exclude=None,
     reply_markup=None,
-) -> None:
+    diagnostic_path: Path | None = None,
+    diagnostic_caption: str | None = None,
+) -> SendReportResult:
     register_context(path, title=title, city=city)
     share_kb = _report_actions_keyboard()
-    await message.answer_document(InputFile(path), reply_markup=share_kb)
+    send_result = await send_report(
+        message.bot,
+        message.chat.id,
+        path,
+        reply_markup=share_kb,
+        diagnostic_path=diagnostic_path,
+        diagnostic_caption=diagnostic_caption,
+    )
+    if not send_result.ok:
+        return send_result
+
     person = getattr(message, "from_user", None)
     if person:
         chips.record_success(person.id, title, city)
@@ -698,7 +786,9 @@ async def _send_report_with_analytics(
         if activation.granted and activation.bonus:
             notify_text = f"🔥 Реферал {mention} активирован — +{activation.bonus} кредит начислен!"
         else:
-            notify_text = f"Реферал {mention} активировал триггер, но бонус не начислен (достигнут лимит)."
+            notify_text = (
+                f"Реферал {mention} активировал триггер, но бонус не начислен (достигнут лимит)."
+            )
         try:
             await message.bot.send_message(activation.inviter_id, notify_text)
         except Exception as exc:  # pragma: no cover
@@ -708,6 +798,7 @@ async def _send_report_with_analytics(
                 inviter_id=activation.inviter_id,
                 err=str(exc),
             )
+    return send_result
 
 
 async def cb_report_share(call: types.CallbackQuery):
@@ -957,7 +1048,12 @@ async def _run_parser_bypass_validation(
                 path=str(result.xlsx_path),
                 duration_ms=result.duration_ms if result else None,
             )
-            await _send_report_with_analytics(
+            correlation = None
+            if result and result.meta:
+                correlation = str(result.meta.get("correlation_id") or "").strip() or None
+            diagnostic_path = result.bundle_path if SEND_DIAG_BUNDLES else None
+            diagnostic_caption = f"diag {correlation}" if correlation else "diagnostic bundle"
+            send_result = await _send_report_with_analytics(
                 message,
                 result.xlsx_path,
                 title=query,
@@ -965,9 +1061,38 @@ async def _run_parser_bypass_validation(
                 include=overrides.get("include"),
                 exclude=overrides.get("exclude"),
                 reply_markup=_main_menu_kb(message, user=user),
+                diagnostic_path=diagnostic_path,
+                diagnostic_caption=diagnostic_caption if diagnostic_path else None,
             )
-            if tracker:
-                await tracker.finish_success()
+            progress_strategy = tracker.ui_strategy if tracker else "edit"
+            _update_ui_meta(
+                result,
+                ack_sent=True,
+                progress_strategy=progress_strategy,
+                report_path=result.xlsx_path,
+                send_error=send_result.error_message,
+            )
+            if send_result.ok:
+                await _cleanup_inline_message(message)
+                if tracker:
+                    await tracker.finish_success()
+                complete_operation(ok=True)
+            else:
+                failure_text = (
+                    "Не удалось отправить отчёт в Telegram. Мы прислали диагностический архив,"
+                    " чтобы помочь с разбором."
+                )
+                if tracker:
+                    await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Не удалось отправить файл")
+                await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
+                await _send_diagnostic_bundle_if_needed(
+                    message.bot,
+                    bundle_path=result.bundle_path,
+                    correlation=correlation,
+                    user_chat_id=getattr(message.chat, "id", None),
+                    user_id=getattr(user, "id", None),
+                )
+                complete_operation(ok=False, err="send_report_failed")
     finally:
         clear_busy(uid)
 
@@ -982,6 +1107,7 @@ async def _run_with_amount(
     *,
     uid: int | None = None,
     user: types.User | None = None,
+    ui_ack_sent: bool | None = None,
 ):
     """Считает pages/per_page под нужный объём total и запускает парсер с блокировкой пользователя."""
     uid = _resolve_requester_id(message, uid)
@@ -1168,7 +1294,12 @@ async def _run_with_amount(
                 path=str(result.xlsx_path),
                 duration_ms=result.duration_ms if result else None,
             )
-            await _send_report_with_analytics(
+            correlation = None
+            if result and result.meta:
+                correlation = str(result.meta.get("correlation_id") or "").strip() or None
+            diagnostic_path = result.bundle_path if SEND_DIAG_BUNDLES else None
+            diagnostic_caption = f"diag {correlation}" if correlation else "diagnostic bundle"
+            send_result = await _send_report_with_analytics(
                 message,
                 result.xlsx_path,
                 title=title,
@@ -1177,9 +1308,39 @@ async def _run_with_amount(
                 include=ov.get("include"),
                 exclude=ov.get("exclude"),
                 reply_markup=_main_menu_kb(message, user=user),
+                diagnostic_path=diagnostic_path,
+                diagnostic_caption=diagnostic_caption if diagnostic_path else None,
             )
-            if tracker:
-                await tracker.finish_success()
+            progress_strategy = tracker.ui_strategy if tracker else "edit"
+            ack_for_meta = ui_ack_sent if ui_ack_sent is not None else True
+            _update_ui_meta(
+                result,
+                ack_sent=ack_for_meta,
+                progress_strategy=progress_strategy,
+                report_path=result.xlsx_path,
+                send_error=send_result.error_message,
+            )
+            if send_result.ok:
+                await _cleanup_inline_message(message)
+                if tracker:
+                    await tracker.finish_success()
+                complete_operation(ok=True)
+            else:
+                failure_text = (
+                    "Не удалось отправить отчёт в Telegram. Мы прислали диагностический архив,"
+                    " чтобы помочь с разбором."
+                )
+                if tracker:
+                    await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Не удалось отправить файл")
+                await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
+                await _send_diagnostic_bundle_if_needed(
+                    message.bot,
+                    bundle_path=result.bundle_path,
+                    correlation=correlation,
+                    user_chat_id=getattr(message.chat, "id", None),
+                    user_id=getattr(user, "id", None),
+                )
+                complete_operation(ok=False, err="send_report_failed")
     finally:
         clear_busy(uid)
 
@@ -1384,7 +1545,12 @@ async def _run_parser(
                 if decision:
                     await _finalize_quota_usage(message, requester_id, decision)
                 _log_parse_ready(norm_title, city_to_use, ov)
-                await _send_report_with_analytics(
+                correlation = None
+                if result and result.meta:
+                    correlation = str(result.meta.get("correlation_id") or "").strip() or None
+                diagnostic_path = result.bundle_path if SEND_DIAG_BUNDLES else None
+                diagnostic_caption = f"diag {correlation}" if correlation else "diagnostic bundle"
+                send_result = await _send_report_with_analytics(
                     message,
                     result.xlsx_path,
                     title=norm_title,
@@ -1392,9 +1558,38 @@ async def _run_parser(
                     include=ov.get("include"),
                     exclude=ov.get("exclude"),
                     reply_markup=_main_menu_kb(message, user=user),
+                    diagnostic_path=diagnostic_path,
+                    diagnostic_caption=diagnostic_caption if diagnostic_path else None,
                 )
-                if tracker:
-                    await tracker.finish_success()
+                progress_strategy = tracker.ui_strategy if tracker else "edit"
+                _update_ui_meta(
+                    result,
+                    ack_sent=True,
+                    progress_strategy=progress_strategy,
+                    report_path=result.xlsx_path,
+                    send_error=send_result.error_message,
+                )
+                if send_result.ok:
+                    await _cleanup_inline_message(message)
+                    if tracker:
+                        await tracker.finish_success()
+                    complete_operation(ok=True)
+                else:
+                    failure_text = (
+                        "Не удалось отправить отчёт в Telegram. Мы прислали диагностический архив,"
+                        " чтобы помочь с разбором."
+                    )
+                    if tracker:
+                        await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Не удалось отправить файл")
+                    await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
+                    await _send_diagnostic_bundle_if_needed(
+                        message.bot,
+                        bundle_path=result.bundle_path,
+                        correlation=correlation,
+                        user_chat_id=getattr(message.chat, "id", None),
+                        user_id=getattr(user, "id", None),
+                    )
+                    complete_operation(ok=False, err="send_report_failed")
         finally:
             clear_busy(requester_id)
         return
@@ -1715,8 +1910,32 @@ async def cb_qty(call: types.CallbackQuery):
         await call.answer(BUSY_TEXT, show_alert=False)
         return
 
+    ack_started = time.monotonic()
+    ack_sent = False
+    try:
+        await call.answer(
+            "Запускаю выгрузку… это займёт пару минут",
+            show_alert=False,
+            cache_time=1,
+        )
+        ack_sent = True
+        log_event(
+            "callback_ack_sent",
+            callback="cb_qty",
+            status="ok",
+            latency_ms=int((time.monotonic() - ack_started) * 1000),
+        )
+    except Exception as exc:
+        log_event(
+            "callback_ack_sent",
+            callback="cb_qty",
+            status="err",
+            latency_ms=int((time.monotonic() - ack_started) * 1000),
+            err=str(exc),
+        )
+        log_event("callback_ack_failed", callback="cb_qty", err=str(exc))
+
     payload = _PENDING_QTY.get(call.from_user.id)
-    await call.answer()
     if not payload:
         await call.message.answer("Не нашёл предыдущий запрос. Введи должность ещё раз:")
         await ParseForm.waiting_query.set()
@@ -1749,6 +1968,7 @@ async def cb_qty(call: types.CallbackQuery):
         total,
         uid=call.from_user.id,
         user=call.from_user,
+        ui_ack_sent=ack_sent,
     )
 
 
@@ -1759,7 +1979,24 @@ async def cb_preview(call: types.CallbackQuery):
         await call.answer(BUSY_TEXT, show_alert=False)
         return
 
-    await call.answer("Готовлю превью…", show_alert=False)
+    ack_started = time.monotonic()
+    try:
+        await call.answer("Готовлю превью…", show_alert=False, cache_time=1)
+        log_event(
+            "callback_ack_sent",
+            callback="cb_preview",
+            status="ok",
+            latency_ms=int((time.monotonic() - ack_started) * 1000),
+        )
+    except Exception as exc:
+        log_event(
+            "callback_ack_sent",
+            callback="cb_preview",
+            status="err",
+            latency_ms=int((time.monotonic() - ack_started) * 1000),
+            err=str(exc),
+        )
+        log_event("callback_ack_failed", callback="cb_preview", err=str(exc))
 
     progress: Progress | None = None
     invalid_arguments: str | None = None
@@ -2068,6 +2305,7 @@ async def cb_resume_yes(call: types.CallbackQuery):
             request.total,
             uid=call.from_user.id,
             user=call.from_user,
+            ui_ack_sent=True,
         )
     elif request.kind == "direct":
         await _run_parser(
