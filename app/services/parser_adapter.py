@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -49,15 +50,55 @@ _SUPPORTED_CLI_FLAGS: set[str] | None = None
 _SUPPORTED_CLI_FLAGS_FAILED = False
 _SUPPORTED_CLI_FLAGS_LOCK: asyncio.Lock | None = None
 _LOG_ONCE_EVENTS: set[str] = set()
-_SITE_DROP_LOGGED = False
 
-DEFAULT_FAIL_MESSAGE = "Не получилось (ошибка/таймаут). Попробуй позже."
+DEFAULT_FAIL_MESSAGE = "Не получилось… Попробуйте позже."
 ARGS_CHANGED_MESSAGE = "Обновился парсер, аргументы изменились; повторите позже"
 
 _parse_metrics = {"total": 0, "ok": 0, "failed": 0, "timeout": 0, "duration_sum": 0}
 _preview_metrics = {"attempts": 0, "ok": 0, "timeout": 0}
 
 SUPPORTED_SITES = {"hh", "gorodrabot", "both"}
+
+_EXPECTED_ARGUMENT_HINTS: dict[str, str] = {
+    "query": "нужен текст запроса",
+    "city": "нужно выбрать город",
+    "role": "указывать только строкой",
+    "pages": "целое число от 1",
+    "per_page": "целое число от 1 до 100",
+    "area": "целое число — идентификатор региона",
+    "include": "список слов через запятую",
+    "exclude": "список слов через запятую",
+    "pause": "число секунд, например 1.5",
+    "site": "одно из значений: hh, gorodrabot, both",
+    "timeout": "целое число секунд",
+}
+
+VALIDATION_FAIL_MESSAGE = (
+    "Не получилось запустить поиск: проверьте параметры — {details}. "
+    "Их можно исправить кнопкой «Назад»."
+)
+
+
+def _format_validation_details(invalid: Sequence[str], details: Mapping[str, str]) -> str:
+    parts: list[str] = []
+    for key in invalid:
+        hint = details.get(key) or _EXPECTED_ARGUMENT_HINTS.get(key)
+        if hint:
+            parts.append(f"{key} (ожидалось: {hint})")
+        else:
+            parts.append(str(key))
+    return "; ".join(parts)
+
+
+def _extract_process_hint(stderr_lines: Sequence[str]) -> str | None:
+    for raw_line in stderr_lines:
+        line = str(raw_line).strip()
+        if not line:
+            continue
+        if len(line) > 200:
+            return f"{line[:197]}…"
+        return line
+    return None
 
 
 class ValidationError(Exception):
@@ -100,88 +141,147 @@ def format_invalid_arguments(invalid: Sequence[str] | None) -> str:
 
 def normalize_and_validate_overrides(
     overrides: Mapping[str, object] | None,
-) -> tuple[bool, dict[str, object], list[str], str | None]:
+) -> tuple[bool, dict[str, object], list[str], dict[str, str]]:
     """Normalize user-provided overrides and collect validation errors."""
 
     invalid: list[str] = []
-    normalized: dict[str, object] = {
-        "include": [],
-        "exclude": [],
-    }
+    reasons: dict[str, str] = {}
+    normalized: dict[str, object] = {}
+
     if not overrides:
-        return True, normalized, invalid, None
+        normalized["include"] = []
+        normalized["exclude"] = []
+        return True, normalized, invalid, reasons
 
-    def _require_int(key: str, raw: object, *, min_value: int | None = None, max_value: int | None = None) -> None:
-        nonlocal normalized
-        try:
-            value = int(raw)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            invalid.append(key)
-            return
-        if (min_value is not None and value < min_value) or (
-            max_value is not None and value > max_value
-        ):
-            invalid.append(key)
-            return
-        normalized[key] = value
+    allowed_keys = {
+        "query",
+        "city",
+        "role",
+        "pages",
+        "per_page",
+        "pause",
+        "site",
+        "area",
+        "include",
+        "exclude",
+        "timeout",
+    }
 
-    def _require_float(key: str, raw: object, *, min_value: float | None = None) -> None:
-        nonlocal normalized
-        try:
-            value = float(raw)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            invalid.append(key)
-            return
-        if min_value is not None and value < min_value:
-            invalid.append(key)
-            return
-        normalized[key] = value
+    def _mark_invalid(key: str, reason: str | None = None) -> None:
+        invalid.append(key)
+        if reason:
+            reasons[key] = reason
+        elif key not in reasons and key in _EXPECTED_ARGUMENT_HINTS:
+            reasons[key] = _EXPECTED_ARGUMENT_HINTS[key]
 
-    allowed_keys = {"pages", "per_page", "pause", "site", "area", "include", "exclude", "timeout"}
-
-    for key, raw_value in overrides.items():
+    for raw_key, raw_value in overrides.items():
+        key = str(raw_key)
         if key not in allowed_keys:
-            invalid.append(str(key))
+            _mark_invalid(key, "неизвестный параметр")
+            continue
+
+        value = raw_value
+        if value is None or value is False:
+            continue
+
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                continue
+
+        if key in {"include", "exclude"}:
+            words = _to_list(value, lower=True)
+            normalized[key] = words
             continue
 
         if key == "pages":
-            _require_int(key, raw_value, min_value=1)
-        elif key == "per_page":
-            _require_int(key, raw_value, min_value=1, max_value=100)
-        elif key == "pause":
-            _require_float(key, raw_value, min_value=0.0)
-        elif key == "site":
-            value = str(raw_value or "").strip().lower()
-            if not value:
-                invalid.append(key)
-            elif value not in SUPPORTED_SITES:
-                invalid.append(key)
-            else:
-                normalized[key] = value
-        elif key == "area":
-            _require_int(key, raw_value, min_value=1)
-        elif key == "timeout":
-            _require_int(key, raw_value, min_value=1)
-        elif key == "include":
-            normalized[key] = _to_list(raw_value)
-        elif key == "exclude":
-            normalized[key] = _to_list(raw_value)
+            try:
+                pages = int(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                _mark_invalid(key)
+                continue
+            if pages < 1:
+                _mark_invalid(key)
+                continue
+            normalized[key] = pages
+            continue
+
+        if key == "per_page":
+            try:
+                per_page = int(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                _mark_invalid(key)
+                continue
+            if per_page < 1 or per_page > 100:
+                _mark_invalid(key)
+                continue
+            normalized[key] = per_page
+            continue
+
+        if key == "pause":
+            try:
+                pause = float(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                _mark_invalid(key)
+                continue
+            if pause < 0:
+                _mark_invalid(key)
+                continue
+            normalized[key] = pause
+            continue
+
+        if key == "site":
+            site_value = str(value).strip().lower()
+            if not site_value:
+                continue
+            if site_value not in SUPPORTED_SITES:
+                _mark_invalid(key)
+                continue
+            normalized[key] = site_value
+            continue
+
+        if key == "area":
+            try:
+                area_value = int(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                _mark_invalid(key)
+                continue
+            normalized[key] = area_value
+            continue
+
+        if key == "timeout":
+            try:
+                timeout_value = int(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                _mark_invalid(key)
+                continue
+            if timeout_value < 1:
+                _mark_invalid(key)
+                continue
+            normalized[key] = timeout_value
+            continue
+
+        if key in {"query", "city", "role"}:
+            normalized[key] = str(value)
+
+    normalized.setdefault("include", [])
+    normalized.setdefault("exclude", [])
 
     unique_invalid = sorted({item for item in invalid if item})
-    error = format_invalid_arguments(unique_invalid) if unique_invalid else None
-    if unique_invalid:
-        return False, normalized, unique_invalid, error
-
-    return True, normalized, [], None
+    return not bool(unique_invalid), normalized, unique_invalid, reasons
 
 
-def _to_list(val: Optional[Iterable[str] | str]) -> List[str]:
-    if not val:
+def _to_list(val: Optional[Iterable[object] | str], *, lower: bool = False) -> List[str]:
+    if val is None:
         return []
     if isinstance(val, str):
         parts = [p.strip() for p in val.replace(";", ",").split(",")]
-        return [p for p in parts if p]
-    return [str(x).strip() for x in val if str(x).strip()]
+    else:
+        parts = [str(x).strip() for x in val if str(x).strip()]
+    result = [p for p in parts if p]
+    if lower:
+        return [p.lower() for p in result]
+    return result
 
 
 def _log_once(event: str, *, level: str = "WARN", **payload: object) -> None:
@@ -193,6 +293,27 @@ def _log_once(event: str, *, level: str = "WARN", **payload: object) -> None:
 
 def _command_to_text(parts: Iterable[object]) -> str:
     return " ".join(str(part) for part in parts)
+
+
+def _clean_arguments_map(payload: Mapping[str, object]) -> dict[str, object]:
+    cleaned: dict[str, object] = {}
+    for key, value in payload.items():
+        if value is None or value is False:
+            continue
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                continue
+            cleaned[key] = stripped
+            continue
+        if isinstance(value, (list, tuple, set)):
+            seq = list(value)
+            if not seq and key not in {"include", "exclude"}:
+                continue
+            cleaned[key] = seq
+            continue
+        cleaned[key] = value
+    return cleaned
 
 
 def _collect_supported_flags() -> tuple[set[str] | None, dict[str, object]]:
@@ -428,7 +549,7 @@ async def preview_report(
     raw_query = query
     raw_city = city
     raw_overrides = {"area": area, "include": include, "exclude": exclude}
-    ok_overrides, normalized_overrides, invalid_override_keys, _ = normalize_and_validate_overrides(
+    ok_overrides, normalized_overrides, invalid_override_keys, override_details = normalize_and_validate_overrides(
         raw_overrides
     )
 
@@ -446,6 +567,13 @@ async def preview_report(
     invalid_arguments.extend(invalid_override_keys)
     invalid_arguments = sorted({item for item in invalid_arguments if item})
 
+    validation_details: dict[str, str] = {}
+    if not query:
+        validation_details["query"] = _EXPECTED_ARGUMENT_HINTS.get("query", "")
+    if not city:
+        validation_details["city"] = _EXPECTED_ARGUMENT_HINTS.get("city", "")
+    validation_details.update(override_details)
+
     raw_arguments = {
         "query": raw_query,
         "city": raw_city,
@@ -453,13 +581,15 @@ async def preview_report(
         "include": _to_list(include),
         "exclude": _to_list(exclude),
     }
-    normalized_arguments = {
-        "query": query,
-        "city": city,
-        "area": area_norm,
-        "include": inc_list,
-        "exclude": exc_list,
-    }
+    normalized_arguments = _clean_arguments_map(
+        {
+            "query": query,
+            "city": city,
+            "area": area_norm,
+            "include": inc_list,
+            "exclude": exc_list,
+        }
+    )
 
     common_log_fields = {
         "query": query,
@@ -949,6 +1079,7 @@ def _build_diagnostic_bundle(
     stderr_lines: list[str],
     meta: dict[str, object],
     csv_path: Path | None,
+    stack_trace: Sequence[str] | None = None,
 ) -> Path | None:
     try:
         bundle_zip = bundle_dir.with_suffix(".zip")
@@ -961,8 +1092,10 @@ def _build_diagnostic_bundle(
         command_text = " ".join(str(part) for part in command)
         (bundle_dir / "command.txt").write_text(command_text, encoding="utf-8")
         (bundle_dir / "env.txt").write_text("\n".join(env_lines), encoding="utf-8")
-        (bundle_dir / "stdout.log").write_text("\n".join(stdout_lines), encoding="utf-8")
-        (bundle_dir / "stderr.log").write_text("\n".join(stderr_lines), encoding="utf-8")
+        (bundle_dir / "stdout.txt").write_text("\n".join(stdout_lines), encoding="utf-8")
+        (bundle_dir / "stderr.txt").write_text("\n".join(stderr_lines), encoding="utf-8")
+        stack_payload = "\n".join(stack_trace or []) or ""
+        (bundle_dir / "stack.txt").write_text(stack_payload, encoding="utf-8")
 
         meta_payload = json.loads(json.dumps(meta, default=str))
         (bundle_dir / "meta.json").write_text(
@@ -1032,7 +1165,7 @@ async def run_report(
     }
     if raw_timeout is not None:
         raw_overrides_input["timeout"] = raw_timeout
-    _ok_overrides, normalized_overrides, invalid_override_keys, _ = normalize_and_validate_overrides(
+    _ok_overrides, normalized_overrides, invalid_override_keys, override_details = normalize_and_validate_overrides(
         raw_overrides_input
     )
 
@@ -1054,6 +1187,13 @@ async def run_report(
         invalid_arguments.append("city")
     invalid_arguments.extend(invalid_override_keys)
     invalid_arguments = sorted({item for item in invalid_arguments if item})
+
+    validation_details: dict[str, str] = {}
+    if not query:
+        validation_details["query"] = _EXPECTED_ARGUMENT_HINTS.get("query", "")
+    if not city:
+        validation_details["city"] = _EXPECTED_ARGUMENT_HINTS.get("city", "")
+    validation_details.update(override_details)
 
     raw_arguments = {
         "query": raw_query,
@@ -1078,7 +1218,7 @@ async def run_report(
         "exclude": _to_list(raw_exclude),
         "timeout": raw_timeout,
     }
-    normalized_arguments = {
+    normalized_arguments_raw = {
         "query": query,
         "city": city,
         "role": role,
@@ -1095,7 +1235,8 @@ async def run_report(
         timeout_val = normalized_overrides.get("timeout")
         if isinstance(timeout_val, int):
             timeout = timeout_val
-    normalized_arguments["timeout"] = timeout
+    normalized_arguments_raw["timeout"] = timeout
+    normalized_arguments = _clean_arguments_map(normalized_arguments_raw)
 
     user_dir = REPORT_DIR / str(user_id)
     user_dir.mkdir(parents=True, exist_ok=True)
@@ -1119,12 +1260,11 @@ async def run_report(
         builder.add("--pause", str(pause))
     if area is not None:
         builder.add("--area", str(area))
+    if site is not None:
+        builder.add("--site", str(site))
 
     command = builder.command
     dropped_flags = list(builder.dropped)
-    if site is not None:
-        _log_once("parser_site_deprecated", level="WARN", site=site)
-        dropped_flags.append("--site")
     dropped_flags = sorted(set(dropped_flags))
     missing_flags = sorted(set(builder.missing_required))
     command_text = _command_to_text(command)
@@ -1169,21 +1309,18 @@ async def run_report(
         "normalized_arguments": normalized_arguments,
         "invalid_arguments": invalid_arguments,
         "validation_ok": not invalid_arguments,
+        "validation_details": validation_details or None,
+        "build_cmd": command_text,
+        "mode": "report",
     }
 
     preflight_blocked = bool(missing_flags or len(command) <= 2)
 
     should_log_dropped = bool(dropped_flags)
-    if dropped_flags == ["--site"]:
-        global _SITE_DROP_LOGGED
-        if _SITE_DROP_LOGGED:
-            should_log_dropped = False
-        else:
-            _SITE_DROP_LOGGED = True
 
     if should_log_dropped and not preflight_blocked:
         log_event(
-            "parser_cli_args_dropped",
+            "parse.cli_args_dropped",
             level="WARN",
             dropped_flags=dropped_flags,
             command_line=command_text,
@@ -1192,7 +1329,7 @@ async def run_report(
 
     if preflight_blocked:
         log_event(
-            "parser_preflight_blocked",
+            "parse.preflight_blocked",
             level="ERROR",
             missing_flags=missing_flags or None,
             dropped_flags=dropped_flags or None,
@@ -1200,10 +1337,11 @@ async def run_report(
             **common_log_fields,
         )
 
+    process_started = False
     if not invalid_arguments and not preflight_blocked:
+        process_started = True
         log_event(
-            "parser_start",
-            action="run_report",
+            "parse.started",
             command_line=command_text,
             **common_log_fields,
         )
@@ -1219,6 +1357,7 @@ async def run_report(
     timeout_hit = False
 
     spawn_error: Exception | None = None
+    stack_lines: list[str] = []
 
     if not invalid_arguments and not preflight_blocked:
         try:
@@ -1276,6 +1415,7 @@ async def run_report(
                 )
         except Exception as exc:  # pragma: no cover - spawn failure is rare
             spawn_error = exc
+            stack_lines = traceback.format_exception(exc)
             if proc and proc.returncode is None:
                 try:
                     proc.kill()
@@ -1321,14 +1461,20 @@ async def run_report(
 
     error_type: str | None = None
 
+    error_code_for_log: str | None = None
+    validation_hint = _format_validation_details(invalid_arguments, validation_details)
+
     if invalid_arguments:
         err_code = "E_BAD_ARGS"
-        err_message = f"Invalid arguments: {', '.join(invalid_arguments)}"
-        user_message = format_invalid_arguments(invalid_arguments)
+        detail_text = validation_hint or ", ".join(invalid_arguments)
+        err_message = f"Invalid arguments: {detail_text}" if detail_text else "Invalid arguments"
+        user_message = VALIDATION_FAIL_MESSAGE.format(details=detail_text or "проверьте параметры")
         error_type = "Validation"
+        error_code_for_log = "VALIDATION"
         log_event(
-            "parser_validation_failed",
+            "parse.validation_fail",
             level="WARN",
+            details=validation_hint or None,
             command_line=command_text,
             **common_log_fields,
         )
@@ -1337,12 +1483,13 @@ async def run_report(
         err_message = "Unsupported CLI arguments filtered by preflight"
         user_message = ARGS_CHANGED_MESSAGE
         error_type = "Validation"
+        error_code_for_log = "VALIDATION"
     elif timeout_hit:
         err_code = "E_TIMEOUT"
         err_message = f"Parser timeout after {eff_timeout}s"
         user_message = DEFAULT_FAIL_MESSAGE
         log_event(
-            "parser_timeout",
+            "parse.timeout",
             level="WARN",
             duration_ms=duration_ms,
             timeout=True,
@@ -1351,16 +1498,21 @@ async def run_report(
             **common_log_fields,
         )
         error_type = "Timeout"
+        error_code_for_log = "TIMEOUT"
     elif spawn_error is not None:
         err_code = "E_NONZERO_RC"
         err_message = str(spawn_error) or spawn_error.__class__.__name__
         user_message = DEFAULT_FAIL_MESSAGE
         error_type = "ProcessExit"
+        if not stack_lines:
+            stack_lines = traceback.format_exception(spawn_error)
+        error_code_for_log = "INTERNAL"
     elif rc is None:
         err_code = "E_NONZERO_RC"
         err_message = "Parser process did not start"
         user_message = DEFAULT_FAIL_MESSAGE
         error_type = "ProcessExit"
+        error_code_for_log = "INTERNAL"
     elif rc != 0:
         err_code = "E_NONZERO_RC"
         err_message = f"Parser exited with code {rc}"
@@ -1370,13 +1522,19 @@ async def run_report(
             err_code = "E_BAD_ARGS"
             user_message = "Некорректные параметры запуска парсера."
             error_type = "Validation"
+            error_code_for_log = "VALIDATION"
         else:
             error_type = "ProcessExit"
+            error_code_for_log = f"PROCESS_EXIT_{rc}" if rc is not None else "PROCESS_EXIT"
+            hint = _extract_process_hint(stderr_lines)
+            if hint:
+                user_message = f"{DEFAULT_FAIL_MESSAGE}\n\nПодсказка от парсера: {hint}"
     elif not out_path.exists():
         err_code = "E_NO_FILE"
         err_message = "Parser reported success but XLSX missing"
         user_message = "Файл отчёта не сформировался. Попробуй ещё раз."
         error_type = "ProcessExit"
+        error_code_for_log = "PROCESS_EXIT_0"
     else:
         ok = True
         file_size: int | None = None
@@ -1390,7 +1548,7 @@ async def run_report(
         )
         rows_count = _count_csv_rows(csv_source)
         log_event(
-            "parser_xlsx_ready",
+            "parse.xlsx_ready",
             level="INFO",
             path=str(out_path),
             size_bytes=file_size,
@@ -1400,20 +1558,23 @@ async def run_report(
             **common_log_fields,
         )
         error_type = None
+        error_code_for_log = None
 
     common_log_fields["error_type"] = error_type
+    if error_code_for_log:
+        common_log_fields["error_code"] = error_code_for_log
 
     snippet_limit = ERROR_SNIPPET_LINES if not ok else SNIPPET_LINES
     if (DEBUG_ENABLED or not ok) and stdout_lines:
         log_event(
-            "parser_stdout_snippet",
+            "parse.stdout_snippet",
             snippet=stdout_lines[:snippet_limit],
             lines=len(stdout_lines),
             **common_log_fields,
         )
     if (DEBUG_ENABLED or not ok) and stderr_lines:
         log_event(
-            "parser_stderr_snippet",
+            "parse.stderr_snippet",
             level="WARN" if not ok else "INFO",
             snippet=stderr_lines[:snippet_limit],
             lines=len(stderr_lines),
@@ -1425,6 +1586,7 @@ async def run_report(
         "started_at": started_iso,
         "finished_at": finished_iso,
         "duration_ms": duration_ms,
+        "user_id": user_id,
         "query": query,
         "city": city,
         "include": inc,
@@ -1436,10 +1598,12 @@ async def run_report(
         "area": area,
         "role": role,
         "timeout": eff_timeout,
+        "mode": "report",
         "preflight_blocked": preflight_blocked,
         "dropped_cli_flags": dropped_flags,
         "timeout_hit": timeout_hit,
         "command_line": command_text,
+        "build_cmd": command_text,
         "command": command,
         "stdout_lines": len(stdout_lines),
         "stderr_lines": len(stderr_lines),
@@ -1455,11 +1619,18 @@ async def run_report(
         "invalid_arguments": invalid_arguments,
         "normalized_overrides": normalized_overrides,
         "error_type": error_type,
+        "validation_details": validation_details,
+        "validation_ok": not invalid_arguments,
+        "process_started": process_started,
     }
     if csv_path:
         meta["csv_path"] = str(csv_path)
     if out_path.exists():
         meta["xlsx_path"] = str(out_path)
+    if stack_lines:
+        meta["stack_trace"] = stack_lines
+    if error_code_for_log:
+        meta["error_code"] = error_code_for_log
 
     bundle_path = _build_diagnostic_bundle(
         bundle_dir=bundle_dir,
@@ -1469,6 +1640,7 @@ async def run_report(
         stderr_lines=stderr_lines,
         meta=meta,
         csv_path=csv_path,
+        stack_trace=stack_lines,
     )
 
     if bundle_path:
@@ -1481,8 +1653,8 @@ async def run_report(
         err_message=err_message,
         user_message=user_message,
         rc=rc,
-        stdout_path=bundle_dir / "stdout.log" if bundle_path else None,
-        stderr_path=bundle_dir / "stderr.log" if bundle_path else None,
+        stdout_path=bundle_dir / "stdout.txt" if bundle_path else None,
+        stderr_path=bundle_dir / "stderr.txt" if bundle_path else None,
         xlsx_path=out_path if out_path.exists() else None,
         csv_path=csv_path if csv_path and csv_path.exists() else None,
         bundle_path=bundle_path,
@@ -1492,26 +1664,39 @@ async def run_report(
         meta=meta,
     )
 
-    level = "INFO" if ok else ("WARN" if err_code == "E_TIMEOUT" else "ERROR")
-    event_name = "parser_finished" if ok else "parser_failed"
-    event_payload: dict[str, object | None] = {
-        "duration_ms": duration_ms,
-        "rc": rc,
-        "err_code": err_code,
-        "err_message": err_message,
-        "bundle_path": str(bundle_path) if bundle_path else None,
-        "command_line": command_text,
-        "timeout": timeout_hit,
-        "timeout_limit": eff_timeout,
-        "dropped_flags": dropped_flags or None,
-        "error_type": error_type,
-    }
-    if not ok and stdout_lines:
-        event_payload["stdout_snippet"] = stdout_lines[:ERROR_SNIPPET_LINES]
-    if not ok and stderr_lines:
-        event_payload["stderr_snippet"] = stderr_lines[:ERROR_SNIPPET_LINES]
+    if process_started:
+        finished_payload: dict[str, object | None] = {
+            "duration_ms": duration_ms,
+            "rc": rc,
+            "ok": ok,
+            "err_code": err_code,
+            "err_message": err_message,
+            "bundle_path": str(bundle_path) if bundle_path else None,
+            "command_line": command_text,
+            "timeout": timeout_hit,
+            "timeout_limit": eff_timeout,
+            "dropped_flags": dropped_flags or None,
+            "error_type": error_type,
+        }
+        if not ok and stdout_lines:
+            finished_payload["stdout_snippet"] = stdout_lines[:ERROR_SNIPPET_LINES]
+        if not ok and stderr_lines:
+            finished_payload["stderr_snippet"] = stderr_lines[:ERROR_SNIPPET_LINES]
 
-    log_event(event_name, level=level, **event_payload, **common_log_fields)
+        finished_level = "INFO" if ok else ("WARN" if err_code == "E_TIMEOUT" else "ERROR")
+        log_event("parse.finished", level=finished_level, **finished_payload, **common_log_fields)
+
+    if error_code_for_log:
+        error_level = "WARN" if error_code_for_log in {"VALIDATION", "TIMEOUT"} else "ERROR"
+        log_event(
+            "parse.error",
+            level=error_level,
+            error_code=error_code_for_log,
+            err_code=err_code,
+            err_message=err_message,
+            user_message=user_message,
+            **common_log_fields,
+        )
 
     _register_parse_result(result)
 

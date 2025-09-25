@@ -96,8 +96,8 @@ def _save_parser_diag(
     diag_dir = make_diag_dir(user_id)
     command_text = " ".join(str(part) for part in exc.cmd)
     save_text(diag_dir, "command.txt", command_text)
-    save_text(diag_dir, "stdout.log", exc.stdout or "")
-    save_text(diag_dir, "stderr.log", exc.stderr or "")
+    save_text(diag_dir, "stdout.txt", exc.stdout or "")
+    save_text(diag_dir, "stderr.txt", exc.stderr or "")
     save_text(diag_dir, "env.txt", _collect_diag_env())
 
     meta = {
