@@ -79,11 +79,14 @@ class ParserRunError(Exception):
         stdout: str,
         stderr: str,
         returncode: int,
+        *,
+        timeout: bool = False,
     ) -> None:
         self.cmd = list(cmd)
         self.stdout = stdout
         self.stderr = stderr
         self.returncode = returncode
+        self.timeout = timeout
         super().__init__(f"Parser failed with return code {returncode}")
 
 
@@ -1526,6 +1529,12 @@ async def run_report(
     if should_raise:
         stdout_text = "\n".join(stdout_lines)
         stderr_text = "\n".join(stderr_lines)
-        raise ParserRunError(command, stdout_text, stderr_text, int(rc) if rc is not None else -1)
+        raise ParserRunError(
+            command,
+            stdout_text,
+            stderr_text,
+            int(rc) if rc is not None else -1,
+            timeout=timeout_hit,
+        )
 
     return result

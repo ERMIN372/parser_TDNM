@@ -34,7 +34,14 @@ from app import keyboards
 from app.utils.admins import is_admin
 from app.utils.diag import make_diag_dir, save_text, zip_dir
 from app.utils.logging import complete_operation, log_event, update_context
-from app.utils.progress import ProgressMessage
+from app.utils.errors import (
+    classify_error,
+    is_retryable,
+    message_for_code,
+    user_message_for_invalid_args,
+    user_message_for_no_data,
+)
+from app.utils.progress import Progress, ProgressStep
 from app.utils.normalize import normalize_city, normalize_role
 
 # Кеш последнего «сомнительного» запроса: user_id -> (query, city, overrides)
@@ -42,18 +49,13 @@ _WARN_CACHE: Dict[int, Tuple[str, str, dict]] = {}
 # Кеш шага выбора объёма: user_id -> (norm_title, city, area_id, overrides, max_total)
 _PENDING_QTY: Dict[int, Tuple[str, str, int, dict, int]] = {}
 
-PROGRESS_STEPS_2 = (
-    "Шаг 1/2: собираю вакансии… {spinner}",
-    "Шаг 2/2: формирую Excel-отчёт… {spinner}",
+PROGRESS_STEPS = (
+    ProgressStep("fetch", "парсинг страниц hh…"),
+    ProgressStep("normalize", "нормализация…"),
+    ProgressStep("write_xlsx", "сбор XLSX…"),
 )
-PROGRESS_STEPS_3 = (
-    "Шаг 1/3: собираю вакансии… {spinner}",
-    "Шаг 2/3: фильтрую по ключевым словам… {spinner}",
-    "Шаг 3/3: формирую Excel-отчёт… {spinner}",
-)
-PREVIEW_TEMPLATE = "Готовлю превью (5 вакансий)… {spinner}"
-DONE_TEXT = "Готово ✅"
-FAIL_TEXT = "❌ Не получилось (ошибка/таймаут). Попробуй позже."
+PROGRESS_SUCCESS_TEXT = "✅ Готово"
+PROGRESS_FAILURE_PREFIX = "❌ Не получилось…"
 
 _DIAG_ENV_KEYS = [
     "PYBIN",
@@ -86,6 +88,9 @@ def _save_parser_diag(
     exclude: list[str] | None,
     amount: int | None,
     mode: str,
+    retries: int,
+    error_code: str | None,
+    progress_last_step: str | None,
 ) -> Path:
     diag_dir = make_diag_dir(user_id)
     command_text = " ".join(str(part) for part in exc.cmd)
@@ -104,6 +109,9 @@ def _save_parser_diag(
         "mode": mode,
         "error": repr(exc),
         "returncode": exc.returncode,
+        "retries": retries,
+        "error_code": error_code,
+        "progress_last_step": progress_last_step,
     }
     save_text(diag_dir, "meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
     try:
@@ -120,60 +128,77 @@ def _format_failure_message(
     invalid_arguments: str | None,
     diag_dir: Path | None,
     user: types.User | None,
+    default_message: str,
 ) -> str:
-    text = invalid_arguments or FAIL_TEXT
+    text = invalid_arguments or default_message
     if diag_dir and user and is_admin(user.id):
         text += f"\nДиагностика сохранена: {diag_dir.name}"
     return text
 
 
 class ReportProgressTracker:
-    def __init__(self, progress: ProgressMessage, steps: tuple[str, ...]):
+    def __init__(self, progress: Progress, *, has_filter: bool):
         self._progress = progress
-        self._steps = steps
-        self._current = 0
-        self._finished = False
+        self._has_filter = has_filter
 
     @property
-    def has_filter(self) -> bool:
-        return len(self._steps) == len(PROGRESS_STEPS_3)
+    def progress(self) -> Progress:
+        return self._progress
+
+    async def mark_command_ready(self) -> None:
+        await self._progress.set("fetch", 10, force=True)
+
+    async def mark_process_started(self) -> None:
+        await self._progress.set("fetch", 30, force=True)
 
     async def handle_event(self, kind: str, payload: dict) -> None:
-        if self._finished:
-            return
         if kind == "status":
-            status = payload.get("status")
-            if status == "csv":
-                await self._set_step(1 if len(self._steps) > 1 else 0)
-            elif status == "report" and payload.get("format") == "xlsx":
-                if not self.has_filter and len(self._steps) > 1:
-                    await self._set_step(len(self._steps) - 1)
-        elif kind == "filter_start":
-            if self.has_filter:
-                await self._set_step(1)
-        elif kind == "filter_done":
-            if self.has_filter:
-                await self._set_step(2)
+            status = str(payload.get("status") or "").lower()
+            if status == "page":
+                extra = self._page_hint(payload)
+                await self._progress.set("fetch", 30, extra_text=extra)
+            elif status == "csv":
+                extra = self._page_hint(payload)
+                await self._progress.set("normalize", 60, extra_text=extra)
+            elif status == "report" and str(payload.get("format") or "").lower() == "xlsx":
+                await self._progress.set("write_xlsx", 90)
+        elif kind == "filter_start" and self._has_filter:
+            await self._progress.set("normalize", 60)
 
-    async def _set_step(self, index: int) -> None:
-        if index < 0 or index >= len(self._steps):
-            return
-        if index == self._current:
-            return
-        self._current = index
-        await self._progress.update_template(self._steps[index])
+    async def finish_success(self, *, delete_after: float | None = 8.0) -> None:
+        await self._progress.close(ok=True, text=PROGRESS_SUCCESS_TEXT, delete_after=delete_after)
 
-    async def finish_success(self, *, delete_after: float | None = 45.0) -> None:
-        if self._finished:
-            return
-        self._finished = True
-        await self._progress.finish(DONE_TEXT, delete_after=delete_after)
+    async def fail(self, message: str) -> None:
+        await self._progress.close(ok=False, text=message)
 
-    async def fail(self) -> None:
-        if self._finished:
-            return
-        self._finished = True
-        await self._progress.fail(FAIL_TEXT)
+    async def show_retry(self, attempt: int, total: int) -> None:
+        await self._progress.show_retry(attempt, total)
+
+    async def clear_retry(self) -> None:
+        await self._progress.clear_retry()
+
+    def _page_hint(self, payload: dict) -> str | None:
+        page = payload.get("page")
+        total = payload.get("pages")
+        if page is None:
+            page = payload.get("current")
+        if total is None:
+            total = payload.get("total")
+        if page is None:
+            page = payload.get("current_page")
+        if total is None:
+            total = payload.get("total_pages")
+        try:
+            page_int = int(page)
+            total_int = int(total)
+        except (TypeError, ValueError):
+            return None
+        if total_int <= 0:
+            return None
+        if page_int < 1:
+            page_int += 1
+        page_int = max(1, min(page_int, total_int))
+        return f"страница {page_int}/{total_int}"
 
 
 async def _start_report_progress(
@@ -181,9 +206,14 @@ async def _start_report_progress(
     include: list[str] | None = None,
     exclude: list[str] | None = None,
 ) -> ReportProgressTracker:
-    steps = PROGRESS_STEPS_3 if (include or exclude) else PROGRESS_STEPS_2
-    progress = await ProgressMessage.create(message.bot, message.chat.id, steps[0])
-    return ReportProgressTracker(progress, steps)
+    progress = await Progress.create(
+        message.bot,
+        message.chat.id,
+        PROGRESS_STEPS,
+        mode="report",
+        initial_step=PROGRESS_STEPS[0].name,
+    )
+    return ReportProgressTracker(progress, has_filter=bool(include or exclude))
 
 
 def _is_timeout_error(exc: BaseException) -> bool:
@@ -499,17 +529,17 @@ def _log_preview_timeout(title: str, city: str, overrides: dict | None = None, e
 
 def _error_message_for_result(result: parser_adapter.RunReportResult) -> str:
     if not result:
-        return FAIL_TEXT
+        return message_for_code("UNKNOWN")
     code = result.err_code or ""
     if code == "E_TIMEOUT":
-        return result.user_message or FAIL_TEXT
+        return result.user_message or message_for_code("TIMEOUT")
     if code == "E_NONZERO_RC":
-        return result.user_message or FAIL_TEXT
+        return result.user_message or message_for_code("PIPELINE_ERROR")
     if code == "E_NO_FILE":
         return "Файл отчёта не сформировался. Попробуй ещё раз."
     if code == "E_BAD_ARGS":
-        return result.user_message or "Некорректные параметры запуска парсера."
-    return result.user_message or FAIL_TEXT
+        return result.user_message or user_message_for_invalid_args()
+    return result.user_message or message_for_code("UNKNOWN")
 
 
 def _remember_bundle_for_chat(
@@ -533,11 +563,11 @@ async def _send_failure_response(
     user: types.User | None = None,
     tracker: ReportProgressTracker | None = None,
 ) -> None:
+    text = _error_message_for_result(result)
     if tracker:
-        await tracker.fail()
+        await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {text}")
 
     correlation = _remember_bundle_for_chat(message, result)
-    text = _error_message_for_result(result)
     menu_markup = _main_menu_kb(message, user=user)
     user_id = getattr(user, "id", None)
     if is_admin(user_id) and result.bundle_path and correlation:
@@ -701,10 +731,11 @@ async def _run_parser_bypass_validation(
     tracker: ReportProgressTracker | None = None
     decision: QuotaDecision | None = None
     result: parser_adapter.RunReportResult | None = None
-    invalid_arguments: str | None = None
     diag_dir: Path | None = None
     include_list: list[str] = []
     exclude_list: list[str] = []
+    retries_done = 0
+    backoffs = (2, 6)
     try:
         decision = await _ensure_quota(
             message,
@@ -718,6 +749,7 @@ async def _run_parser_bypass_validation(
         include_list = _ensure_str_list(overrides.get("include"))
         exclude_list = _ensure_str_list(overrides.get("exclude"))
         tracker = await _start_report_progress(message, include_list, exclude_list)
+        await tracker.mark_command_ready()
         _log_parse_start(query, city, overrides)
         log_event(
             "INFO",
@@ -748,54 +780,72 @@ async def _run_parser_bypass_validation(
                 user_id=uid,
             )
 
-        result = await parser_adapter.run_report(
-            uid,
-            query,
-            city,
-            role=query,
-            include=include_list,
-            exclude=exclude_list,
-            progress=_progress,
-            **allowed_kwargs,
-        )
-    except parser_adapter.ParserRunError as exc:
-        if tracker:
-            await tracker.fail()
-        hint = "parser timeout" if exc.returncode == -1 else "rc != 0"
-        log_event(
-            "ERROR",
-            "parse.error",
-            user_id=uid,
-            mode="report",
-            query=query,
-            city=city,
-            hint=hint,
-            exc=repr(exc),
-        )
-        diag_dir = _save_parser_diag(
-            uid,
-            exc=exc,
-            query=query,
-            city=city,
-            area_id=overrides.get("area") if isinstance(overrides.get("area"), int) else None,
-            include=include_list,
-            exclude=exclude_list,
-            amount=None,
-            mode="report",
-        )
-        failure_text = _format_failure_message(
-            invalid_arguments=invalid_arguments,
-            diag_dir=diag_dir,
-            user=user,
-        )
-        await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
-        complete_operation(ok=False, err="parser_error")
-        return
+        while True:
+            try:
+                if tracker:
+                    if retries_done > 0:
+                        await tracker.clear_retry()
+                        await tracker.mark_command_ready()
+                    await tracker.mark_process_started()
+                result = await parser_adapter.run_report(
+                    uid,
+                    query,
+                    city,
+                    role=query,
+                    include=include_list,
+                    exclude=exclude_list,
+                    progress=_progress,
+                    **allowed_kwargs,
+                )
+                break
+            except parser_adapter.ParserRunError as exc:
+                error_info = classify_error(exc, exc.stdout, exc.stderr)
+                log_event(
+                    "ERROR",
+                    "parse.error",
+                    user_id=uid,
+                    mode="report",
+                    query=query,
+                    city=city,
+                    error_code=error_info.code,
+                    hint=error_info.hint_for_log,
+                    attempt=retries_done + 1,
+                )
+                if is_retryable(error_info.code) and retries_done < len(backoffs):
+                    retries_done += 1
+                    if tracker:
+                        await tracker.show_retry(retries_done, len(backoffs))
+                    await asyncio.sleep(backoffs[retries_done - 1])
+                    continue
+
+                progress_last_step = tracker.progress.last_step if tracker else None
+                if tracker:
+                    await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}")
+                diag_dir = _save_parser_diag(
+                    uid,
+                    exc=exc,
+                    query=query,
+                    city=city,
+                    area_id=overrides.get("area") if isinstance(overrides.get("area"), int) else None,
+                    include=include_list,
+                    exclude=exclude_list,
+                    amount=None,
+                    mode="report",
+                    retries=retries_done,
+                    error_code=error_info.code,
+                    progress_last_step=progress_last_step,
+                )
+                failure_text = _format_failure_message(
+                    invalid_arguments=None,
+                    diag_dir=diag_dir,
+                    user=user,
+                    default_message=error_info.message_for_user,
+                )
+                await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
+                complete_operation(ok=False, err=error_info.code.lower())
+                return
     except Exception as e:  # pragma: no cover
-        if tracker:
-            await tracker.fail()
-        event = "parse_timeout" if _is_timeout_error(e) else "parse_error"
-        err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
+        error_info = classify_error(e, getattr(e, "stdout", ""), getattr(e, "stderr", ""))
         log_event(
             "ERROR",
             "parse.error",
@@ -803,16 +853,19 @@ async def _run_parser_bypass_validation(
             mode="report",
             query=query,
             city=city,
-            hint=event,
-            exc=repr(e),
+            error_code=error_info.code,
+            hint=error_info.hint_for_log,
         )
+        if tracker:
+            await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}")
         failure_text = _format_failure_message(
-            invalid_arguments=invalid_arguments,
+            invalid_arguments=None,
             diag_dir=diag_dir,
             user=user,
+            default_message=error_info.message_for_user,
         )
         await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
-        complete_operation(ok=False, err=err_text)
+        complete_operation(ok=False, err=error_info.code.lower())
         return
     else:
         if not result or not result.ok or not (result.xlsx_path and result.xlsx_path.exists()):
@@ -889,10 +942,11 @@ async def _run_with_amount(
     decision: QuotaDecision | None = None
     tracker: ReportProgressTracker | None = None
     result: parser_adapter.RunReportResult | None = None
-    invalid_arguments: str | None = None
     diag_dir: Path | None = None
     include_list: list[str] = []
     exclude_list: list[str] = []
+    retries_done = 0
+    backoffs = (2, 6)
 
     try:
         decision = await _ensure_quota(
@@ -908,6 +962,7 @@ async def _run_with_amount(
         include_list = _ensure_str_list(ov.get("include"))
         exclude_list = _ensure_str_list(ov.get("exclude"))
         tracker = await _start_report_progress(message, include_list, exclude_list)
+        await tracker.mark_command_ready()
         _log_parse_start(title, city, ov, approx_total=total)
         log_event(
             "INFO",
@@ -924,21 +979,74 @@ async def _run_with_amount(
                 await tracker.handle_event(kind, payload)
 
         run_kwargs = {k: v for k, v in ov.items() if k not in {"include", "exclude"}}
-        result = await parser_adapter.run_report(
-            uid,
-            title,
-            city,
-            role=title,
-            timeout=timeout,
-            include=include_list,
-            exclude=exclude_list,
-            progress=_progress,
-            **run_kwargs,
-        )
-    except parser_adapter.ParserRunError as exc:
-        if tracker:
-            await tracker.fail()
-        hint = "parser timeout" if exc.returncode == -1 else "rc != 0"
+        while True:
+            try:
+                if tracker:
+                    if retries_done > 0:
+                        await tracker.clear_retry()
+                        await tracker.mark_command_ready()
+                    await tracker.mark_process_started()
+                result = await parser_adapter.run_report(
+                    uid,
+                    title,
+                    city,
+                    role=title,
+                    timeout=timeout,
+                    include=include_list,
+                    exclude=exclude_list,
+                    progress=_progress,
+                    **run_kwargs,
+                )
+                break
+            except parser_adapter.ParserRunError as exc:
+                error_info = classify_error(exc, exc.stdout, exc.stderr)
+                log_event(
+                    "ERROR",
+                    "parse.error",
+                    user_id=uid,
+                    mode="report",
+                    query=title,
+                    city=city,
+                    amount=total,
+                    error_code=error_info.code,
+                    hint=error_info.hint_for_log,
+                    attempt=retries_done + 1,
+                )
+                if is_retryable(error_info.code) and retries_done < len(backoffs):
+                    retries_done += 1
+                    if tracker:
+                        await tracker.show_retry(retries_done, len(backoffs))
+                    await asyncio.sleep(backoffs[retries_done - 1])
+                    continue
+
+                progress_last_step = tracker.progress.last_step if tracker else None
+                if tracker:
+                    await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}")
+                diag_dir = _save_parser_diag(
+                    uid,
+                    exc=exc,
+                    query=title,
+                    city=city,
+                    area_id=area_id,
+                    include=include_list,
+                    exclude=exclude_list,
+                    amount=total,
+                    mode="report",
+                    retries=retries_done,
+                    error_code=error_info.code,
+                    progress_last_step=progress_last_step,
+                )
+                failure_text = _format_failure_message(
+                    invalid_arguments=None,
+                    diag_dir=diag_dir,
+                    user=user,
+                    default_message=error_info.message_for_user,
+                )
+                await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
+                complete_operation(ok=False, err=error_info.code.lower())
+                return
+    except Exception as e:
+        error_info = classify_error(e, getattr(e, "stdout", ""), getattr(e, "stderr", ""))
         log_event(
             "ERROR",
             "parse.error",
@@ -947,42 +1055,19 @@ async def _run_with_amount(
             query=title,
             city=city,
             amount=total,
-            hint=hint,
-            exc=repr(exc),
+            error_code=error_info.code,
+            hint=error_info.hint_for_log,
         )
-        diag_dir = _save_parser_diag(
-            uid,
-            exc=exc,
-            query=title,
-            city=city,
-            area_id=area_id,
-            include=include_list,
-            exclude=exclude_list,
-            amount=total,
-            mode="report",
-        )
-        failure_text = _format_failure_message(
-            invalid_arguments=invalid_arguments,
-            diag_dir=diag_dir,
-            user=user,
-        )
-        await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
-        complete_operation(ok=False, err="parser_error")
-        return
-    except Exception as e:
         if tracker:
-            await tracker.fail()
-        err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
-        event = "parse_timeout" if _is_timeout_error(e) else "parse_error"
-        log_event("ERROR", "parse.error", user_id=uid, mode="report", query=title, city=city, amount=total, hint=event, exc=repr(e))
-        diag_dir = None
+            await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}")
         failure_text = _format_failure_message(
-            invalid_arguments=invalid_arguments,
-            diag_dir=diag_dir,
+            invalid_arguments=None,
+            diag_dir=None,
             user=user,
+            default_message=error_info.message_for_user,
         )
         await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
-        complete_operation(ok=False, err=err_text)
+        complete_operation(ok=False, err=error_info.code.lower())
         return
     else:
         if not result or not result.ok or not (result.xlsx_path and result.xlsx_path.exists()):
@@ -1106,6 +1191,9 @@ async def _run_parser(
         decision: QuotaDecision | None = None
         tracker: ReportProgressTracker | None = None
         result: parser_adapter.RunReportResult | None = None
+        diag_dir: Path | None = None
+        retries_done = 0
+        backoffs = (2, 6)
         try:
             decision = await _ensure_quota(
                 message,
@@ -1119,6 +1207,7 @@ async def _run_parser(
             include_list = _ensure_str_list(ov.get("include"))
             exclude_list = _ensure_str_list(ov.get("exclude"))
             tracker = await _start_report_progress(message, include_list, exclude_list)
+            await tracker.mark_command_ready()
             _log_parse_start(norm_title, city_to_use, ov)
 
             async def _progress(kind: str, payload: dict) -> None:
@@ -1126,24 +1215,89 @@ async def _run_parser(
                     await tracker.handle_event(kind, payload)
 
             run_kwargs = {k: v for k, v in ov.items() if k not in {"include", "exclude"}}
-            result = await parser_adapter.run_report(
-                requester_id,
-                norm_title,
-                city_to_use,
-                role=norm_title,
-                include=include_list,
-                exclude=exclude_list,
-                progress=_progress,
-                **run_kwargs,
-            )
+            while True:
+                try:
+                    if tracker:
+                        if retries_done > 0:
+                            await tracker.clear_retry()
+                            await tracker.mark_command_ready()
+                        await tracker.mark_process_started()
+                    result = await parser_adapter.run_report(
+                        requester_id,
+                        norm_title,
+                        city_to_use,
+                        role=norm_title,
+                        include=include_list,
+                        exclude=exclude_list,
+                        progress=_progress,
+                        **run_kwargs,
+                    )
+                    break
+                except parser_adapter.ParserRunError as exc:
+                    error_info = classify_error(exc, exc.stdout, exc.stderr)
+                    log_event(
+                        "ERROR",
+                        "parse.error",
+                        user_id=requester_id,
+                        mode="report",
+                        query=norm_title,
+                        city=city_to_use,
+                        error_code=error_info.code,
+                        hint=error_info.hint_for_log,
+                        attempt=retries_done + 1,
+                    )
+                    if is_retryable(error_info.code) and retries_done < len(backoffs):
+                        retries_done += 1
+                        if tracker:
+                            await tracker.show_retry(retries_done, len(backoffs))
+                        await asyncio.sleep(backoffs[retries_done - 1])
+                        continue
+
+                    progress_last_step = tracker.progress.last_step if tracker else None
+                    if tracker:
+                        await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}")
+                    diag_dir = _save_parser_diag(
+                        requester_id,
+                        exc=exc,
+                        query=norm_title,
+                        city=city_to_use,
+                        area_id=ov.get("area") if isinstance(ov.get("area"), int) else None,
+                        include=include_list,
+                        exclude=exclude_list,
+                        amount=None,
+                        mode="report",
+                        retries=retries_done,
+                        error_code=error_info.code,
+                        progress_last_step=progress_last_step,
+                    )
+                    failure_text = _format_failure_message(
+                        invalid_arguments=None,
+                        diag_dir=diag_dir,
+                        user=user,
+                        default_message=error_info.message_for_user,
+                    )
+                    await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
+                    complete_operation(ok=False, err=error_info.code.lower())
+                    return
         except Exception as e:
+            error_info = classify_error(e, getattr(e, "stdout", ""), getattr(e, "stderr", ""))
+            log_event(
+                "ERROR",
+                "parse.error",
+                user_id=requester_id,
+                mode="report",
+                query=norm_title,
+                city=city_to_use,
+                error_code=error_info.code,
+                hint=error_info.hint_for_log,
+            )
             if tracker:
-                await tracker.fail()
-            err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
-            event = "parse_timeout" if _is_timeout_error(e) else "parse_error"
-            log_event(event, level="ERROR", err=err_text)
-            await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
-            complete_operation(ok=False, err=err_text)
+                await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}")
+            await message.answer(
+                error_info.message_for_user,
+                reply_markup=_main_menu_kb(message, user=user),
+            )
+            complete_operation(ok=False, err=error_info.code.lower())
             return
         else:
             if not result or not result.ok or not (result.xlsx_path and result.xlsx_path.exists()):
@@ -1529,9 +1683,8 @@ async def cb_preview(call: types.CallbackQuery):
 
     await call.answer("Готовлю превью…", show_alert=False)
 
-    progress: ProgressMessage | None = None
+    progress: Progress | None = None
     invalid_arguments: str | None = None
-    diag_dir: Path | None = None
     try:
         payload = _PENDING_QTY.get(uid)   # ВАЖНО: .get(), НЕ .pop()!
         if not payload:
@@ -1602,7 +1755,14 @@ async def cb_preview(call: types.CallbackQuery):
             if not decision:
                 return
 
-        progress = await ProgressMessage.create(call.message.bot, call.message.chat.id, PREVIEW_TEMPLATE)
+        progress = await Progress.create(
+            call.message.bot,
+            call.message.chat.id,
+            PROGRESS_STEPS,
+            mode="preview",
+            initial_step=PROGRESS_STEPS[0].name,
+        )
+        await progress.set("fetch", 10, force=True)
         _log_preview_start(title, city, overrides)
         log_event(
             "INFO",
@@ -1612,116 +1772,112 @@ async def cb_preview(call: types.CallbackQuery):
             city=city,
             area_id=area_id,
         )
-        try:
-            rows = await parser_adapter.preview_rows(
-                uid,
-                title,
-                city,
-                area=area_id,
-                include=include,
-                exclude=exclude,
-            )
-        except parser_adapter.ParserRunError as exc:
-            hint = "parser timeout" if exc.returncode == -1 else "rc != 0"
-            log_event(
-                "ERROR",
-                "preview.error",
-                user_id=uid,
-                query=title,
-                city=city,
-                hint=hint,
-                exc=repr(exc),
-            )
-            if progress:
-                await progress.fail()
-            diag_dir = _save_parser_diag(
-                uid,
-                exc=exc,
-                query=title,
-                city=city,
-                area_id=area_id if isinstance(area_id, int) else None,
-                include=include,
-                exclude=exclude,
-                amount=parser_adapter.PREVIEW_ROWS,
-                mode="preview",
-            )
-            failure_text = _format_failure_message(
-                invalid_arguments=invalid_arguments,
-                diag_dir=diag_dir,
-                user=call.from_user,
-            )
-            await call.message.answer(failure_text)
-            return
-        except parser_adapter.ValidationError as exc:
-            if progress:
-                await progress.fail()
-            await call.message.answer(exc.user_message)
-            return
-        except asyncio.TimeoutError as exc:
-            _log_preview_timeout(title, city, overrides, err=str(exc))
-            log_event(
-                "ERROR",
-                "preview.error",
-                user_id=uid,
-                query=title,
-                city=city,
-                hint="timeout",
-                exc=repr(exc),
-            )
-            if progress:
-                await progress.fail()
-            failure_text = _format_failure_message(
-                invalid_arguments=invalid_arguments,
-                diag_dir=diag_dir,
-                user=call.from_user,
-            )
-            await call.message.answer(failure_text)
-            return
-        except Exception as exc:
-            _log_preview_timeout(title, city, overrides, err=str(exc))
-            log_event(
-                "ERROR",
-                "preview.error",
-                user_id=uid,
-                query=title,
-                city=city,
-                hint="exception",
-                exc=repr(exc),
-            )
-            if progress:
-                await progress.fail()
-            failure_text = _format_failure_message(
-                invalid_arguments=invalid_arguments,
-                diag_dir=diag_dir,
-                user=call.from_user,
-            )
-            await call.message.answer(failure_text)
-            return
 
-        if rows is None:
-            if progress:
-                await progress.fail()
-            failure_text = _format_failure_message(
-                invalid_arguments=invalid_arguments,
-                diag_dir=diag_dir,
-                user=call.from_user,
-            )
-            log_event(
-                "ERROR",
-                "preview.error",
-                user_id=uid,
-                query=title,
-                city=city,
-                hint="no_result",
-            )
-            await call.message.answer(failure_text)
-            return
+        backoffs = (2, 6)
+        retries_done = 0
+        diag_dir: Path | None = None
+        rows: list[dict[str, str]] | None = None
+        while True:
+            try:
+                if retries_done > 0:
+                    await progress.clear_retry()
+                    await progress.set("fetch", 10, force=True)
+                await progress.set("fetch", 30, force=True)
+                rows = await parser_adapter.preview_rows(
+                    uid,
+                    title,
+                    city,
+                    area=area_id,
+                    include=include,
+                    exclude=exclude,
+                )
+                break
+            except parser_adapter.ParserRunError as exc:
+                error_info = classify_error(exc, exc.stdout, exc.stderr)
+                _log_preview_timeout(title, city, overrides, err=error_info.hint_for_log)
+                log_event(
+                    "ERROR",
+                    "preview.error",
+                    user_id=uid,
+                    query=title,
+                    city=city,
+                    error_code=error_info.code,
+                    hint=error_info.hint_for_log,
+                    attempt=retries_done + 1,
+                )
+                if is_retryable(error_info.code) and retries_done < len(backoffs):
+                    retries_done += 1
+                    await progress.show_retry(retries_done, len(backoffs))
+                    await asyncio.sleep(backoffs[retries_done - 1])
+                    continue
+
+                progress_last_step = progress.last_step
+                diag_dir = _save_parser_diag(
+                    uid,
+                    exc=exc,
+                    query=title,
+                    city=city,
+                    area_id=area_id if isinstance(area_id, int) else None,
+                    include=include,
+                    exclude=exclude,
+                    amount=parser_adapter.PREVIEW_ROWS,
+                    mode="preview",
+                    retries=retries_done,
+                    error_code=error_info.code,
+                    progress_last_step=progress_last_step,
+                )
+                await progress.close(
+                    ok=False,
+                    text=f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}",
+                )
+                failure_text = _format_failure_message(
+                    invalid_arguments=invalid_arguments,
+                    diag_dir=diag_dir,
+                    user=call.from_user,
+                    default_message=error_info.message_for_user,
+                )
+                await call.message.answer(failure_text)
+                return
+            except validator.ValidationError as exc:
+                await progress.close(
+                    ok=False,
+                    text=f"{PROGRESS_FAILURE_PREFIX} {exc.user_message}",
+                )
+                await call.message.answer(exc.user_message)
+                return
+            except Exception as exc:
+                error_info = classify_error(exc, getattr(exc, "stdout", ""), getattr(exc, "stderr", ""))
+                _log_preview_timeout(title, city, overrides, err=error_info.hint_for_log)
+                log_event(
+                    "ERROR",
+                    "preview.error",
+                    user_id=uid,
+                    query=title,
+                    city=city,
+                    error_code=error_info.code,
+                    hint=error_info.hint_for_log,
+                )
+                await progress.close(
+                    ok=False,
+                    text=f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}",
+                )
+                failure_text = _format_failure_message(
+                    invalid_arguments=invalid_arguments,
+                    diag_dir=diag_dir,
+                    user=call.from_user,
+                    default_message=error_info.message_for_user,
+                )
+                await call.message.answer(failure_text)
+                return
 
         if not rows:
-            await call.message.answer("Совпадений не нашлось по текущим критериям.")
+            user_msg = user_message_for_no_data()
+            await progress.close(
+                ok=False,
+                text=f"{PROGRESS_FAILURE_PREFIX} {user_msg}",
+            )
+            await call.message.answer(user_msg)
             _log_preview_ready(title, city, 0, overrides)
-            if progress:
-                await progress.finish(DONE_TEXT, delete_after=45.0)
             log_event(
                 "INFO",
                 "preview.ok",
@@ -1729,10 +1885,12 @@ async def cb_preview(call: types.CallbackQuery):
                 query=title,
                 city=city,
                 count=0,
+                error_code="NO_DATA",
             )
             return
 
-        # аккуратный текст превью
+        await progress.set("normalize", 60)
+
         lines = []
         for r in rows:
             t = r.get("title") or "—"
@@ -1743,6 +1901,8 @@ async def cb_preview(call: types.CallbackQuery):
                 lines.append(f"• <a href=\"{link}\">{t}</a> — {c} — {s}")
             else:
                 lines.append(f"• {t} — {c} — {s}")
+
+        await progress.set("write_xlsx", 90)
 
         txt = "<b>Предпросмотр (первые совпадения):</b>\n" + "\n".join(lines)
         await call.message.answer(txt, disable_web_page_preview=True)
@@ -1755,8 +1915,7 @@ async def cb_preview(call: types.CallbackQuery):
             count=len(rows),
         )
         _log_preview_ready(title, city, len(rows), overrides)
-        if progress:
-            await progress.finish(DONE_TEXT, delete_after=45.0)
+        await progress.close(ok=True, text=PROGRESS_SUCCESS_TEXT, delete_after=8.0)
     finally:
         clear_busy(uid)
 
