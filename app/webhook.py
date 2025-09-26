@@ -1,11 +1,12 @@
 
-from datetime import datetime, timezone
+from typing import Any, Dict
 
+from aiogram import Bot, Dispatcher, types
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
-from aiogram import Bot, Dispatcher, types
 
 from .config import settings
+from .utils.diagnostics import collect_runtime_diagnostics
 from .utils.logging import log_event
 
 
@@ -18,6 +19,8 @@ def set_dispatcher(dp: Dispatcher):
     global _dp, _bot
     _dp = dp
     _bot = dp.bot
+    Dispatcher.set_current(dp)
+    Bot.set_current(dp.bot)
 
 
 @app.get("/")
@@ -32,17 +35,16 @@ async def health() -> JSONResponse:
 
 @app.get("/_debug")
 async def debug_info() -> JSONResponse:
-    data = {
+    data: Dict[str, Any] = {
         "status": "ok",
         "mode": settings.MODE,
         "webhook_url": settings.WEBHOOK_URL,
         "webapp_port": settings.WEBAPP_PORT,
         "webapp_port_source": settings.WEBAPP_PORT_SOURCE,
         "build_version": settings.BUILD_VERSION,
-        "dispatcher_ready": _dp is not None,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
         "health_url": f"http://0.0.0.0:{settings.WEBAPP_PORT}/health",
     }
+    data.update(collect_runtime_diagnostics(_dp))
     return JSONResponse(data)
 
 
@@ -54,7 +56,20 @@ async def handle_update(request: Request):
     update = types.Update(**data)
     if _bot:
         Bot.set_current(_bot)
-    await _dp.process_update(update)
+    previous_dp = Dispatcher.get_current()
+    if previous_dp is None:
+        log_event(
+            "dispatcher_context_reset",
+            level="DEBUG",
+            message="Dispatcher context was empty before processing update",
+        )
+    Dispatcher.set_current(_dp)
+    try:
+        await _dp.process_update(update)
+    finally:
+        Dispatcher.set_current(None)
+        if _bot:
+            Bot.set_current(None)
     return {"status": "ok"}
 
 
