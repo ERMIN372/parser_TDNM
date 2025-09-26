@@ -10,15 +10,17 @@ from app.services import parser_adapter
 
 
 def test_preview_rows_converts_to_dict(monkeypatch):
-    async def fake_preview_report(*args, **kwargs):
+    async def fake_preview_report(*args, diagnostic=None, **kwargs):
+        if diagnostic is not None:
+            diagnostic.update({"mode": "api", "stdout": [], "stderr": [], "returncode": 0, "attempt": None, "error": None})
         return [("Dev", "Acme", "https://hh.ru/vacancy/1")]
 
     monkeypatch.setattr(parser_adapter, "preview_report", fake_preview_report)
 
-    rows = asyncio.run(parser_adapter.preview_rows(123, "Dev", "Москва"))
+    result = asyncio.run(parser_adapter.preview_rows(123, "Dev", "Москва"))
 
-    assert isinstance(rows, list)
-    assert rows == [
+    assert isinstance(result.rows, list)
+    assert result.rows == [
         {
             "title": "Dev",
             "company": "Acme",
@@ -26,14 +28,19 @@ def test_preview_rows_converts_to_dict(monkeypatch):
             "link": "https://hh.ru/vacancy/1",
         }
     ]
+    assert result.bundle_path.is_dir()
+    assert result.bundle_id
 
 
 def test_preview_rows_handles_empty(monkeypatch):
-    async def fake_preview_report(*args, **kwargs):
+    async def fake_preview_report(*args, diagnostic=None, **kwargs):
+        if diagnostic is not None:
+            diagnostic.update({"mode": "api", "stdout": [], "stderr": [], "returncode": 0, "attempt": None, "error": None})
         return None
 
     monkeypatch.setattr(parser_adapter, "preview_report", fake_preview_report)
 
-    rows = asyncio.run(parser_adapter.preview_rows(1, "", ""))
+    result = asyncio.run(parser_adapter.preview_rows(1, "", ""))
 
-    assert rows == []
+    assert result.rows == []
+    assert result.bundle_path.is_dir()

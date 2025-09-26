@@ -28,6 +28,7 @@ from .storage.db import init_db
 from .utils.logging import (
     build_audit_summary,
     complete_operation,
+    get_operation_context,
     log_event,
     set_audit_sink,
     setup_logging,
@@ -49,21 +50,30 @@ def create_dispatcher() -> Dispatcher:
     # ---- global errors handler (aiogram v2) ----
     @dp.errors_handler()
     async def _global_errors_handler(update, exception):
-        # Полный стек для логов
         tb = "".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
         exc_type = type(exception).__name__
         if isinstance(exception, TelegramAPIError):
             exc_type = f"TelegramAPIError:{exc_type}"
-        logger.error(
+
+        snapshot: dict[str, object] | str
+        try:
+            snapshot = update.to_python() if hasattr(update, "to_python") else str(update)
+        except Exception:  # pragma: no cover - defensive logging
+            snapshot = str(update)
+
+        ctx = get_operation_context()
+        chat_id = getattr(ctx, "chat_id", None) if ctx else None
+
+        log_event(
             "unhandled_exception",
-            extra={
-                "event": "exception",
-                "update": update.to_python() if hasattr(update, "to_python") else str(update),
-                "exception_type": exc_type,
-                "traceback": tb[:15000],  # чтобы не раздуть логи
-            },
+            level="ERROR",
+            message=str(exception) or exc_type,
+            exception_type=exc_type,
+            traceback=tb[:15000],
+            update_snapshot=snapshot,
+            chat_id=chat_id,
         )
-        # Возвращаем True — чтобы aiogram не ронял процесс
+        complete_operation(ok=False, err=str(exception) or exc_type, force=True)
         return True
     # -------------------------------------------
 
@@ -115,6 +125,22 @@ def main() -> None:
 
     logger.info("startup_ok", extra={"event": "startup"})
 
+    health_url = f"http://0.0.0.0:{settings.WEBAPP_PORT}/health"
+    log_event(
+        "startup_banner",
+        message=(
+            f"mode={settings.MODE} webhook_url={settings.WEBHOOK_URL or '-'} "
+            f"port={settings.WEBAPP_PORT} (source={settings.WEBAPP_PORT_SOURCE}) "
+            f"health={health_url}"
+        ),
+        mode=settings.MODE,
+        webhook_url=settings.WEBHOOK_URL,
+        webapp_port=settings.WEBAPP_PORT,
+        webapp_port_source=settings.WEBAPP_PORT_SOURCE,
+        health_url=health_url,
+        build_version=settings.BUILD_VERSION,
+    )
+
     if settings.MODE == "polling":
         executor.start_polling(dp, skip_updates=True)
         return
@@ -130,7 +156,7 @@ def main() -> None:
                 webhook_setup_success = True
                 log_event("webhook_setup", message="Webhook configured successfully")
             except Exception as e:
-                log_event("webhook_setup_failed", level="WARN", 
+                log_event("webhook_setup_failed", level="WARN",
                          message=f"Initial webhook setup failed: {e}. Server will start anyway.")
                 print(f"Warning: Webhook setup failed: {e}")
                 print("The server will start anyway. You can manually set the webhook later.")

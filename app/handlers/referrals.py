@@ -9,6 +9,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from app.config import settings
 from app.services import referrals
 from app.storage import repo
+from app.utils.callbacks import safe_answer
 from app.utils.logging import log_event, update_context
 
 
@@ -42,7 +43,7 @@ async def cmd_referrals(message: types.Message):
 async def cb_ref_copy(call: types.CallbackQuery):
     me = await call.bot.get_me()
     link = referrals.build_referral_link(me.username or "", call.from_user.id)
-    await call.answer(link, show_alert=True)
+    await safe_answer(call, link, show_alert=True)
 
 
 async def cmd_promo(message: types.Message):
