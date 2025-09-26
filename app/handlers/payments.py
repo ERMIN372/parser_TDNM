@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 from aiogram import Dispatcher, types
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app import keyboards
 from app.handlers import parse
-from app.services import paywall, payments, referrals
+from app.services import paywall, payments, referrals, promo
 from app.utils.callbacks import safe_answer
 from app.utils.logging import complete_operation, log_event, update_context
 from app.utils.admins import is_admin
+
+
+class PromoForm(StatesGroup):
+    waiting_code = State()
 
 
 def _resolve_pack(data: str) -> str | None:
@@ -98,6 +104,15 @@ async def cb_buy_back(call: types.CallbackQuery):
     )
 
 
+async def cb_buy_promo(call: types.CallbackQuery, state: FSMContext):
+    update_context(command="buy_promo")
+    log_event("promo_redeem_prompt", message="Promo prompt opened")
+    if not await safe_answer(call):
+        return
+    await state.set_state(PromoForm.waiting_code.state)
+    await call.message.answer("Введите промокод одним сообщением (без пробелов).")
+
+
 async def cb_check(call: types.CallbackQuery):
     pid = call.data.split(":", 1)[1]
     update_context(command="pay_check", args={"payment_id": pid})
@@ -116,6 +131,24 @@ async def cb_check(call: types.CallbackQuery):
     if status == "succeeded":
         await parse.prompt_resume(call.bot, call.from_user.id)
     await safe_answer(call)
+
+
+async def promo_code_entered(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.lower() in {"/cancel", "отмена"}:
+        await state.finish()
+        await message.reply(
+            "Отменено.",
+            reply_markup=keyboards.main_kb(is_admin=is_admin(message.from_user.id)),
+        )
+        return
+
+    update_context(command="promo_redeem", args={"raw": text})
+    log_event("promo_redeem_request", message="Promo redeem requested", raw=text)
+    result = promo.redeem_promo(message.from_user.id, text)
+    reply_kb = keyboards.promo_result_kb()
+    await message.reply(result.message, reply_markup=reply_kb)
+    await state.finish()
 
 
 async def start_with_payload(message: types.Message):
@@ -172,7 +205,11 @@ def _format_user_mention(user: types.User | None) -> str:
 
 def register(dp: Dispatcher):
     dp.register_message_handler(cmd_buy, commands=["buy"])
-    dp.register_message_handler(cmd_buy, lambda m: m.text in {"💳 Купить", "Купить"}, state="*")
+    dp.register_message_handler(
+        cmd_buy,
+        lambda m: (m.text or "").strip() in {"💳 Купить", "Купить", "Купить ещё кредиты"},
+        state="*",
+    )
     dp.register_callback_query_handler(cb_buy_open, lambda c: c.data == "buy:open", state="*")
     dp.register_callback_query_handler(cb_buy_info, lambda c: c.data == "buy:info", state="*")
     dp.register_callback_query_handler(cb_buy_back, lambda c: c.data == "buy:back", state="*")
@@ -181,6 +218,8 @@ def register(dp: Dispatcher):
         lambda c: c.data and (c.data.startswith("buy:pack:") or c.data.startswith("buy:unlim:")),
         state="*",
     )
+    dp.register_callback_query_handler(cb_buy_promo, lambda c: c.data == "buy:promo", state="*")
     dp.register_callback_query_handler(cb_create, lambda c: c.data and c.data.startswith("pay_create:"))
     dp.register_callback_query_handler(cb_check, lambda c: c.data and c.data.startswith("pay_check:"))
     dp.register_message_handler(start_with_payload, commands=["start"])
+    dp.register_message_handler(promo_code_entered, state=PromoForm.waiting_code, content_types=types.ContentTypes.TEXT)

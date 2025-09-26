@@ -78,6 +78,8 @@ def init_db() -> None:
         Ledger,
         ReferralBan,
         SearchQuery,
+        PromoCreditCode,
+        PromoRedemption,
     )  # noqa: WPS347
     db.connect(reuse_if_open=True)
     db.create_tables([
@@ -91,5 +93,15 @@ def init_db() -> None:
         Ledger,
         ReferralBan,
         SearchQuery,
-    ])
+        PromoCreditCode,
+        PromoRedemption,
+    ], safe=True)
+
+    ledger_columns = {col.name for col in db.get_columns("ledger")}
+    if "operation_id" not in ledger_columns:
+        db.execute_sql("ALTER TABLE ledger ADD COLUMN operation_id TEXT")
+    db.execute_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_operation_id "
+        "ON ledger(operation_id) WHERE operation_id IS NOT NULL"
+    )
     db.close()
