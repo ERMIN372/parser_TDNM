@@ -74,9 +74,7 @@ def _extract_user_message(update: types.Update) -> Tuple[str | None, str | None]
 class OperationLoggerMiddleware(BaseMiddleware):
     async def on_pre_process_update(self, update: types.Update, data: Dict) -> None:
         user, chat_id = _extract_user(update)
-        correlation = data.get("correlation_id") if isinstance(data, dict) else None
-        if not correlation:
-            correlation = str(uuid.uuid4())
+        correlation = str(uuid.uuid4())
         ctx = start_operation(correlation_id=correlation)
 
         username = getattr(user, "username", None)

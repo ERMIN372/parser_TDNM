@@ -56,7 +56,6 @@ class OperationContext:
     update_type: str | None = None
     user_message_raw: str | None = None
     command: str | None = None
-    action: str | None = None
     args: Dict[str, Any] | None = None
     dialog_step: str | None = None
     bot_reply_type: str | None = None
@@ -80,7 +79,6 @@ class OperationContext:
             "update_type",
             "user_message_raw",
             "command",
-            "action",
             "args",
             "dialog_step",
             "bot_reply_type",
@@ -147,6 +145,34 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(event, ensure_ascii=False, separators=(",", ":"))
 
 
+class ConsoleFormatter(logging.Formatter):
+    COLORS = {
+        "DEBUG": "\x1b[38;5;245m",
+        "INFO": "\x1b[38;5;46m",
+        "WARN": "\x1b[38;5;214m",
+        "WARNING": "\x1b[38;5;214m",
+        "ERROR": "\x1b[38;5;196m",
+        "RESET": "\x1b[0m",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        event: Dict[str, Any] = getattr(record, "event_data", {})
+        level = record.levelname
+        color = self.COLORS.get(level, "")
+        reset = self.COLORS["RESET"] if color else ""
+        ts = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
+        correlation_id = event.get("correlation_id", "----")
+        user_part = ""
+        if event.get("username"):
+            user_part = f" @{event['username']}"
+        if event.get("full_name"):
+            user_part += f" ({event.get('user_id', '-')}: {event['full_name']})"
+        elif event.get("user_id"):
+            user_part += f" ({event['user_id']})"
+        summary = record.getMessage()
+        return f"[{ts} {color}{level}{reset}] (#{correlation_id[:6]}){user_part}: {summary}"
+
+
 def _ensure_logger() -> Logger:
     global _logger
     if _logger is None:
@@ -163,9 +189,6 @@ def setup_logging() -> None:
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
 
-    for noisy in ("aiogram", "aiohttp.access", "urllib3"):
-        logging.getLogger(noisy).setLevel(logging.INFO)
-
     log_queue: queue.Queue[logging.LogRecord] = queue.Queue()
     queue_handler = QueueHandler(log_queue)
     root_logger.handlers = [queue_handler]
@@ -173,7 +196,7 @@ def setup_logging() -> None:
     handlers: list[logging.Handler] = []
 
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(JsonFormatter())
+    console_handler.setFormatter(ConsoleFormatter())
     handlers.append(console_handler)
 
     if os.getenv("LOG_JSON", "true").lower() in {"1", "true", "yes"}:
@@ -224,45 +247,19 @@ def update_context(**fields: Any) -> None:
             setattr(ctx, key, value)
 
 
-def current_correlation_id() -> str | None:
-    ctx = get_operation_context()
-    return ctx.correlation_id if ctx else None
-
-
 def _prepare_payload(event: str, level: str, extra: Dict[str, Any]) -> Dict[str, Any]:
     ctx = get_operation_context()
-    correlation = extra.get("correlation_id")
-    if ctx and not correlation:
-        correlation = ctx.correlation_id
     payload: Dict[str, Any] = {
         "ts": _iso_ts(),
         "level": level,
         "event": event,
-        "correlation_id": correlation or str(uuid.uuid4()),
+        "correlation_id": ctx.correlation_id if ctx else extra.get("correlation_id", str(uuid.uuid4())),
     }
 
     if ctx:
-        ctx_payload = ctx.to_payload()
-        if ctx_payload:
-            payload.update(ctx_payload)
+        payload.update(ctx.to_payload())
 
     payload.update(extra)
-
-    if "command" in payload and isinstance(payload["command"], str):
-        payload["command"] = _truncate(payload["command"], limit=64)
-    if "action" in payload and isinstance(payload["action"], str):
-        payload["action"] = _truncate(payload["action"], limit=64)
-
-    for key in ("query", "city", "site"):
-        if key in payload and isinstance(payload[key], str):
-            payload[key] = _truncate(_mask_text(payload[key]), limit=256)
-
-    for key in ("include", "exclude"):
-        if key in payload and isinstance(payload[key], list):
-            payload[key] = [
-                _truncate(_mask_text(str(item)), limit=128)
-                for item in payload[key][:50]
-            ]
 
     for field in ("user_message_raw", "bot_reply_preview"):
         if field in payload and isinstance(payload[field], str):
@@ -282,47 +279,11 @@ def _prepare_payload(event: str, level: str, extra: Dict[str, Any]) -> Dict[str,
     return payload
 
 
-def log_event(*args: Any, **extra: Any) -> None:
-    if not args:
-        raise TypeError("log_event requires at least an event name")
-
-    message = extra.pop("message", None)
-
-    level_arg = args[0]
-    event: str
-    level: str
-
-    if (
-        len(args) >= 2
-        and isinstance(level_arg, str)
-        and level_arg.upper() in {"DEBUG", "INFO", "WARN", "WARNING", "ERROR", "CRITICAL"}
-    ):
-        level = level_arg.upper()
-        event = str(args[1])
-    else:
-        event = str(level_arg)
-        level = str(extra.pop("level", "INFO")).upper()
-
-    payload_extra = dict(extra)
-    if message is not None:
-        payload_extra["message"] = message
-
-    payload = _prepare_payload(event, level, payload_extra)
-
-    ts = payload.pop("ts", _iso_ts())
-    lvl = payload.pop("level", level)
-    evt = payload.pop("event", event)
-
-    line = {"ts": ts, "level": lvl, "event": evt, "data": payload}
-
-    try:
-        text = json.dumps(line, ensure_ascii=False, separators=(",", ":"), default=str)
-    except TypeError:
-        safe_data = json.loads(json.dumps(payload, default=str))
-        line["data"] = safe_data
-        text = json.dumps(line, ensure_ascii=False, separators=(",", ":"))
-
-    print(text, file=sys.stdout, flush=True)
+def log_event(event: str, level: str = "INFO", message: str | None = None, **extra: Any) -> None:
+    logger = _ensure_logger()
+    payload = _prepare_payload(event, level, extra)
+    record_message = message or extra.get("message") or event
+    logger.log(getattr(logging, level, logging.INFO), record_message, extra={"event_data": payload})
 
 
 def log_exception(event: str, err: Exception, message: str | None = None, **extra: Any) -> None:

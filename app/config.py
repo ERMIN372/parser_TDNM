@@ -1,22 +1,9 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
-
 from dotenv import load_dotenv
 
-
 load_dotenv()
-
-
-def get_runtime_port() -> int:
-    """Resolve the port that should be used by the web application."""
-
-    port_value = os.getenv("PORT") or os.getenv("WEBAPP_PORT") or "8080"
-    try:
-        return int(port_value)
-    except ValueError as exc:  # pragma: no cover - configuration error
-        raise RuntimeError("PORT/WEBAPP_PORT must be an integer") from exc
-
 
 @dataclass
 class Settings:
@@ -50,7 +37,7 @@ def _load() -> Settings:
         TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         MODE=os.getenv("MODE", "polling"),
         WEBAPP_HOST=os.getenv("WEBAPP_HOST", "0.0.0.0"),
-        WEBAPP_PORT=get_runtime_port(),
+        WEBAPP_PORT=int(os.getenv("WEBAPP_PORT", "8080")),
         WEBHOOK_URL=os.getenv("WEBHOOK_URL", ""),
         REPORT_DIR=Path(os.getenv("REPORT_DIR", "./reports")),
         PARSER_USER_AGENT=os.getenv("PARSER_USER_AGENT"),

@@ -1,15 +1,9 @@
 from __future__ import annotations
-
-import asyncio
-import json
 import logging
+import asyncio
 import math
 import os
-import shutil
-import time
-import traceback
-from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Tuple
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.dispatcher import FSMContext
@@ -20,7 +14,7 @@ from aiogram.types import (
     InputFile,
     ReplyKeyboardRemove,
 )
-from aiogram.utils.exceptions import BadRequest, MessageCantBeEdited, MessageNotModified
+from aiogram.utils.exceptions import MessageCantBeEdited, MessageNotModified
 
 # анти-спам / занятость пользователя
 from ..middlewares.busy import BUSY_TEXT, clear_busy, is_busy, set_busy
@@ -29,537 +23,82 @@ from ..services import parser_adapter
 from ..services import referrals
 from ..services import validator  # валидация запроса
 from ..services import chips
-from ..services.mini_analytics import register_context, render_mini_analytics
+from ..services.mini_analytics import get_summary, register_context, render_mini_analytics
 from ..services import report_share
 from ..services import paywall
 from ..services.quota import FREE_PER_MONTH, QuotaDecision, check_quota, commit_usage
-from ..services.diagnostics import get_bundle_by_correlation, remember_bundle
-from app.services.deliver_diagnostics import (
-    DeliverDiagContext,
-    build_diag_bundle,
-    build_stack,
-)
 from app import keyboards
-from app.utils.admins import admin_ids, is_admin
-from app.utils.diag import make_diag_dir, save_text, zip_dir
+from app.utils.admins import is_admin
 from app.utils.logging import complete_operation, log_event, update_context
-from app.utils.errors import (
-    classify_error,
-    is_retryable,
-    message_for_code,
-    user_message_for_invalid_args,
-    user_message_for_no_data,
-)
-from app.utils.progress import Progress, ProgressStep
-from app.utils.report_sender import SendReportResult, send_report
-from app.utils.xlsx_diagnostics import collect_xlsx_diagnostics
+from app.utils.progress import ProgressMessage
 from app.utils.normalize import normalize_city, normalize_role
 
 # Кеш последнего «сомнительного» запроса: user_id -> (query, city, overrides)
 _WARN_CACHE: Dict[int, Tuple[str, str, dict]] = {}
 # Кеш шага выбора объёма: user_id -> (norm_title, city, area_id, overrides, max_total)
 _PENDING_QTY: Dict[int, Tuple[str, str, int, dict, int]] = {}
-# Активные задачи выгрузки: user_id -> asyncio.Task
-_ACTIVE_REPORT_JOBS: dict[int, asyncio.Task] = {}
 
-
-def _is_report_job_active(uid: int) -> bool:
-    task = _ACTIVE_REPORT_JOBS.get(uid)
-    return bool(task) and not task.done()
-
-
-def _register_report_job(uid: int, task: asyncio.Task) -> None:
-    _ACTIVE_REPORT_JOBS[uid] = task
-
-    def _cleanup(_task: asyncio.Task, *, user_id: int = uid) -> None:
-        existing = _ACTIVE_REPORT_JOBS.get(user_id)
-        if existing is _task:
-            _ACTIVE_REPORT_JOBS.pop(user_id, None)
-
-    task.add_done_callback(_cleanup)
-
-PROGRESS_STEPS = (
-    ProgressStep("fetch", "парсинг страниц hh…"),
-    ProgressStep("normalize", "нормализация…"),
-    ProgressStep("write_xlsx", "сбор XLSX…"),
+PROGRESS_STEPS_2 = (
+    "Шаг 1/2: собираю вакансии… {spinner}",
+    "Шаг 2/2: формирую Excel-отчёт… {spinner}",
 )
-PROGRESS_SUCCESS_TEXT = "Готово ✅"
-PROGRESS_FAILURE_PREFIX = "❌ Не получилось…"
-
-_DIAG_ENV_KEYS = [
-    "PYBIN",
-    "PARSER_PIPELINE",
-    "REPORT_DIR",
-    "AREA",
-    "PAGES",
-    "PER_PAGE",
-    "SITE",
-    "PAUSE",
-]
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-SEND_DIAG_BUNDLES = _env_bool("SEND_DIAG_BUNDLES", True)
-_DIAG_ENABLED = _env_bool("DIAG", False)
-_ADMIN_FORWARD_IDS = tuple(admin_ids())
-
-
-def _collect_diag_env() -> str:
-    lines = []
-    for key in _DIAG_ENV_KEYS:
-        value = os.getenv(key)
-        lines.append(f"{key}={value if value is not None else ''}")
-    return "\n".join(lines)
-
-
-def _extract_csv_path(stdout: str | None) -> Path | None:
-    if not stdout:
-        return None
-    for raw in stdout.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if payload.get("status") != "report" or payload.get("format") != "csv":
-            continue
-        csv_path = payload.get("path")
-        if not csv_path:
-            continue
-        try:
-            path = Path(csv_path)
-        except (TypeError, ValueError):
-            continue
-        if path.exists():
-            return path
-    return None
-
-
-def _extract_output_path_from_cmd(command: Sequence[str] | None) -> Path | None:
-    if not command:
-        return None
-    for idx, token in enumerate(command):
-        if token == "--output" and idx + 1 < len(command):
-            try:
-                return Path(command[idx + 1])
-            except (TypeError, ValueError):  # pragma: no cover - defensive
-                return None
-    return None
-
-
-def _make_unique_xlsx_path(path: Path) -> Path:
-    target = path
-    if not target.suffix:
-        target = target.with_suffix(".xlsx")
-    if not target.exists():
-        return target
-    stem = target.stem
-    suffix = target.suffix or ".xlsx"
-    parent = target.parent
-    for idx in range(1, 1000):  # pragma: no cover - deterministic upper bound
-        candidate = parent / f"{stem}_fallback{idx}{suffix}"
-        if not candidate.exists():
-            return candidate
-    return parent / f"{stem}_fallback{int(time.time())}{suffix}"
-
-
-def _convert_csv_to_xlsx(csv_path: Path, xlsx_path: Path) -> None:
-    import pandas as pd
-
-    df = pd.read_csv(csv_path)
-    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False)
-
-
-async def _recover_report_from_error(
-    error: parser_adapter.ParserRunError,
-    *,
-    query: str,
-    city: str,
-    user_id: int,
-) -> parser_adapter.RunReportResult | None:
-    csv_path = _extract_csv_path(getattr(error, "stdout", ""))
-    if not csv_path:
-        return None
-
-    expected_out = _extract_output_path_from_cmd(getattr(error, "cmd", None))
-    target_path = _make_unique_xlsx_path(expected_out or csv_path.with_suffix(".xlsx"))
-
-    try:
-        await asyncio.to_thread(_convert_csv_to_xlsx, csv_path, target_path)
-    except Exception as exc:  # pragma: no cover - recovery best effort
-        log_event(
-            "parse.fallback_failed",
-            level="ERROR",
-            err=str(exc),
-            stack=traceback.format_exc(),
-            user_id=user_id,
-            query=query,
-            city=city,
-            csv_path=str(csv_path),
-            target_path=str(target_path),
-        )
-        return None
-
-    log_event(
-        "parse.fallback_recovered",
-        level="WARN",
-        user_id=user_id,
-        query=query,
-        city=city,
-        csv_path=str(csv_path),
-        xlsx_path=str(target_path),
-    )
-
-    return parser_adapter.RunReportResult(
-        ok=True,
-        xlsx_path=target_path,
-        csv_path=csv_path,
-        duration_ms=0,
-        meta={
-            "fallback_recovery": True,
-            "command_line": " ".join(
-                str(part) for part in (getattr(error, "cmd", []) or [])
-            ),
-        },
-    )
-
-
-def _safe_document_name(path: Path) -> tuple[str, bool]:
-    original = path.name
-    cleaned = original.strip()
-    if not cleaned or cleaned in {".", ".."}:
-        return _fallback_name(path), False
-    if any(sep in cleaned for sep in ("/", "\\", "\n", "\r", "\t")):
-        return _fallback_name(path), False
-    if len(cleaned) > 120:
-        return _fallback_name(path), False
-    return cleaned, True
-
-
-def _fallback_name(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix == ".csv":
-        return "report.csv"
-    return "report.xlsx"
-
-
-def _extract_correlation_from_bundle(path: Path | None) -> str | None:
-    if not path:
-        return None
-    stem = path.stem
-    if stem.startswith("bundle_"):
-        remainder = stem[len("bundle_") :].strip()
-        return remainder or None
-    return None
-
-
-def _save_parser_diag(
-    user_id: int,
-    *,
-    exc: parser_adapter.ParserRunError,
-    query: str,
-    city: str,
-    area_id: int | None,
-    include: list[str] | None,
-    exclude: list[str] | None,
-    amount: int | None,
-    mode: str,
-    retries: int,
-    error_code: str | None,
-    progress_last_step: str | None,
-) -> Path:
-    diag_dir = make_diag_dir(user_id)
-    command_text = " ".join(str(part) for part in exc.cmd)
-    save_text(diag_dir, "command.txt", command_text)
-    save_text(diag_dir, "stdout.txt", exc.stdout or "")
-    save_text(diag_dir, "stderr.txt", exc.stderr or "")
-    save_text(diag_dir, "env.txt", _collect_diag_env())
-
-    meta = {
-        "query": query,
-        "city": city,
-        "area_id": area_id,
-        "include": include or [],
-        "exclude": exclude or [],
-        "amount": amount,
-        "mode": mode,
-        "error": repr(exc),
-        "returncode": exc.returncode,
-        "retries": retries,
-        "error_code": error_code,
-        "progress_last_step": progress_last_step,
-    }
-    save_text(diag_dir, "meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
-    try:
-        zip_dir(diag_dir)
-    except Exception:
-        pass
-
-    log_event("ERROR", "parse.diag_saved", dir=str(diag_dir))
-    return diag_dir
-
-
-def _format_failure_message(
-    *,
-    invalid_arguments: str | None,
-    diag_dir: Path | None,
-    user: types.User | None,
-    default_message: str,
-) -> str:
-    text = invalid_arguments or default_message
-    if diag_dir and user and is_admin(user.id):
-        text += f"\nДиагностика сохранена: {diag_dir.name}"
-    return text
-
-
-async def _send_diagnostic_bundle_if_needed(
-    bot: Bot,
-    *,
-    bundle_path: Path | None,
-    correlation: str | None,
-    user_chat_id: int | None,
-    user_id: int | None,
-) -> None:
-    if not SEND_DIAG_BUNDLES or not bundle_path or not bundle_path.exists():
-        return
-
-    caption = f"diag {correlation}" if correlation else "diagnostic bundle"
-    targets: list[tuple[int, str, str]] = []
-    seen: set[int] = set()
-
-    if user_chat_id is not None and user_chat_id not in seen:
-        targets.append((user_chat_id, caption, "user"))
-        seen.add(user_chat_id)
-
-    for admin_id in _ADMIN_FORWARD_IDS:
-        if admin_id in seen or admin_id == user_id:
-            continue
-        targets.append((admin_id, caption, "admin"))
-        seen.add(admin_id)
-
-    for chat_id, doc_caption, target in targets:
-        try:
-            await bot.send_document(chat_id, InputFile(bundle_path), caption=doc_caption)
-            log_event(
-                "diagnostic_bundle_sent",
-                action="auto_send",
-                target=target,
-                chat_id=chat_id,
-                correlation_id=correlation,
-            )
-        except Exception as exc:
-            log_event(
-                "diagnostic_bundle_send_failed",
-                level="WARN",
-                target=target,
-                chat_id=chat_id,
-                correlation_id=correlation,
-                err=str(exc),
-            )
-
-
-async def _dispatch_deliver_bundle(
-    bot: Bot,
-    *,
-    bundle_path: Path,
-    correlation_id: str | None,
-    user_chat_id: int | None,
-    user_id: int | None,
-) -> None:
-    if not bundle_path.exists():
-        return
-
-    caption = (
-        "⚠️ Ошибка доставки отчёта. Диагностика во вложении. Мы уже смотрим"
-    )
-    if correlation_id:
-        caption += f" (ID: {correlation_id})"
-    targets: list[tuple[int, str]] = []
-    delivered: set[int] = set()
-
-    if user_chat_id is not None:
-        targets.append((user_chat_id, "user"))
-        delivered.add(user_chat_id)
-
-    for admin_id in _ADMIN_FORWARD_IDS:
-        if admin_id == user_id or admin_id in delivered:
-            continue
-        targets.append((admin_id, "admin"))
-        delivered.add(admin_id)
-
-    for chat_id, target in targets:
-        try:
-            await bot.send_document(chat_id, InputFile(bundle_path), caption=caption)
-            event_name = (
-                "diagnostic_bundle_sent_user" if target == "user" else "diagnostic_bundle_sent_admin"
-            )
-            log_event(
-                event_name,
-                chat_id=chat_id,
-                correlation_id=correlation_id,
-                path=str(bundle_path),
-            )
-        except Exception as exc:
-            log_event(
-                "diagnostic_bundle_send_failed",
-                level="WARN",
-                target=target,
-                chat_id=chat_id,
-                correlation_id=correlation_id,
-                err=str(exc),
-            )
-
-
-def _update_ui_meta(
-    result: parser_adapter.RunReportResult | None,
-    *,
-    ack_sent: bool | None,
-    progress_strategy: str | None,
-    report_path: Path | None,
-    send_error: str | None = None,
-) -> None:
-    if not result or not result.meta:
-        return
-
-    ui_payload: dict[str, object] = {
-        "ack_sent": bool(ack_sent) if ack_sent is not None else False,
-        "progress_strategy": progress_strategy or "edit",
-        "report_path": str(report_path) if report_path else None,
-    }
-    if send_error:
-        ui_payload["send_error"] = send_error
-
-    result.meta["ui"] = {k: v for k, v in ui_payload.items() if v is not None}
-
-    bundle_path = getattr(result, "bundle_path", None)
-    if not bundle_path:
-        return
-    bundle_dir = bundle_path.with_suffix("")
-    meta_path = bundle_dir / "meta.json"
-    if not meta_path.exists():
-        return
-    try:
-        try:
-            meta_data = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
-            meta_data = {}
-        meta_data["ui"] = result.meta["ui"]
-        meta_path.write_text(
-            json.dumps(meta_data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        shutil.make_archive(str(bundle_dir), "zip", root_dir=bundle_dir, base_dir=".")
-    except Exception as exc:  # pragma: no cover - diagnostics best effort
-        log_event(
-            "diagnostic_meta_update_failed",
-            level="WARN",
-            bundle=str(bundle_path),
-            err=str(exc),
-        )
-
-
-async def _cleanup_inline_message(message: types.Message) -> None:
-    try:
-        await message.edit_reply_markup(reply_markup=None)
-    except MessageNotModified:
-        pass
-    except (MessageCantBeEdited, BadRequest) as exc:
-        log_event(
-            "ui.cleanup_failed",
-            level="WARN",
-            err=str(exc),
-            reason="remove_inline_markup",
-        )
-    except Exception as exc:  # pragma: no cover - UI cleanup best effort
-        log_event(
-            "ui.cleanup_failed",
-            level="WARN",
-            err=str(exc),
-            reason="remove_inline_markup",
-        )
+PROGRESS_STEPS_3 = (
+    "Шаг 1/3: собираю вакансии… {spinner}",
+    "Шаг 2/3: фильтрую по ключевым словам… {spinner}",
+    "Шаг 3/3: формирую Excel-отчёт… {spinner}",
+)
+PREVIEW_TEMPLATE = "Готовлю превью (5 вакансий)… {spinner}"
+DONE_TEXT = "Готово ✅"
+FAIL_TEXT = "❌ Не получилось (ошибка/таймаут). Попробуй позже."
 
 
 class ReportProgressTracker:
-    def __init__(self, progress: Progress, *, has_filter: bool):
+    def __init__(self, progress: ProgressMessage, steps: tuple[str, ...]):
         self._progress = progress
-        self._has_filter = has_filter
+        self._steps = steps
+        self._current = 0
+        self._finished = False
 
     @property
-    def progress(self) -> Progress:
-        return self._progress
-
-    @property
-    def ui_strategy(self) -> str:
-        return self._progress.ui_strategy
-
-    @property
-    def last_percent(self) -> int | None:
-        return getattr(self._progress, "last_percent", None)
-
-    async def mark_command_ready(self) -> None:
-        await self._progress.set("fetch", 10, force=True)
-
-    async def mark_process_started(self) -> None:
-        await self._progress.set("fetch", 30, force=True)
+    def has_filter(self) -> bool:
+        return len(self._steps) == len(PROGRESS_STEPS_3)
 
     async def handle_event(self, kind: str, payload: dict) -> None:
+        if self._finished:
+            return
         if kind == "status":
-            status = str(payload.get("status") or "").lower()
-            if status == "page":
-                extra = self._page_hint(payload)
-                await self._progress.set("fetch", 30, extra_text=extra)
-            elif status == "csv":
-                extra = self._page_hint(payload)
-                await self._progress.set("normalize", 60, extra_text=extra)
-            elif status == "report" and str(payload.get("format") or "").lower() == "xlsx":
-                await self._progress.set("write_xlsx", 90)
-        elif kind == "filter_start" and self._has_filter:
-            await self._progress.set("normalize", 60)
+            status = payload.get("status")
+            if status == "csv":
+                await self._set_step(1 if len(self._steps) > 1 else 0)
+            elif status == "report" and payload.get("format") == "xlsx":
+                if not self.has_filter and len(self._steps) > 1:
+                    await self._set_step(len(self._steps) - 1)
+        elif kind == "filter_start":
+            if self.has_filter:
+                await self._set_step(1)
+        elif kind == "filter_done":
+            if self.has_filter:
+                await self._set_step(2)
 
-    async def finish_success(self, *, delete_after: float | None = 8.0) -> None:
-        await self._progress.close(ok=True, text=PROGRESS_SUCCESS_TEXT, delete_after=delete_after)
+    async def _set_step(self, index: int) -> None:
+        if index < 0 or index >= len(self._steps):
+            return
+        if index == self._current:
+            return
+        self._current = index
+        await self._progress.update_template(self._steps[index])
 
-    async def fail(self, message: str) -> None:
-        await self._progress.close(ok=False, text=message)
+    async def finish_success(self, *, delete_after: float | None = 45.0) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        await self._progress.finish(DONE_TEXT, delete_after=delete_after)
 
-    async def show_retry(self, attempt: int, total: int) -> None:
-        await self._progress.show_retry(attempt, total)
-
-    async def clear_retry(self) -> None:
-        await self._progress.clear_retry()
-
-    def _page_hint(self, payload: dict) -> str | None:
-        page = payload.get("page")
-        total = payload.get("pages")
-        if page is None:
-            page = payload.get("current")
-        if total is None:
-            total = payload.get("total")
-        if page is None:
-            page = payload.get("current_page")
-        if total is None:
-            total = payload.get("total_pages")
-        try:
-            page_int = int(page)
-            total_int = int(total)
-        except (TypeError, ValueError):
-            return None
-        if total_int <= 0:
-            return None
-        if page_int < 1:
-            page_int += 1
-        page_int = max(1, min(page_int, total_int))
-        return f"страница {page_int}/{total_int}"
+    async def fail(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        await self._progress.fail(FAIL_TEXT)
 
 
 async def _start_report_progress(
@@ -567,14 +106,9 @@ async def _start_report_progress(
     include: list[str] | None = None,
     exclude: list[str] | None = None,
 ) -> ReportProgressTracker:
-    progress = await Progress.create(
-        message.bot,
-        message.chat.id,
-        PROGRESS_STEPS,
-        mode="report",
-        initial_step=PROGRESS_STEPS[0].name,
-    )
-    return ReportProgressTracker(progress, has_filter=bool(include or exclude))
+    steps = PROGRESS_STEPS_3 if (include or exclude) else PROGRESS_STEPS_2
+    progress = await ProgressMessage.create(message.bot, message.chat.id, steps[0])
+    return ReportProgressTracker(progress, steps)
 
 
 def _is_timeout_error(exc: BaseException) -> bool:
@@ -726,9 +260,6 @@ def _ensure_str_list(values) -> list[str]:
     return result
 
 
-_REPORT_OVERRIDE_KEYS = {"pages", "per_page", "pause", "site", "area"}
-
-
 def _build_args(
     title: str | None,
     city: str | None,
@@ -852,20 +383,12 @@ def _log_parse_start(title: str, city: str, overrides: dict | None = None, *, ap
 def _log_parse_ready(title: str, city: str, overrides: dict | None = None, *, approx_total: int | None = None) -> None:
     args = _build_args(title, city, overrides, qty=approx_total)
     update_context(args=args)
-    log_event(
-        "report_ready",
-        message=f"report_ready title='{title}' city='{city}'",
-        args=args,
-    )
+    log_event("parse_ready", message=f"parse_ready title='{title}' city='{city}'", args=args)
 
 
 def _log_preview_start(title: str, city: str, overrides: dict | None = None) -> None:
     args = _build_args(title, city, overrides)
-    log_event(
-        "preview_requested",
-        message=f"preview_requested title='{title}' city='{city}'",
-        args=args,
-    )
+    log_event("preview_start", message=f"preview_start title='{title}' city='{city}'", args=args)
 
 
 def _log_preview_ready(title: str, city: str, rows: int, overrides: dict | None = None) -> None:
@@ -888,69 +411,6 @@ def _log_preview_timeout(title: str, city: str, overrides: dict | None = None, e
     )
 
 
-def _error_message_for_result(result: parser_adapter.RunReportResult) -> str:
-    if not result:
-        return message_for_code("UNKNOWN")
-    code = result.err_code or ""
-    if code == "E_TIMEOUT":
-        return result.user_message or message_for_code("TIMEOUT")
-    if code == "E_NONZERO_RC":
-        return result.user_message or message_for_code("PIPELINE_ERROR")
-    if code == "E_NO_FILE":
-        return "Файл отчёта не сформировался. Попробуй ещё раз."
-    if code == "E_BAD_ARGS":
-        return result.user_message or user_message_for_invalid_args()
-    return result.user_message or message_for_code("UNKNOWN")
-
-
-def _remember_bundle_for_chat(
-    message: types.Message,
-    result: parser_adapter.RunReportResult,
-) -> str | None:
-    if not result.bundle_path or not result.meta:
-        return None
-    correlation = str(result.meta.get("correlation_id") or "").strip()
-    chat_id = getattr(message.chat, "id", None)
-    if not correlation or chat_id is None:
-        return None
-    remember_bundle(chat_id=chat_id, correlation_id=correlation, bundle_path=result.bundle_path)
-    return correlation
-
-
-async def _send_failure_response(
-    message: types.Message,
-    result: parser_adapter.RunReportResult,
-    *,
-    user: types.User | None = None,
-    tracker: ReportProgressTracker | None = None,
-) -> None:
-    text = _error_message_for_result(result)
-    if tracker:
-        await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {text}")
-
-    correlation = _remember_bundle_for_chat(message, result)
-    menu_markup = _main_menu_kb(message, user=user)
-    user_id = getattr(user, "id", None)
-    if is_admin(user_id) and result.bundle_path and correlation:
-        kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(InlineKeyboardButton("📎 Логи (zip)", callback_data=f"diag_bundle:{correlation}"))
-        await message.answer(text, reply_markup=kb)
-        await message.answer("Главное меню:", reply_markup=menu_markup)
-    else:
-        await message.answer(text, reply_markup=menu_markup)
-
-    chat_id = getattr(message.chat, "id", None)
-    await _send_diagnostic_bundle_if_needed(
-        message.bot,
-        bundle_path=result.bundle_path if result else None,
-        correlation=correlation,
-        user_chat_id=chat_id,
-        user_id=user_id,
-    )
-
-    complete_operation(ok=False, err=result.err_code or result.err_message)
-
-
 async def _send_report_with_analytics(
     message: types.Message,
     path,
@@ -961,23 +421,10 @@ async def _send_report_with_analytics(
     include=None,
     exclude=None,
     reply_markup=None,
-    diagnostic_path: Path | None = None,
-    diagnostic_caption: str | None = None,
-    file_name_override: str | None = None,
-) -> SendReportResult:
+) -> None:
     register_context(path, title=title, city=city)
-    send_result = await send_report(
-        message.bot,
-        message.chat.id,
-        path,
-        reply_markup=None,
-        diagnostic_path=diagnostic_path,
-        diagnostic_caption=diagnostic_caption,
-        file_name=file_name_override,
-    )
-    if not send_result.ok:
-        return send_result
-
+    share_kb = _report_actions_keyboard()
+    await message.answer_document(InputFile(path), reply_markup=share_kb)
     person = getattr(message, "from_user", None)
     if person:
         chips.record_success(person.id, title, city)
@@ -1005,25 +452,16 @@ async def _send_report_with_analytics(
             top_companies=getattr(summary, "top_companies", None),
         )
     if text:
-        await message.answer(
-            text,
-            disable_web_page_preview=True,
-            reply_markup=_report_actions_keyboard(),
-        )
-    else:
-        await message.answer("Готово ✅", reply_markup=_report_actions_keyboard())
-
-    if reply_markup is not None:
-        await message.answer("Главное меню:", reply_markup=reply_markup)
+        await message.answer(text, disable_web_page_preview=True, reply_markup=reply_markup)
+    elif reply_markup is not None:
+        await message.answer("Готово ✅", reply_markup=reply_markup)
     activation = referrals.handle_activation_trigger(message.from_user.id, "report")
     if activation and activation.inviter_id:
         mention = _format_user_mention(message.from_user)
         if activation.granted and activation.bonus:
             notify_text = f"🔥 Реферал {mention} активирован — +{activation.bonus} кредит начислен!"
         else:
-            notify_text = (
-                f"Реферал {mention} активировал триггер, но бонус не начислен (достигнут лимит)."
-            )
+            notify_text = f"Реферал {mention} активировал триггер, но бонус не начислен (достигнут лимит)."
         try:
             await message.bot.send_message(activation.inviter_id, notify_text)
         except Exception as exc:  # pragma: no cover
@@ -1033,7 +471,6 @@ async def _send_report_with_analytics(
                 inviter_id=activation.inviter_id,
                 err=str(exc),
             )
-    return send_result
 
 
 async def cb_report_share(call: types.CallbackQuery):
@@ -1079,28 +516,6 @@ async def cb_report_menu(call: types.CallbackQuery):
     await call.message.answer("Главное меню:", reply_markup=kb)
 
 
-async def cb_diag_bundle(call: types.CallbackQuery):
-    if not is_admin(call.from_user.id):
-        await call.answer("Нет доступа", show_alert=True)
-        return
-    if not call.data:
-        await call.answer("Некорректный запрос", show_alert=True)
-        return
-    try:
-        _, correlation = call.data.split(":", 1)
-    except ValueError:
-        await call.answer("Некорректный запрос", show_alert=True)
-        return
-    bundle = get_bundle_by_correlation(correlation)
-    if not bundle or not bundle.exists():
-        await call.answer("Бандл не найден", show_alert=True)
-        return
-
-    await call.answer()
-    log_event("diagnostic_bundle_sent", action="send_bundle", correlation_id=correlation)
-    await call.message.answer_document(InputFile(bundle), caption=f"diag {correlation}")
-
-
 async def _run_parser_bypass_validation(
     message: types.Message,
     query: str,
@@ -1113,11 +528,6 @@ async def _run_parser_bypass_validation(
     """Запуск парсера без доп. проверок (по кнопке «Всё равно искать»)."""
     uid = _resolve_requester_id(message, uid)
     if not set_busy(uid):
-        if tracker:
-            try:
-                await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Уже выполняю другой запрос")
-            except Exception:
-                pass
         await message.answer(BUSY_TEXT)
         return
     snapshot = paywall.SavedRequest(
@@ -1128,12 +538,7 @@ async def _run_parser_bypass_validation(
     )
     tracker: ReportProgressTracker | None = None
     decision: QuotaDecision | None = None
-    result: parser_adapter.RunReportResult | None = None
-    diag_dir: Path | None = None
-    include_list: list[str] = []
-    exclude_list: list[str] = []
-    retries_done = 0
-    backoffs = (2, 6)
+    result: parser_adapter.ReportResult | None = None
     try:
         decision = await _ensure_quota(
             message,
@@ -1147,382 +552,53 @@ async def _run_parser_bypass_validation(
         include_list = _ensure_str_list(overrides.get("include"))
         exclude_list = _ensure_str_list(overrides.get("exclude"))
         tracker = await _start_report_progress(message, include_list, exclude_list)
-        await tracker.mark_command_ready()
         _log_parse_start(query, city, overrides)
-        log_event(
-            "INFO",
-            "parse.start",
-            user_id=uid,
-            mode="report",
-            query=query,
-            city=city,
-            overrides=overrides,
-        )
 
         async def _progress(kind: str, payload: dict) -> None:
             if tracker:
                 await tracker.handle_event(kind, payload)
 
-        allowed_kwargs = {k: v for k, v in overrides.items() if k in _REPORT_OVERRIDE_KEYS}
-        extra_keys = sorted(
-            k for k in overrides.keys() if k not in _REPORT_OVERRIDE_KEYS | {"include", "exclude"}
+        result = await parser_adapter.run_report(
+            uid,
+            query,
+            city,
+            role=query,
+            include=include_list,
+            exclude=exclude_list,
+            progress=_progress,
+            **{k: v for k, v in overrides.items() if k not in {"include", "exclude"}},
         )
-        if extra_keys:
-            dropped_flags = [f"--{key.replace('_', '-')}" for key in extra_keys]
-            log_event(
-                "parser_cli_args_dropped",
-                level="WARN",
-                dropped_flags=dropped_flags,
-                query=query,
-                city=city,
-                user_id=uid,
-            )
-
-        while True:
-            try:
-                if tracker:
-                    if retries_done > 0:
-                        await tracker.clear_retry()
-                        await tracker.mark_command_ready()
-                    await tracker.mark_process_started()
-                result = await parser_adapter.run_report(
-                    uid,
-                    query,
-                    city,
-                    role=query,
-                    include=include_list,
-                    exclude=exclude_list,
-                    progress=_progress,
-                    **allowed_kwargs,
-                )
-                break
-            except parser_adapter.ParserRunError as exc:
-                fallback_result = await _recover_report_from_error(
-                    exc,
-                    query=title,
-                    city=city,
-                    user_id=uid,
-                )
-                if fallback_result:
-                    result = fallback_result
-                    if tracker_obj:
-                        await tracker_obj.clear_retry()
-                        await tracker_obj.mark_command_ready()
-                    log_event(
-                        "parse.fallback_used",
-                        level="WARN",
-                        user_id=uid,
-                        query=title,
-                        city=city,
-                        amount=total,
-                        xlsx_path=str(fallback_result.xlsx_path)
-                        if fallback_result.xlsx_path
-                        else None,
-                    )
-                    break
-                error_info = classify_error(exc, exc.stdout, exc.stderr)
-                log_event(
-                    "ERROR",
-                    "parse.error",
-                    user_id=uid,
-                    mode="report",
-                    query=query,
-                    city=city,
-                    error_code=error_info.code,
-                    hint=error_info.hint_for_log,
-                    attempt=retries_done + 1,
-                )
-                if is_retryable(error_info.code) and retries_done < len(backoffs):
-                    retries_done += 1
-                    if tracker:
-                        await tracker.show_retry(retries_done, len(backoffs))
-                    await asyncio.sleep(backoffs[retries_done - 1])
-                    continue
-
-                progress_last_step = tracker.progress.last_step if tracker else None
-                if tracker:
-                    await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}")
-                diag_dir = _save_parser_diag(
-                    uid,
-                    exc=exc,
-                    query=query,
-                    city=city,
-                    area_id=overrides.get("area") if isinstance(overrides.get("area"), int) else None,
-                    include=include_list,
-                    exclude=exclude_list,
-                    amount=None,
-                    mode="report",
-                    retries=retries_done,
-                    error_code=error_info.code,
-                    progress_last_step=progress_last_step,
-                )
-                failure_text = _format_failure_message(
-                    invalid_arguments=None,
-                    diag_dir=diag_dir,
-                    user=user,
-                    default_message=error_info.message_for_user,
-                )
-                await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
-                await _send_diagnostic_bundle_if_needed(
-                    message.bot,
-                    bundle_path=diag_dir.with_suffix(".zip") if diag_dir else None,
-                    correlation=None,
-                    user_chat_id=getattr(message.chat, "id", None),
-                    user_id=getattr(user, "id", None),
-                )
-                complete_operation(ok=False, err=error_info.code.lower())
-                return
     except Exception as e:  # pragma: no cover
-        error_info = classify_error(e, getattr(e, "stdout", ""), getattr(e, "stderr", ""))
-        log_event(
-            "ERROR",
-            "parse.error",
-            user_id=uid,
-            mode="report",
-            query=query,
-            city=city,
-            error_code=error_info.code,
-            hint=error_info.hint_for_log,
-        )
         if tracker:
-            await tracker.fail(
-                f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}"
-            )
-        failure_text = _format_failure_message(
-            invalid_arguments=None,
-            diag_dir=diag_dir,
-            user=user,
-            default_message=error_info.message_for_user,
-        )
-        await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
-        complete_operation(ok=False, err=error_info.code.lower())
+            await tracker.fail()
+        event = "parse_timeout" if _is_timeout_error(e) else "parse_error"
+        err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
+        log_event(event, level="ERROR", err=err_text)
+        await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
+        complete_operation(ok=False, err=err_text)
         return
     else:
-        if not result or not result.ok or not (result.xlsx_path and result.xlsx_path.exists()):
-            await _send_failure_response(message, result, user=user, tracker=tracker)
-        else:
+        path = result.xlsx_path if result else None
+        if path and path.exists():
             await _finalize_quota_usage(message, uid, decision)
             _log_parse_ready(query, city, overrides)
-            log_event(
-                "INFO",
-                "parse.ok",
-                user_id=uid,
-                mode="report",
-                query=query,
+            await _send_report_with_analytics(
+                message,
+                path,
+                title=query,
                 city=city,
-                path=str(result.xlsx_path),
-                duration_ms=result.duration_ms if result else None,
+                include=overrides.get("include"),
+                exclude=overrides.get("exclude"),
+                reply_markup=_main_menu_kb(message, user=user),
             )
-            correlation = None
-            if result and result.meta:
-                correlation = str(result.meta.get("correlation_id") or "").strip() or None
-            report_path = Path(result.xlsx_path)
-            chat_id = getattr(message.chat, "id", None)
-            user_id = getattr(user, "id", None)
-            report_size: int | None = None
-            send_error_message: str | None = None
-            ack_sent = False
-            deliver_status = "fail"
-            safe_name, name_ok = _safe_document_name(report_path)
-            progress_strategy = tracker.ui_strategy if tracker else "edit"
-            diag_snapshot = collect_xlsx_diagnostics(report_path)
-            diag_payload = diag_snapshot.to_event_payload()
-            if diag_snapshot.size_bytes is not None:
-                report_size = diag_snapshot.size_bytes
-            send_result: SendReportResult | None = None
-
-            try:
-                started_payload = {
-                    "correlation_id": correlation,
-                    "chat_id": chat_id,
-                    "path": str(report_path),
-                    "file_name": safe_name if safe_name else report_path.name,
-                }
-                if report_size is not None:
-                    started_payload["size_bytes"] = report_size
-                started_payload["diagnostics"] = diag_payload
-                if _DIAG_ENABLED:
-                    started_payload["cmd_line"] = (result.meta or {}).get("command_line") if result else None
-                    started_payload["progress_last_percent"] = (
-                        tracker.last_percent if tracker else None
-                    )
-                log_event(
-                    "deliver.started",
-                    **{k: v for k, v in started_payload.items() if v is not None},
-                )
-
-                if not report_path.exists():
-                    raise FileNotFoundError("report_file_missing")
-
-                if report_size is None:
-                    report_size = report_path.stat().st_size
-                    diag_snapshot = collect_xlsx_diagnostics(report_path)
-                    diag_payload = diag_snapshot.to_event_payload()
-                    if diag_snapshot.size_bytes is not None:
-                        report_size = diag_snapshot.size_bytes
-
-                if report_size <= 0:
-                    raise ValueError("report_file_empty")
-
-                if not name_ok:
-                    log_event(
-                        "deliver.file_name_adjusted",
-                        correlation_id=correlation,
-                        chat_id=chat_id,
-                        original=report_path.name,
-                        new=safe_name,
-                    )
-
-                diagnostic_path = result.bundle_path if SEND_DIAG_BUNDLES else None
-                diagnostic_caption = f"diag {correlation}" if correlation else "diagnostic bundle"
-
-                send_result = await _send_report_with_analytics(
-                    message,
-                    result.xlsx_path,
-                    title=query,
-                    city=city,
-                    include=overrides.get("include"),
-                    exclude=overrides.get("exclude"),
-                    reply_markup=_main_menu_kb(message, user=user),
-                    diagnostic_path=diagnostic_path,
-                    diagnostic_caption=diagnostic_caption if diagnostic_path else None,
-                    file_name_override=safe_name,
-                )
-                ack_sent = True
-                send_error_message = send_result.error_message
-                if send_result.size is not None:
-                    report_size = send_result.size
-                if send_result.diagnostics:
-                    diag_snapshot = send_result.diagnostics
-                    diag_payload = diag_snapshot.to_event_payload()
-
-                if not send_result.ok:
-                    log_event(
-                        "deliver.send_report_failed",
-                        level="ERROR",
-                        correlation_id=correlation,
-                        chat_id=chat_id,
-                        path=str(report_path),
-                        size_bytes=send_result.size,
-                        error_type=type(send_result.error).__name__
-                        if send_result.error
-                        else None,
-                        error_message=send_result.error_message,
-                        diagnostics=diag_payload,
-                    )
-                    raise RuntimeError(send_result.error_message or "send_report_failed")
-
-                await _cleanup_inline_message(message)
-                if tracker:
-                    await tracker.finish_success()
-                complete_operation(ok=True)
-                deliver_status = "ok"
-            except Exception as exc:
-                deliver_status = "fail"
-                if send_result and send_result.diagnostics:
-                    diag_snapshot = send_result.diagnostics
-                else:
-                    diag_snapshot = collect_xlsx_diagnostics(report_path)
-                diag_payload = diag_snapshot.to_event_payload()
-                stack_full = build_stack(exc)
-                stack_lines = [line for line in stack_full.strip().splitlines() if line.strip()]
-                stack_short = stack_lines[-1] if stack_lines else type(exc).__name__
-                fail_payload = {
-                    "correlation_id": correlation,
-                    "chat_id": chat_id,
-                    "path": str(report_path),
-                    "size_bytes": report_size,
-                    "exception_type": type(exc).__name__,
-                    "message": str(exc),
-                    "stack_short": stack_short,
-                    "diagnostics": diag_payload,
-                }
-                if _DIAG_ENABLED:
-                    fail_payload["cmd_line"] = (result.meta or {}).get("command_line") if result else None
-                    fail_payload["progress_last_percent"] = (
-                        tracker.last_percent if tracker else None
-                    )
-                log_event(
-                    "deliver.fail",
-                    level="ERROR",
-                    **{k: v for k, v in fail_payload.items() if v is not None},
-                )
-
-                if send_error_message is None:
-                    send_error_message = str(exc)
-
-                if tracker:
-                    await tracker.fail(
-                        f"{PROGRESS_FAILURE_PREFIX} Ошибка доставки файла"
-                    )
-
-                failure_text = "Не получилось… прикладываю диагностику, команда уже уведомлена"
-                await message.answer(
-                    failure_text,
-                    reply_markup=_main_menu_kb(message, user=user),
-                )
-
-                bundle_path: Path | None = None
-                bundle_correlation: str | None = None
-                try:
-                    context = DeliverDiagContext(
-                        user_id=user_id,
-                        username=getattr(user, "username", None),
-                        chat_id=chat_id,
-                        exception_type=type(exc).__name__,
-                        exception_message=str(exc),
-                        stack=stack_full,
-                        xlsx_path=report_path,
-                        xlsx_size=report_size,
-                        csv_path=result.csv_path if result else None,
-                        stdout_path=result.stdout_path if result else None,
-                        stderr_path=result.stderr_path if result else None,
-                        cmd_line=(result.meta or {}).get("command_line") if result else None,
-                        progress_last_percent=tracker.last_percent if tracker else None,
-                        xlsx_diagnostics=diag_payload,
-                    )
-                    bundle_path = build_diag_bundle(correlation, context)
-                    bundle_correlation = _extract_correlation_from_bundle(bundle_path) or correlation
-                    remember_bundle(
-                        chat_id=chat_id,
-                        correlation_id=bundle_correlation,
-                        bundle_path=bundle_path,
-                    )
-                    if bundle_correlation:
-                        correlation = bundle_correlation
-                except Exception as bundle_exc:
-                    log_event(
-                        "diagnostic_bundle_failed",
-                        level="ERROR",
-                        correlation_id=correlation,
-                        path=str(report_path),
-                        err=str(bundle_exc),
-                    )
-                else:
-                    await _dispatch_deliver_bundle(
-                        message.bot,
-                        bundle_path=bundle_path,
-                        correlation_id=bundle_correlation or correlation,
-                        user_chat_id=chat_id,
-                        user_id=user_id,
-                    )
-
-                complete_operation(ok=False, err="send_report_failed")
-            finally:
-                _update_ui_meta(
-                    result,
-                    ack_sent=ack_sent,
-                    progress_strategy=progress_strategy,
-                    report_path=result.xlsx_path,
-                    send_error=send_error_message,
-                )
-                log_event(
-                    "deliver.done",
-                    correlation_id=correlation,
-                    status="ok" if deliver_status == "ok" else "fail",
-                    chat_id=chat_id,
-                    diagnostics=diag_payload,
-                )
+            if tracker:
+                await tracker.finish_success()
+        else:
+            if tracker:
+                await tracker.fail()
+            await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
+            log_event("parse_error", level="ERROR", err="report_missing")
+            complete_operation(ok=False, err="report_missing")
     finally:
         clear_busy(uid)
 
@@ -1537,17 +613,10 @@ async def _run_with_amount(
     *,
     uid: int | None = None,
     user: types.User | None = None,
-    ui_ack_sent: bool | None = None,
-    tracker: ReportProgressTracker | None = None,
 ):
     """Считает pages/per_page под нужный объём total и запускает парсер с блокировкой пользователя."""
     uid = _resolve_requester_id(message, uid)
     if not set_busy(uid):
-        if tracker:
-            try:
-                await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Уже выполняю другой запрос")
-            except Exception:
-                pass
         await message.answer(BUSY_TEXT)
         return
 
@@ -1561,6 +630,7 @@ async def _run_with_amount(
 
     # ⚡ быстрый режим для больших объёмов
     if total > 200:
+        ov.setdefault("site", "hh")
         ov.setdefault("pause", 0.3)
         timeout = int(os.getenv("PARSER_TIMEOUT_LARGE", "1200"))
     else:
@@ -1576,13 +646,8 @@ async def _run_with_amount(
         approx_total=total,
     )
     decision: QuotaDecision | None = None
-    tracker_obj: ReportProgressTracker | None = tracker
-    result: parser_adapter.RunReportResult | None = None
-    diag_dir: Path | None = None
-    include_list: list[str] = []
-    exclude_list: list[str] = []
-    retries_done = 0
-    backoffs = (2, 6)
+    tracker: ReportProgressTracker | None = None
+    result: parser_adapter.ReportResult | None = None
 
     try:
         decision = await _ensure_quota(
@@ -1593,288 +658,62 @@ async def _run_with_amount(
             reason="parse_amount",
         )
         if not decision:
-            if tracker_obj:
-                try:
-                    await tracker_obj.fail(f"{PROGRESS_FAILURE_PREFIX} Недостаточно лимитов")
-                except Exception:
-                    pass
             return
 
         include_list = _ensure_str_list(ov.get("include"))
         exclude_list = _ensure_str_list(ov.get("exclude"))
-        if tracker_obj is None:
-            tracker_obj = await _start_report_progress(message, include_list, exclude_list)
-        await tracker_obj.mark_command_ready()
+        tracker = await _start_report_progress(message, include_list, exclude_list)
         _log_parse_start(title, city, ov, approx_total=total)
-        log_event(
-            "INFO",
-            "parse.start",
-            user_id=uid,
-            mode="report",
-            query=title,
-            city=city,
-            amount=total,
-        )
-        log_event(
-            "parse.started",
-            user_id=uid,
-            query=title,
-            city=city,
-            amount=total,
-            overrides=ov,
-        )
 
         async def _progress(kind: str, payload: dict) -> None:
-            if tracker_obj:
-                await tracker_obj.handle_event(kind, payload)
+            if tracker:
+                await tracker.handle_event(kind, payload)
 
         run_kwargs = {k: v for k, v in ov.items() if k not in {"include", "exclude"}}
-        while True:
-            try:
-                if tracker_obj:
-                    if retries_done > 0:
-                        await tracker_obj.clear_retry()
-                        await tracker_obj.mark_command_ready()
-                    await tracker_obj.mark_process_started()
-                result = await parser_adapter.run_report(
-                    uid,
-                    title,
-                    city,
-                    role=title,
-                    timeout=timeout,
-                    include=include_list,
-                    exclude=exclude_list,
-                    progress=_progress,
-                    **run_kwargs,
-                )
-                log_event(
-                    "parse.finished",
-                    user_id=uid,
-                    ok=result.ok if result else False,
-                    duration_ms=result.duration_ms if result else None,
-                    cmd_line=(result.meta or {}).get("command_line") if result else None,
-                    rows=(result.meta or {}).get("result", {}).get("rows") if result else None,
-                    xlsx_path=str(result.xlsx_path) if result and result.xlsx_path else None,
-                )
-                break
-            except parser_adapter.ParserRunError as exc:
-                fallback_result = await _recover_report_from_error(
-                    exc,
-                    query=title,
-                    city=city,
-                    user_id=uid,
-                )
-                if fallback_result:
-                    result = fallback_result
-                    if tracker_obj:
-                        await tracker_obj.clear_retry()
-                        await tracker_obj.mark_command_ready()
-                    log_event(
-                        "parse.fallback_used",
-                        level="WARN",
-                        user_id=uid,
-                        query=title,
-                        city=city,
-                        amount=total,
-                        xlsx_path=str(fallback_result.xlsx_path)
-                        if fallback_result.xlsx_path
-                        else None,
-                    )
-                    break
-                error_info = classify_error(exc, exc.stdout, exc.stderr)
-                log_event(
-                    "ERROR",
-                    "parse.error",
-                    user_id=uid,
-                    mode="report",
-                    query=title,
-                    city=city,
-                    amount=total,
-                    error_code=error_info.code,
-                    hint=error_info.hint_for_log,
-                    attempt=retries_done + 1,
-                )
-                if is_retryable(error_info.code) and retries_done < len(backoffs):
-                    retries_done += 1
-                    if tracker_obj:
-                        await tracker_obj.show_retry(retries_done, len(backoffs))
-                    await asyncio.sleep(backoffs[retries_done - 1])
-                    continue
-
-                progress_last_step = (
-                    tracker_obj.progress.last_step if tracker_obj else None
-                )
-                if tracker_obj:
-                    await tracker_obj.fail(
-                        f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}"
-                    )
-                diag_dir = _save_parser_diag(
-                    uid,
-                    exc=exc,
-                    query=title,
-                    city=city,
-                    area_id=area_id,
-                    include=include_list,
-                    exclude=exclude_list,
-                    amount=total,
-                    mode="report",
-                    retries=retries_done,
-                    error_code=error_info.code,
-                    progress_last_step=progress_last_step,
-                )
-                failure_text = _format_failure_message(
-                    invalid_arguments=None,
-                    diag_dir=diag_dir,
-                    user=user,
-                    default_message=error_info.message_for_user,
-                )
-                await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
-                await _send_diagnostic_bundle_if_needed(
-                    message.bot,
-                    bundle_path=diag_dir.with_suffix(".zip") if diag_dir else None,
-                    correlation=None,
-                    user_chat_id=getattr(message.chat, "id", None),
-                    user_id=getattr(user, "id", None),
-                )
-                log_event(
-                    "parse.finished",
-                    user_id=uid,
-                    ok=False,
-                    duration_ms=None,
-                    cmd_line=" ".join(str(part) for part in getattr(exc, "cmd", []) or []).strip() or None,
-                    rows=None,
-                    xlsx_path=None,
-                )
-                complete_operation(ok=False, err=error_info.code.lower())
-                return
+        result = await parser_adapter.run_report(
+            uid,
+            title,
+            city,
+            role=title,
+            timeout=timeout,
+            include=include_list,
+            exclude=exclude_list,
+            progress=_progress,
+            **run_kwargs,
+        )
     except Exception as e:
-        error_info = classify_error(e, getattr(e, "stdout", ""), getattr(e, "stderr", ""))
-        log_event(
-            "ERROR",
-            "parse.error",
-            user_id=uid,
-            mode="report",
-            query=title,
-            city=city,
-            amount=total,
-            error_code=error_info.code,
-            hint=error_info.hint_for_log,
-        )
-        if tracker_obj:
-            await tracker_obj.fail(
-                f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}"
-            )
-        failure_text = _format_failure_message(
-            invalid_arguments=None,
-            diag_dir=None,
-            user=user,
-            default_message=error_info.message_for_user,
-        )
-        await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
-        log_event(
-            "parse.finished",
-            user_id=uid,
-            ok=False,
-            duration_ms=None,
-            cmd_line=" ".join(str(part) for part in getattr(e, "cmd", []) or []).strip() or None,
-            rows=None,
-            xlsx_path=None,
-        )
-        complete_operation(ok=False, err=error_info.code.lower())
+        if tracker:
+            await tracker.fail()
+        err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
+        event = "parse_timeout" if _is_timeout_error(e) else "parse_error"
+        log_event(event, level="ERROR", err=err_text)
+        await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
+        complete_operation(ok=False, err=err_text)
         return
     else:
-        if not result or not result.ok or not (result.xlsx_path and result.xlsx_path.exists()):
-            await _send_failure_response(message, result, user=user, tracker=tracker)
-        else:
+        path = result.xlsx_path if result else None
+        if path and path.exists():
             if decision:
                 await _finalize_quota_usage(message, uid, decision)
             _log_parse_ready(title, city, ov, approx_total=total)
-            log_event(
-                "INFO",
-                "parse.ok",
-                user_id=uid,
-                mode="report",
-                query=title,
-                city=city,
-                amount=total,
-                path=str(result.xlsx_path),
-                duration_ms=result.duration_ms if result else None,
-            )
-            correlation = None
-            if result and result.meta:
-                correlation = str(result.meta.get("correlation_id") or "").strip() or None
-            diagnostic_path = result.bundle_path if SEND_DIAG_BUNDLES else None
-            diagnostic_caption = f"diag {correlation}" if correlation else "diagnostic bundle"
-            chat_id = getattr(message.chat, "id", None)
-            send_result = await _send_report_with_analytics(
+            await _send_report_with_analytics(
                 message,
-                result.xlsx_path,
+                path,
                 title=title,
                 city=city,
                 approx_total=total,
                 include=ov.get("include"),
                 exclude=ov.get("exclude"),
                 reply_markup=_main_menu_kb(message, user=user),
-                diagnostic_path=diagnostic_path,
-                diagnostic_caption=diagnostic_caption if diagnostic_path else None,
             )
-            progress_strategy = tracker_obj.ui_strategy if tracker_obj else "edit"
-            ack_for_meta = ui_ack_sent if ui_ack_sent is not None else True
-            _update_ui_meta(
-                result,
-                ack_sent=ack_for_meta,
-                progress_strategy=progress_strategy,
-                report_path=result.xlsx_path,
-                send_error=send_result.error_message,
-            )
-            diag_payload = (
-                send_result.diagnostics.to_event_payload()
-                if send_result.diagnostics
-                else collect_xlsx_diagnostics(Path(result.xlsx_path)).to_event_payload()
-            )
-            log_event(
-                "deliver.done",
-                correlation_id=correlation,
-                status="ok" if send_result.ok else "fail",
-                chat_id=chat_id,
-                diagnostics=diag_payload,
-                size_bytes=send_result.size,
-            )
-            if send_result.ok:
-                await _cleanup_inline_message(message)
-                if tracker_obj:
-                    await tracker_obj.finish_success()
-                complete_operation(ok=True)
-            else:
-                log_event(
-                    "deliver.send_report_failed",
-                    level="ERROR",
-                    correlation_id=correlation,
-                    chat_id=chat_id,
-                    path=str(result.xlsx_path),
-                    size_bytes=send_result.size,
-                    error_type=type(send_result.error).__name__
-                    if send_result.error
-                    else None,
-                    error_message=send_result.error_message,
-                    diagnostics=diag_payload,
-                )
-                failure_text = (
-                    "Не получилось отправить файл. Я приложил диагностический ZIP и уведомил поддержку."
-                )
-                if tracker_obj:
-                    await tracker_obj.fail(
-                        f"{PROGRESS_FAILURE_PREFIX} Не удалось отправить файл"
-                    )
-                await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
-                await _send_diagnostic_bundle_if_needed(
-                    message.bot,
-                    bundle_path=result.bundle_path,
-                    correlation=correlation,
-                    user_chat_id=getattr(message.chat, "id", None),
-                    user_id=getattr(user, "id", None),
-                )
-                complete_operation(ok=False, err="send_report_failed")
+            if tracker:
+                await tracker.finish_success()
+        else:
+            if tracker:
+                await tracker.fail()
+            await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
+            log_event("parse_error", level="ERROR", err="report_missing")
+            complete_operation(ok=False, err="report_missing")
     finally:
         clear_busy(uid)
 
@@ -1903,19 +742,6 @@ async def _run_parser(
     if is_busy(requester_id):
         await message.answer(BUSY_TEXT)
         return
-
-    overrides = overrides or {}
-    _, normalized_overrides, _, _ = (
-        parser_adapter.normalize_and_validate_overrides(overrides)
-    )
-
-    clean_overrides: dict[str, object] = {}
-    for key in ("include", "exclude", "pages", "per_page", "pause", "site", "area"):
-        if key in normalized_overrides:
-            value = normalized_overrides[key]
-            if value is not None or key in {"include", "exclude"}:
-                clean_overrides[key] = value
-    overrides = clean_overrides
 
     # 1) Мягкая валидация
     ok, norm_title, area_id, canonical_city, bad_msg = validator.validate_request(query, city)
@@ -1956,10 +782,7 @@ async def _run_parser(
         )
         decision: QuotaDecision | None = None
         tracker: ReportProgressTracker | None = None
-        result: parser_adapter.RunReportResult | None = None
-        diag_dir: Path | None = None
-        retries_done = 0
-        backoffs = (2, 6)
+        result: parser_adapter.ReportResult | None = None
         try:
             decision = await _ensure_quota(
                 message,
@@ -1973,7 +796,6 @@ async def _run_parser(
             include_list = _ensure_str_list(ov.get("include"))
             exclude_list = _ensure_str_list(ov.get("exclude"))
             tracker = await _start_report_progress(message, include_list, exclude_list)
-            await tracker.mark_command_ready()
             _log_parse_start(norm_title, city_to_use, ov)
 
             async def _progress(kind: str, payload: dict) -> None:
@@ -1981,175 +803,48 @@ async def _run_parser(
                     await tracker.handle_event(kind, payload)
 
             run_kwargs = {k: v for k, v in ov.items() if k not in {"include", "exclude"}}
-            while True:
-                try:
-                    if tracker:
-                        if retries_done > 0:
-                            await tracker.clear_retry()
-                            await tracker.mark_command_ready()
-                        await tracker.mark_process_started()
-                    result = await parser_adapter.run_report(
-                        requester_id,
-                        norm_title,
-                        city_to_use,
-                        role=norm_title,
-                        include=include_list,
-                        exclude=exclude_list,
-                        progress=_progress,
-                        **run_kwargs,
-                    )
-                    break
-                except parser_adapter.ParserRunError as exc:
-                    error_info = classify_error(exc, exc.stdout, exc.stderr)
-                    log_event(
-                        "ERROR",
-                        "parse.error",
-                        user_id=requester_id,
-                        mode="report",
-                        query=norm_title,
-                        city=city_to_use,
-                        error_code=error_info.code,
-                        hint=error_info.hint_for_log,
-                        attempt=retries_done + 1,
-                    )
-                    if is_retryable(error_info.code) and retries_done < len(backoffs):
-                        retries_done += 1
-                        if tracker:
-                            await tracker.show_retry(retries_done, len(backoffs))
-                        await asyncio.sleep(backoffs[retries_done - 1])
-                        continue
-
-                    progress_last_step = tracker.progress.last_step if tracker else None
-                    if tracker:
-                        await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}")
-                    diag_dir = _save_parser_diag(
-                        requester_id,
-                        exc=exc,
-                        query=norm_title,
-                        city=city_to_use,
-                        area_id=ov.get("area") if isinstance(ov.get("area"), int) else None,
-                        include=include_list,
-                        exclude=exclude_list,
-                        amount=None,
-                        mode="report",
-                        retries=retries_done,
-                        error_code=error_info.code,
-                        progress_last_step=progress_last_step,
-                    )
-                    failure_text = _format_failure_message(
-                        invalid_arguments=None,
-                        diag_dir=diag_dir,
-                        user=user,
-                        default_message=error_info.message_for_user,
-                    )
-                    await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
-                    await _send_diagnostic_bundle_if_needed(
-                        message.bot,
-                        bundle_path=diag_dir.with_suffix(".zip") if diag_dir else None,
-                        correlation=None,
-                        user_chat_id=getattr(message.chat, "id", None),
-                        user_id=getattr(user, "id", None),
-                    )
-                    complete_operation(ok=False, err=error_info.code.lower())
-                    return
+            result = await parser_adapter.run_report(
+                requester_id,
+                norm_title,
+                city_to_use,
+                role=norm_title,
+                include=include_list,
+                exclude=exclude_list,
+                progress=_progress,
+                **run_kwargs,
+            )
         except Exception as e:
-            error_info = classify_error(e, getattr(e, "stdout", ""), getattr(e, "stderr", ""))
-            log_event(
-                "ERROR",
-                "parse.error",
-                user_id=requester_id,
-                mode="report",
-                query=norm_title,
-                city=city_to_use,
-                error_code=error_info.code,
-                hint=error_info.hint_for_log,
-            )
             if tracker:
-                await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}")
-            await message.answer(
-                error_info.message_for_user,
-                reply_markup=_main_menu_kb(message, user=user),
-            )
-            complete_operation(ok=False, err=error_info.code.lower())
+                await tracker.fail()
+            err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
+            event = "parse_timeout" if _is_timeout_error(e) else "parse_error"
+            log_event(event, level="ERROR", err=err_text)
+            await message.answer(err_text, reply_markup=_main_menu_kb(message, user=user))
+            complete_operation(ok=False, err=err_text)
             return
         else:
-            if not result or not result.ok or not (result.xlsx_path and result.xlsx_path.exists()):
-                await _send_failure_response(message, result, user=user, tracker=tracker)
-            else:
+            path = result.xlsx_path if result else None
+            if path and path.exists():
                 if decision:
                     await _finalize_quota_usage(message, requester_id, decision)
                 _log_parse_ready(norm_title, city_to_use, ov)
-                correlation = None
-                if result and result.meta:
-                    correlation = str(result.meta.get("correlation_id") or "").strip() or None
-                diagnostic_path = result.bundle_path if SEND_DIAG_BUNDLES else None
-                diagnostic_caption = f"diag {correlation}" if correlation else "diagnostic bundle"
-                chat_id = getattr(message.chat, "id", None)
-                send_result = await _send_report_with_analytics(
+                await _send_report_with_analytics(
                     message,
-                    result.xlsx_path,
+                    path,
                     title=norm_title,
                     city=city_to_use,
                     include=ov.get("include"),
                     exclude=ov.get("exclude"),
                     reply_markup=_main_menu_kb(message, user=user),
-                    diagnostic_path=diagnostic_path,
-                    diagnostic_caption=diagnostic_caption if diagnostic_path else None,
                 )
-                progress_strategy = tracker.ui_strategy if tracker else "edit"
-                _update_ui_meta(
-                    result,
-                    ack_sent=True,
-                    progress_strategy=progress_strategy,
-                    report_path=result.xlsx_path,
-                    send_error=send_result.error_message,
-                )
-                diag_payload = (
-                    send_result.diagnostics.to_event_payload()
-                    if send_result.diagnostics
-                    else collect_xlsx_diagnostics(Path(result.xlsx_path)).to_event_payload()
-                )
-                log_event(
-                    "deliver.done",
-                    correlation_id=correlation,
-                    status="ok" if send_result.ok else "fail",
-                    chat_id=chat_id,
-                    diagnostics=diag_payload,
-                    size_bytes=send_result.size,
-                )
-                if send_result.ok:
-                    await _cleanup_inline_message(message)
-                    if tracker:
-                        await tracker.finish_success()
-                    complete_operation(ok=True)
-                else:
-                    log_event(
-                        "deliver.send_report_failed",
-                        level="ERROR",
-                        correlation_id=correlation,
-                        chat_id=chat_id,
-                        path=str(result.xlsx_path),
-                        size_bytes=send_result.size,
-                        error_type=type(send_result.error).__name__
-                        if send_result.error
-                        else None,
-                        error_message=send_result.error_message,
-                        diagnostics=diag_payload,
-                    )
-                    failure_text = (
-                        "Не получилось отправить файл. Я приложил диагностический ZIP и уведомил поддержку."
-                    )
-                    if tracker:
-                        await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Не удалось отправить файл")
-                    await message.answer(failure_text, reply_markup=_main_menu_kb(message, user=user))
-                    await _send_diagnostic_bundle_if_needed(
-                        message.bot,
-                        bundle_path=result.bundle_path,
-                        correlation=correlation,
-                        user_chat_id=getattr(message.chat, "id", None),
-                        user_id=getattr(user, "id", None),
-                    )
-                    complete_operation(ok=False, err="send_report_failed")
+                if tracker:
+                    await tracker.finish_success()
+            else:
+                if tracker:
+                    await tracker.fail()
+                await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
+                log_event("parse_error", level="ERROR", err="report_missing")
+                complete_operation(ok=False, err="report_missing")
         finally:
             clear_busy(requester_id)
         return
@@ -2206,16 +901,11 @@ async def cmd_parse(message: types.Message, state: FSMContext):
                 )
                 complete_operation(ok=False, err=str(exc))
                 return
-        log_event(
-            "parse_dialog_start",
-            command="/parse",
-            args=_build_args(query, city, overrides),
-        )
         await _run_parser(message, query, city, overrides)
         return
 
     update_context(command="parse_dialog")
-    log_event("parse_dialog_start", command="parse_dialog")
+    log_event("request_parsed", message="parse dialog start", command="parse_dialog")
     prompt = await message.answer("Введите должность:", reply_markup=ReplyKeyboardRemove())
     await ParseForm.waiting_query.set()
     await chips.render_role_chips(prompt, message.from_user.id)
@@ -2465,66 +1155,13 @@ async def cb_parse_fix(call: types.CallbackQuery):
 
 
 async def cb_qty(call: types.CallbackQuery):
-    uid = call.from_user.id
-
-    if _is_report_job_active(uid):
-        ack_started = time.monotonic()
-        try:
-            await call.answer(BUSY_TEXT, show_alert=False, cache_time=1)
-            log_event(
-                "callback_ack_sent",
-                callback="cb_qty_dedup",
-                status="ok",
-                latency_ms=int((time.monotonic() - ack_started) * 1000),
-            )
-        except Exception as exc:  # pragma: no cover - best effort logging
-            stack = traceback.format_exc()
-            log_event(
-                "callback_ack_sent",
-                callback="cb_qty_dedup",
-                status="err",
-                latency_ms=int((time.monotonic() - ack_started) * 1000),
-                err=str(exc),
-                stack=stack,
-            )
-            log_event("callback_ack_failed", callback="cb_qty_dedup", err=str(exc), stack=stack)
-        log_event("job.deduped", callback="cb_qty", user_id=uid)
-        return
-
     # если занят — просто подсказка и выходим
-    if is_busy(uid):
+    if is_busy(call.from_user.id):
         await call.answer(BUSY_TEXT, show_alert=False)
         return
 
-    ack_started = time.monotonic()
-    ack_sent = False
-    ack_stack: str | None = None
-    try:
-        await call.answer(
-            "Запускаю выгрузку… это займёт пару минут",
-            show_alert=False,
-            cache_time=1,
-        )
-        ack_sent = True
-        log_event(
-            "callback_ack_sent",
-            callback="cb_qty",
-            status="ok",
-            latency_ms=int((time.monotonic() - ack_started) * 1000),
-        )
-    except Exception as exc:
-        ack_stack = traceback.format_exc()
-        log_event(
-            "callback_ack_sent",
-            callback="cb_qty",
-            status="err",
-            latency_ms=int((time.monotonic() - ack_started) * 1000),
-            err=str(exc),
-            stack=ack_stack,
-        )
-        log_event("callback_ack_failed", callback="cb_qty", err=str(exc), stack=ack_stack)
-
-    payload = _PENDING_QTY.get(uid)
+    payload = _PENDING_QTY.get(call.from_user.id)
+    await call.answer()
     if not payload:
         await call.message.answer("Не нашёл предыдущий запрос. Введи должность ещё раз:")
         await ParseForm.waiting_query.set()
@@ -2539,61 +1176,19 @@ async def cb_qty(call: types.CallbackQuery):
     else:  # "all"
         total = max_total
 
-    include_list = _ensure_str_list((overrides or {}).get("include"))
-    exclude_list = _ensure_str_list((overrides or {}).get("exclude"))
-
-    try:
-        tracker = await _start_report_progress(call.message, include_list, exclude_list)
-    except Exception as exc:
-        log_event(
-            "progress.start_failed",
-            level="ERROR",
-            err=str(exc),
-            callback="cb_qty",
-        )
-        tracker = None
-
     # фикс: после старта выгрузки «забываем» pending, чтобы старые кнопки не плодили ошибки
-    _PENDING_QTY.pop(uid, None)
+    _PENDING_QTY.pop(call.from_user.id, None)
     update_context(dialog_step=_dialog_step("qty", str(total)))
-    log_event(
-        "qty_chosen",
-        action=f"qty_{total}",
-        quantity=total,
-        args=_build_args(title, city, overrides, qty=total),
+    await _run_with_amount(
+        call.message,
+        title,
+        city,
+        area_id,
+        overrides,
+        total,
+        uid=call.from_user.id,
+        user=call.from_user,
     )
-
-    async def _job() -> None:
-        try:
-            await _run_with_amount(
-                call.message,
-                title,
-                city,
-                area_id,
-                overrides,
-                total,
-                uid=uid,
-                user=call.from_user,
-                ui_ack_sent=ack_sent,
-                tracker=tracker,
-            )
-        except Exception as exc:  # pragma: no cover - defensive logging
-            stack = traceback.format_exc()
-            log_event(
-                "report.job_failed",
-                level="ERROR",
-                err=str(exc),
-                stack=stack,
-                user_id=uid,
-            )
-            if tracker:
-                try:
-                    await tracker.fail(f"{PROGRESS_FAILURE_PREFIX} Внутренняя ошибка")
-                except Exception:
-                    pass
-
-    task = asyncio.create_task(_job(), name=f"report:{uid}:{total}")
-    _register_report_job(uid, task)
 
 
 async def cb_preview(call: types.CallbackQuery):
@@ -2603,27 +1198,9 @@ async def cb_preview(call: types.CallbackQuery):
         await call.answer(BUSY_TEXT, show_alert=False)
         return
 
-    ack_started = time.monotonic()
-    try:
-        await call.answer("Готовлю превью…", show_alert=False, cache_time=1)
-        log_event(
-            "callback_ack_sent",
-            callback="cb_preview",
-            status="ok",
-            latency_ms=int((time.monotonic() - ack_started) * 1000),
-        )
-    except Exception as exc:
-        log_event(
-            "callback_ack_sent",
-            callback="cb_preview",
-            status="err",
-            latency_ms=int((time.monotonic() - ack_started) * 1000),
-            err=str(exc),
-        )
-        log_event("callback_ack_failed", callback="cb_preview", err=str(exc))
+    await call.answer("Готовлю превью…", show_alert=False)
 
-    progress: Progress | None = None
-    invalid_arguments: str | None = None
+    progress: ProgressMessage | None = None
     try:
         payload = _PENDING_QTY.get(uid)   # ВАЖНО: .get(), НЕ .pop()!
         if not payload:
@@ -2632,56 +1209,15 @@ async def cb_preview(call: types.CallbackQuery):
             return
 
         title, city, area_id, overrides, _max_total = payload
-        overrides = overrides or {}
-        invalid_keys: list[str] = []
-        if not (title or "").strip():
-            invalid_keys.append("query")
-        if not (city or "").strip():
-            invalid_keys.append("city")
-
-        override_payload: dict[str, object] = {
-            "include": overrides.get("include"),
-            "exclude": overrides.get("exclude"),
-        }
-        area_source = overrides.get("area", area_id)
-        if area_source is not None:
-            override_payload["area"] = area_source
-
-        _ok_overrides, normalized_overrides, invalid_override_keys, _ = (
-            parser_adapter.normalize_and_validate_overrides(override_payload)
-        )
-        invalid_keys.extend(invalid_override_keys)
-        if invalid_keys:
-            log_event(
-                "preview_validation_failed",
-                level="WARN",
-                invalid_arguments=invalid_keys,
-                args=_build_args(title, city, overrides),
-            )
-            invalid_arguments = parser_adapter.format_invalid_arguments(invalid_keys)
-            await call.message.answer(invalid_arguments)
-            return
-
-        include = normalized_overrides.get("include", [])
-        exclude = normalized_overrides.get("exclude", [])
-        area_norm = normalized_overrides.get("area")
-        area_id = area_norm if area_norm is not None else area_source
-
-        clean_overrides = dict(overrides)
-        clean_overrides["include"] = include
-        clean_overrides["exclude"] = exclude
-        if area_id is not None:
-            clean_overrides["area"] = area_id
-        elif "area" in clean_overrides:
-            clean_overrides.pop("area", None)
-        overrides = clean_overrides
+        include = (overrides or {}).get("include") or []
+        exclude = (overrides or {}).get("exclude") or []
 
         if not ALLOW_FREE_PREVIEW:
             snapshot = paywall.SavedRequest(
                 kind="preview",
                 query=title,
                 city=city,
-                overrides=overrides,
+                overrides=overrides or {},
                 area_id=area_id,
             )
             decision = await _ensure_quota(
@@ -2694,156 +1230,38 @@ async def cb_preview(call: types.CallbackQuery):
             if not decision:
                 return
 
-        progress = await Progress.create(
-            call.message.bot,
-            call.message.chat.id,
-            PROGRESS_STEPS,
-            mode="preview",
-            initial_step=PROGRESS_STEPS[0].name,
-        )
-        await progress.set("fetch", 10, force=True)
+        progress = await ProgressMessage.create(call.message.bot, call.message.chat.id, PREVIEW_TEMPLATE)
         _log_preview_start(title, city, overrides)
-        log_event(
-            "INFO",
-            "preview.start",
-            user_id=uid,
-            query=title,
-            city=city,
-            area_id=area_id,
-        )
-
-        backoffs = (2, 6)
-        retries_done = 0
-        diag_dir: Path | None = None
-        rows: list[dict[str, str]] | None = None
-        while True:
-            try:
-                if retries_done > 0:
-                    await progress.clear_retry()
-                    await progress.set("fetch", 10, force=True)
-                await progress.set("fetch", 30, force=True)
-                rows = await parser_adapter.preview_rows(
-                    uid,
-                    title,
-                    city,
-                    area=area_id,
-                    include=include,
-                    exclude=exclude,
-                )
-                break
-            except parser_adapter.ParserRunError as exc:
-                error_info = classify_error(exc, exc.stdout, exc.stderr)
-                _log_preview_timeout(title, city, overrides, err=error_info.hint_for_log)
-                log_event(
-                    "ERROR",
-                    "preview.error",
-                    user_id=uid,
-                    query=title,
-                    city=city,
-                    error_code=error_info.code,
-                    hint=error_info.hint_for_log,
-                    attempt=retries_done + 1,
-                )
-                if is_retryable(error_info.code) and retries_done < len(backoffs):
-                    retries_done += 1
-                    await progress.show_retry(retries_done, len(backoffs))
-                    await asyncio.sleep(backoffs[retries_done - 1])
-                    continue
-
-                progress_last_step = progress.last_step
-                diag_dir = _save_parser_diag(
-                    uid,
-                    exc=exc,
-                    query=title,
-                    city=city,
-                    area_id=area_id if isinstance(area_id, int) else None,
-                    include=include,
-                    exclude=exclude,
-                    amount=parser_adapter.PREVIEW_ROWS,
-                    mode="preview",
-                    retries=retries_done,
-                    error_code=error_info.code,
-                    progress_last_step=progress_last_step,
-                )
-                await progress.close(
-                    ok=False,
-                    text=f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}",
-                )
-                failure_text = _format_failure_message(
-                    invalid_arguments=invalid_arguments,
-                    diag_dir=diag_dir,
-                    user=call.from_user,
-                    default_message=error_info.message_for_user,
-                )
-                await call.message.answer(failure_text)
-                await _send_diagnostic_bundle_if_needed(
-                    call.message.bot,
-                    bundle_path=diag_dir.with_suffix(".zip") if diag_dir else None,
-                    correlation=None,
-                    user_chat_id=getattr(call.message.chat, "id", None),
-                    user_id=getattr(call.from_user, "id", None),
-                )
-                return
-            except validator.ValidationError as exc:
-                await progress.close(
-                    ok=False,
-                    text=f"{PROGRESS_FAILURE_PREFIX} {exc.user_message}",
-                )
-                await call.message.answer(exc.user_message)
-                return
-            except Exception as exc:
-                error_info = classify_error(exc, getattr(exc, "stdout", ""), getattr(exc, "stderr", ""))
-                _log_preview_timeout(title, city, overrides, err=error_info.hint_for_log)
-                log_event(
-                    "ERROR",
-                    "preview.error",
-                    user_id=uid,
-                    query=title,
-                    city=city,
-                    error_code=error_info.code,
-                    hint=error_info.hint_for_log,
-                )
-                await progress.close(
-                    ok=False,
-                    text=f"{PROGRESS_FAILURE_PREFIX} {error_info.message_for_user}",
-                )
-                failure_text = _format_failure_message(
-                    invalid_arguments=invalid_arguments,
-                    diag_dir=diag_dir,
-                    user=call.from_user,
-                    default_message=error_info.message_for_user,
-                )
-                await call.message.answer(failure_text)
-                await _send_diagnostic_bundle_if_needed(
-                    call.message.bot,
-                    bundle_path=diag_dir.with_suffix(".zip") if diag_dir else None,
-                    correlation=None,
-                    user_chat_id=getattr(call.message.chat, "id", None),
-                    user_id=getattr(call.from_user, "id", None),
-                )
-                return
-
-        if not rows:
-            user_msg = user_message_for_no_data()
-            await progress.close(
-                ok=False,
-                text=f"{PROGRESS_FAILURE_PREFIX} {user_msg}",
+        try:
+            rows = await parser_adapter.preview_rows(
+                uid,
+                title,
+                city,
+                area=area_id,
+                include=include,
+                exclude=exclude,
             )
-            await call.message.answer(user_msg)
-            _log_preview_ready(title, city, 0, overrides)
-            log_event(
-                "INFO",
-                "preview.ok",
-                user_id=uid,
-                query=title,
-                city=city,
-                count=0,
-                error_code="NO_DATA",
-            )
+        except asyncio.TimeoutError as exc:
+            _log_preview_timeout(title, city, overrides, err=str(exc))
+            if progress:
+                await progress.fail()
+            await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
+            return
+        except Exception as exc:
+            _log_preview_timeout(title, city, overrides, err=str(exc))
+            if progress:
+                await progress.fail()
+            await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
             return
 
-        await progress.set("normalize", 60)
+        if not rows:
+            await call.message.answer("Совпадений не нашлось по текущим критериям.")
+            _log_preview_ready(title, city, 0, overrides)
+            if progress:
+                await progress.finish(DONE_TEXT, delete_after=45.0)
+            return
 
+        # аккуратный текст превью
         lines = []
         for r in rows:
             t = r.get("title") or "—"
@@ -2855,20 +1273,11 @@ async def cb_preview(call: types.CallbackQuery):
             else:
                 lines.append(f"• {t} — {c} — {s}")
 
-        await progress.set("write_xlsx", 90)
-
         txt = "<b>Предпросмотр (первые совпадения):</b>\n" + "\n".join(lines)
         await call.message.answer(txt, disable_web_page_preview=True)
-        log_event(
-            "INFO",
-            "preview.ok",
-            user_id=uid,
-            query=title,
-            city=city,
-            count=len(rows),
-        )
         _log_preview_ready(title, city, len(rows), overrides)
-        await progress.close(ok=True, text=PROGRESS_SUCCESS_TEXT, delete_after=8.0)
+        if progress:
+            await progress.finish(DONE_TEXT, delete_after=45.0)
     finally:
         clear_busy(uid)
 
@@ -2929,7 +1338,6 @@ async def cb_resume_yes(call: types.CallbackQuery):
             request.total,
             uid=call.from_user.id,
             user=call.from_user,
-            ui_ack_sent=True,
         )
     elif request.kind == "direct":
         await _run_parser(
@@ -2997,6 +1405,5 @@ def register(dp: Dispatcher):
     dp.register_callback_query_handler(cb_report_share_copy, lambda c: c.data == "report_share_copy", state="*")
     dp.register_callback_query_handler(cb_report_again, lambda c: c.data == "report_again", state="*")
     dp.register_callback_query_handler(cb_report_menu, lambda c: c.data == "report_menu", state="*")
-    dp.register_callback_query_handler(cb_diag_bundle, lambda c: c.data and c.data.startswith("diag_bundle:"), state="*")
     dp.register_callback_query_handler(cb_resume_yes,  lambda c: c.data == "resume:last", state="*")
     dp.register_callback_query_handler(cb_resume_skip, lambda c: c.data == "resume:skip", state="*")

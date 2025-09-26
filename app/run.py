@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 
 import aiogram
@@ -10,15 +9,10 @@ import uvicorn
 from aiogram import Dispatcher, executor
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
-from .utils.logging import setup_logging
-
-setup_logging()
-
 from . import webhook
-from .config import get_runtime_port, settings
-from .handlers import (  # noqa: E402  (setup_logging must run before handlers)
+from .config import settings
+from .handlers import (
     admin as h_admin,
-    admin_debug,
     parse,
     payments as h_payments,
     referrals as h_referrals,
@@ -26,7 +20,6 @@ from .handlers import (  # noqa: E402  (setup_logging must run before handlers)
     status,
 )
 from .middlewares.busy import BusyMiddleware
-from .middlewares.debug import DebugMiddleware
 from .middlewares.operation_logger import OperationLoggerMiddleware
 from .storage.db import init_db
 from .utils.logging import (
@@ -34,18 +27,17 @@ from .utils.logging import (
     complete_operation,
     log_event,
     set_audit_sink,
+    setup_logging,
 )
 from .utils.telegram_logging import LoggedBot
 
 
-logger = logging.getLogger("app.startup")
-
-
 def create_dispatcher() -> Dispatcher:
+    setup_logging()
+
     bot = LoggedBot(token=settings.TELEGRAM_BOT_TOKEN, parse_mode="HTML")
     dp = Dispatcher(bot, storage=MemoryStorage())
 
-    dp.middleware.setup(DebugMiddleware())
     dp.middleware.setup(OperationLoggerMiddleware())
     dp.middleware.setup(BusyMiddleware())
 
@@ -66,7 +58,6 @@ def create_dispatcher() -> Dispatcher:
     h_payments.register(dp)
     h_referrals.register(dp)
     h_admin.register(dp)
-    admin_debug.register(dp)
 
     async def _error_handler(update, error):  # noqa: ANN001
         log_event("exception", level="ERROR", err=str(error))
@@ -82,20 +73,6 @@ dp = create_dispatcher()
 bot = dp.bot
 
 
-def _resolve_listen_port() -> int:
-    return get_runtime_port()
-
-
-def _validate_webhook_url() -> None:
-    url = (settings.WEBHOOK_URL or "").strip()
-    if not url:
-        raise RuntimeError("WEBHOOK_URL must be set when MODE=webhook")
-    if not url.startswith("https://"):
-        raise RuntimeError("WEBHOOK_URL must start with https://")
-    if not url.endswith("/webhook"):
-        raise RuntimeError("WEBHOOK_URL must end with /webhook")
-
-
 def main() -> None:
     init_db()
 
@@ -107,16 +84,6 @@ def main() -> None:
         ),
     )
 
-    listen_port = _resolve_listen_port()
-    if settings.MODE == "webhook":
-        _validate_webhook_url()
-    logger.info(
-        "Final configuration: mode=%s, webhook_url=%s, port=%s",
-        settings.MODE,
-        settings.WEBHOOK_URL or "-",
-        listen_port,
-    )
-
     if settings.MODE == "polling":
         executor.start_polling(dp, skip_updates=True)
         return
@@ -126,41 +93,34 @@ def main() -> None:
     async def _run() -> None:
         webhook_setup_success = False
         try:
+            # Try to setup webhook, but don't fail if it doesn't work initially
             try:
                 await webhook.setup_webhook(bot)
                 webhook_setup_success = True
                 log_event("webhook_setup", message="Webhook configured successfully")
-            except Exception as exc:
-                log_event(
-                    "webhook_setup_failed",
-                    level="WARN",
-                    message=f"Initial webhook setup failed: {exc}. Server will start anyway.",
-                )
-                logger.warning("Initial webhook setup failed: %s", exc, exc_info=True)
-
+            except Exception as e:
+                log_event("webhook_setup_failed", level="WARN", 
+                         message=f"Initial webhook setup failed: {e}. Server will start anyway.")
+                print(f"Warning: Webhook setup failed: {e}")
+                print("The server will start anyway. You can manually set the webhook later.")
+            
+            # Start the server regardless of webhook setup status
             config = uvicorn.Config(
                 webhook.app,
-                host="0.0.0.0",
-                port=listen_port,
+                host=settings.WEBAPP_HOST,
+                port=settings.WEBAPP_PORT,
                 log_level="info",
             )
             server = uvicorn.Server(config)
-            start_message = f"Starting server on 0.0.0.0:{listen_port}"
-            log_event("server_start", message=start_message)
-            logger.info(start_message)
+            log_event("server_start", message=f"Starting server on {settings.WEBAPP_HOST}:{settings.WEBAPP_PORT}")
             await server.serve()
         finally:
             # Only try to remove webhook if it was successfully set
             if webhook_setup_success:
                 try:
                     await webhook.remove_webhook(bot)
-                except Exception as exc:
-                    log_event(
-                        "webhook_cleanup_failed",
-                        level="WARN",
-                        message=f"Failed to cleanup webhook: {exc}",
-                    )
-                    logger.warning("Failed to cleanup webhook: %s", exc, exc_info=True)
+                except Exception as e:
+                    log_event("webhook_cleanup_failed", level="WARN", message=f"Failed to cleanup webhook: {e}")
 
     asyncio.run(_run())
 

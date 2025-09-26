@@ -1,47 +1,29 @@
 # parsers/fetch_vacancies.py
-import time, argparse, requests, pandas as pd, re, urllib.parse, html, sys
+import time, argparse, pandas as pd, re, urllib.parse, html
 from typing import List, Dict, Any, Tuple, Optional
-from datetime import datetime
 
+try:  # pragma: no cover - import shim for script execution
+    from ..constants import DEFAULT_HH_SEARCH_FIELD
+except ImportError:  # noqa: F401 - fallback for running as standalone script
+    import importlib
+    import sys
+    from pathlib import Path
 
-def _extract_date_from_gorodrabot(url: str) -> Optional[str]:
-    if not (_HAS_BS4 and isinstance(url,str) and url.startswith("http")):
-        return None
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        if r.status_code != 200:
-            return None
-        soup = BeautifulSoup(r.text, "lxml")
-        # <time datetime="2025-09-20"> или текст «сегодня/вчера/…»
-        t = soup.select_one("time[datetime]")
-        if t and t.get("datetime"):
-            return _iso_date(t.get("datetime"))
-        # запасной путь: ищем что-то вроде "Опубликовано 20.09.2025"
-        txt = soup.get_text(" ", strip=True).lower()
-        m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", txt)
-        if m:
-            d, mo, y = m.groups()
-            return f"{y}-{mo}-{d}"
-        # «сегодня / вчера»
-        if "сегодня" in txt: return datetime.now().date().isoformat()
-        if "вчера" in txt:
-            return (datetime.now().date()).fromordinal(datetime.now().date().toordinal()-1).isoformat()
-    except Exception:
-        return None
-    return None
+    current_dir = Path(__file__).resolve().parent.parent
+    if str(current_dir) not in sys.path:
+        sys.path.insert(0, str(current_dir))
+    DEFAULT_HH_SEARCH_FIELD = importlib.import_module("constants").DEFAULT_HH_SEARCH_FIELD
 
-def _iso_date(s: Optional[str]) -> Optional[str]:
-    """HH: '2025-09-20T12:34:56+0300' -> '2025-09-20'."""
-    if not s: return None
-    try:
-        # нормализуем зону вида +0300 -> +03:00
-        if len(s) >= 5 and (s[-5] in "+-") and s[-3] != ":":
-            s = s[:-2] + ":" + s[-2:]
-        dt = datetime.fromisoformat(s.replace("Z","+00:00"))
-        return dt.date().isoformat()
-    except Exception:
-        # на всякий случай берём до 'T'
-        return s.split("T",1)[0]
+try:  # pragma: no cover - зависимость должна ставиться вместе с ботом
+    import requests
+except ImportError:  # pragma: no cover
+    class _RequestsStub:
+        def get(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError(
+                "requests package is required for network fetching. Install dependencies."
+            )
+
+    requests = _RequestsStub()  # type: ignore[assignment]
 
 # ---- optional bs4 for HTML (hh + gorodrabot) ----
 try:
@@ -57,12 +39,10 @@ HEADERS = {
 }
 
 TEMPLATE_COLS = [
-    "Должность","Работодатель","Дата публикации",
-    "ЗП от (т.р.)","ЗП до (т.р.)",
+    "Должность","Работодатель","ЗП от (т.р.)","ЗП до (т.р.)",
     "Средний совокупный доход при графике 2/2 по 12 часов","В час","Длительность \nсмены",
     "Требуемый\nопыт","Труд-во","График","Частота \nвыплат","Льготы","Обязаности","Ссылка"
 ]
-
 
 # ================= РОЛЕВЫЕ ФИЛЬТРЫ ПО НАЗВАНИЮ =================
 FILTERS = {
@@ -109,12 +89,12 @@ FILTERS = {
         "inc": [
             r"\bменеджер\b.*\bразработк\w*\b.*\bпродукт",
             r"\bменеджер\b.*\bразработк\w*\b.*\bменю\b",
-            r"\bменеджер\b.*\bблюд\w*\b", r"\bпродукта\b",
+            r"\bменеджер\b.*\bблюд\w*\b",
             r"\bменеджер\s*r\W?&\W?d\b",
             r"\bproduct\s*development\b",
         ],
         "exc": [
-            r"\bproduct\s*manager\b",
+            r"\bпродакт\b", r"\bproduct\s*manager\b",
             r"\bIT\b|\bайти\b|\bdigital\b|\bsoftware\b|\bприложен|\bПО\b",
         ],
     },
@@ -327,48 +307,22 @@ def pick_benefits(text: str) -> Optional[str]:
     return ", ".join(out) if out else None
 
 # =================== HH.RU ===================
-def _warn(msg: str) -> None:
-    print(msg, file=sys.stderr)
-
-
 def hh_search(query: str, area: int, pages: int, per_page: int, pause: float, search_in: str) -> List[Dict[str, Any]]:
     items=[]
     for page in range(pages):
         p={"text":query,"area":area,"page":page,"per_page":per_page,"only_with_salary":"false"}
         if search_in in ("name","description","company_name","everything"):
             p["search_field"]=search_in
-        try:
-            r=requests.get("https://api.hh.ru/vacancies", params=p, headers=HEADERS, timeout=20)
-        except requests.RequestException as exc:
-            _warn(f"hh_search: request failed on page {page}: {exc}")
-            break
-        if r.status_code!=200:
-            _warn(f"hh_search: unexpected status {r.status_code} on page {page}")
-            break
-        try:
-            data=r.json()
-        except ValueError as exc:
-            _warn(f"hh_search: invalid JSON on page {page}: {exc}")
-            break
-        items+=data.get("items",[])
+        r=requests.get("https://api.hh.ru/vacancies", params=p, headers=HEADERS, timeout=20)
+        if r.status_code!=200: break
+        data=r.json(); items+=data.get("items",[])
         if page>=data.get("pages",0)-1: break
         time.sleep(pause)
     return items
 
 def hh_details(vac_id: str) -> dict:
-    try:
-        r=requests.get(f"https://api.hh.ru/vacancies/{vac_id}", headers=HEADERS, timeout=20)
-    except requests.RequestException as exc:
-        _warn(f"hh_details: request failed for id {vac_id}: {exc}")
-        return {}
-    if r.status_code!=200:
-        _warn(f"hh_details: unexpected status {r.status_code} for id {vac_id}")
-        return {}
-    try:
-        return r.json()
-    except ValueError as exc:
-        _warn(f"hh_details: invalid JSON for id {vac_id}: {exc}")
-        return {}
+    r=requests.get(f"https://api.hh.ru/vacancies/{vac_id}", headers=HEADERS, timeout=20)
+    return r.json() if r.status_code==200 else {}
 
 def map_hh(items: List[Dict[str, Any]], pause_detail: float = 0.2) -> List[Dict[str, Any]]:
     rows = []
@@ -384,7 +338,7 @@ def map_hh(items: List[Dict[str, Any]], pause_detail: float = 0.2) -> List[Dict[
 
         exp = (v.get("experience") or {}).get("name")
         empl_src = (v.get("employment") or {}).get("name")
-        sched_src = (v.get("schedule") or {}).get("name")
+        sched_src = (v.get("schedule") or {}).get("name")  # используем как текст-источник, не доверяем «гибкий»
 
         snip = v.get("snippet") or {}
         resp_snip = snip.get("responsibility") or ""
@@ -395,47 +349,40 @@ def map_hh(items: List[Dict[str, Any]], pause_detail: float = 0.2) -> List[Dict[
         descr_html = det.get("description") or ""
         descr_txt = _strip_html(descr_html) or short
 
-        # дата публикации
-        published = _iso_date(v.get("published_at") or det.get("published_at"))
-
-        # оплата
         hour, shift = extract_comp(descr_txt)
+        graph = extract_schedule_strict(descr_txt, sched_src=None)  # собирает ВСЕ варианты, напр. "5/2, 4/3"
 
-        # график: только числовые формы; собираем все варианты
-        graph = extract_schedule_strict(descr_txt, sched_src=None)
-
-        # длительность смены: из текста; иначе проставим позже
+        # длительность смены из текста
         sl = extract_shift_len(descr_txt)
         if sl:
-            shift_len = sl[1]  # "'8-12" либо число часов
-            if isinstance(shift_len, (int, float)) and hour and not shift:
-                # если нашли почасовую и конкретные часы смены — считаем смену под эти часы
-                shift = hour * float(shift_len)
+            if sl[0] == "text":
+                shift_len = sl[1]  # "'8-12"
+            else:
+                shift_len = sl[1]  # 12.0
         else:
             shift_len = 12.0 if (hour or shift) else None
 
-        # HTML-добор графика/часов, если не нашли в description
+        # HTML-добор (только если не нашли)
         if (not graph or shift_len is None) and isinstance(url, str) and url.startswith("http"):
             g_html, hours_html = _extract_schedule_from_html(url)
             if not graph and g_html:
-                graph = g_html                      # например: "5/2, 4/3"
+                graph = g_html  # вернёт "5/2, 4/3" если оба найдены
             if shift_len is None and hours_html:
                 shift_len = float(hours_html)
-                if hour and not shift:
-                    shift = hour * float(shift_len)
 
-        # финальная «за смену 12ч» для колонки шаблона
-        shift12_out = shift if (isinstance(shift_len, (int, float)) and float(shift_len) == 12.0) else (hour * 12.0 if hour else None)
 
-        pay    = extract_pay_frequency(descr_txt)
+
+        # итоговые значения
+        shift12_out = shift if shift is not None else (hour * 12.0 if hour else None)
+
+        pay   = extract_pay_frequency(descr_txt)
         employ = extract_employment_type(descr_txt, employment_name=empl_src)
         duties = extract_responsibilities(descr_html or descr_txt, fallback=resp_snip or reqs_snip)
-        bens   = pick_benefits(descr_txt)
+        bens = pick_benefits(descr_txt)
 
         rows.append({
             "Должность": name,
             "Работодатель": employer,
-            "Дата публикации": published,
             "ЗП от (т.р.)": to_tr(salary.get("from")),
             "ЗП до (т.р.)": to_tr(salary.get("to")),
             "Средний совокупный доход при графике 2/2 по 12 часов": shift12_out,
@@ -447,12 +394,10 @@ def map_hh(items: List[Dict[str, Any]], pause_detail: float = 0.2) -> List[Dict[
             "Частота \nвыплат": pay,
             "Льготы": bens,
             "Обязаности": duties,
-            "Ссылка": url,
-            "__text": f"{descr_txt} {duties or ''}",  # для фильтра по обязанностям
+            "Ссылка": url
         })
         time.sleep(pause_detail)
     return rows
-
 
 # =================== gorodrabot.ru ===================
 def _text(node) -> str:
@@ -511,12 +456,10 @@ def map_gorodrabot(rows_in: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         pay = extract_pay_frequency(combo)
         duties = extract_responsibilities(desc, fallback=None)
         bens = pick_benefits(desc)
-        pub = _extract_date_from_gorodrabot(r.get("url") or "")
 
         mapped.append({
             "Должность": r.get("title"),
             "Работодатель": r.get("employer"),
-            "Дата публикации": pub,
             "ЗП от (т.р.)": sal_from,
             "ЗП до (т.р.)": sal_to,
             "Средний совокупный доход при графике 2/2 по 12 часов": (shift if shift is not None else (hour*12.0 if hour else None)),
@@ -548,23 +491,28 @@ def main():
     ap.add_argument("--query", required=True)
     ap.add_argument("--area", type=int, default=1)                   # hh регион (1=Москва)
     ap.add_argument("--city", default="Москва")                      # gorodrabot город
-    ap.add_argument("--role", default="повар", help="ключ из FILTERS")
+    ap.add_argument("--role", default=None, help="ключ из FILTERS")
     ap.add_argument("--pages", type=int, default=3)
-    ap.add_argument("--per_page", type=int, default=50)
+    ap.add_argument("--per-page", dest="per_page", type=int, default=50)
+    ap.add_argument("--per_page", dest="per_page", type=int, help="alias", metavar="N")
     ap.add_argument("--pause", type=float, default=0.6)
-    ap.add_argument("--search_in", default="name", help="name|description|company_name|everything")
+    ap.add_argument("--search-in", dest="search_in", default=DEFAULT_HH_SEARCH_FIELD,
+                    help="name|description|company_name|everything")
+    ap.add_argument("--search_in", dest="search_in", help="alias")
+    ap.add_argument("--site", choices=["hh", "gorodrabot", "both"], default="both")
     ap.add_argument("--out_csv", required=True)
     a = ap.parse_args()
 
-    INC_RE, EXC_RE = _compile_filters(a.role)
+    INC_RE, EXC_RE = _compile_filters(a.role or "")
 
-    # HH
-    hh_items = hh_search(a.query, a.area, a.pages, a.per_page, a.pause, a.search_in)
-    rows_hh = map_hh(hh_items)
+    rows_hh = []
+    if a.site in ("hh", "both"):
+        hh_items = hh_search(a.query, a.area, a.pages, a.per_page, a.pause, a.search_in)
+        rows_hh = map_hh(hh_items)
 
     # GorodRabot
     rows_gr = []
-    if _HAS_BS4:
+    if _HAS_BS4 and a.site in ("gorodrabot", "both"):
         gr_items = gorodrabot_search(a.query, a.city, a.pages, a.pause)
         rows_gr = map_gorodrabot(gr_items)
 
