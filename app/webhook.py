@@ -54,22 +54,35 @@ async def handle_update(request: Request):
         return {"status": "dispatcher not ready"}
     data = await request.json()
     update = types.Update(**data)
+
+    try:
+        previous_bot = Bot.get_current()
+    except LookupError:
+        previous_bot = None
+
+    try:
+        previous_dp = Dispatcher.get_current()
+    except LookupError:
+        previous_dp = None
+
     if _bot:
         Bot.set_current(_bot)
-    previous_dp = Dispatcher.get_current()
+
     if previous_dp is None:
         log_event(
             "dispatcher_context_reset",
             level="DEBUG",
             message="Dispatcher context was empty before processing update",
         )
+
     Dispatcher.set_current(_dp)
     try:
         await _dp.process_update(update)
     finally:
-        Dispatcher.set_current(None)
-        if _bot:
-            Bot.set_current(None)
+        if previous_dp:
+            Dispatcher.set_current(previous_dp)
+        if previous_bot:
+            Bot.set_current(previous_bot)
     return {"status": "ok"}
 
 
