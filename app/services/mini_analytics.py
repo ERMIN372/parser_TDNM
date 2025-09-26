@@ -23,8 +23,6 @@ _CONTEXT: dict[str, tuple[str, str]] = {}
 
 _THIN_NBSP = "\u202f"
 
-__all__ = ["get_summary", "register_context", "render_mini_analytics"]
-
 
 MINI_ANALYTICS_AVAILABLE = pd is not None and np is not None
 
@@ -714,15 +712,10 @@ def get_summary(path: Path) -> MiniAnalyticsSummary | None:
         return None
 
 
-# provide stable public API even if real impl above uses other names
 if "get_summary" not in globals():
-    def get_summary(*a, **k):
-        return None
+    def get_summary(*a, **k): return None
 if "register_context" not in globals():
-    def register_context(*a, **k):
-        return None
+    def register_context(*a, **k): return None
 if "render_mini_analytics" not in globals():
-    def render_mini_analytics(*a, **k):
-        return None
-
+    def render_mini_analytics(*a, **k): return None
 __all__ = ["get_summary", "register_context", "render_mini_analytics"]

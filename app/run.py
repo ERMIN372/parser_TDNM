@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import traceback
 
 import aiogram
 import aiohttp
 import uvicorn
-from aiogram import Dispatcher, executor
+from aiogram import Bot, Dispatcher, executor
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.utils.exceptions import TelegramAPIError
 
 from . import webhook
 from .config import settings
@@ -32,11 +35,37 @@ from .utils.logging import (
 from .utils.telegram_logging import LoggedBot
 
 
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("bot")
+
+
 def create_dispatcher() -> Dispatcher:
     setup_logging()
 
     bot = LoggedBot(token=settings.TELEGRAM_BOT_TOKEN, parse_mode="HTML")
+    Bot.set_current(bot)
     dp = Dispatcher(bot, storage=MemoryStorage())
+
+    # ---- global errors handler (aiogram v2) ----
+    @dp.errors_handler()
+    async def _global_errors_handler(update, exception):
+        # Полный стек для логов
+        tb = "".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+        exc_type = type(exception).__name__
+        if isinstance(exception, TelegramAPIError):
+            exc_type = f"TelegramAPIError:{exc_type}"
+        logger.error(
+            "unhandled_exception",
+            extra={
+                "event": "exception",
+                "update": update.to_python() if hasattr(update, "to_python") else str(update),
+                "exception_type": exc_type,
+                "traceback": tb[:15000],  # чтобы не раздуть логи
+            },
+        )
+        # Возвращаем True — чтобы aiogram не ронял процесс
+        return True
+    # -------------------------------------------
 
     dp.middleware.setup(OperationLoggerMiddleware())
     dp.middleware.setup(BusyMiddleware())
@@ -83,6 +112,8 @@ def main() -> None:
             f"(aiogram={aiogram.__version__}, aiohttp={aiohttp.__version__})"
         ),
     )
+
+    logger.info("startup_ok", extra={"event": "startup"})
 
     if settings.MODE == "polling":
         executor.start_polling(dp, skip_updates=True)
