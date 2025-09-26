@@ -11,7 +11,7 @@ import aiohttp
 from aiogram import Dispatcher, types
 from aiogram.types import InputFile
 
-from app.config import settings
+from app.config import get_runtime_port, settings
 from app.services.diagnostics import get_last_bundle
 from app.utils.admins import is_admin
 from app.utils.logging import log_event
@@ -53,12 +53,10 @@ async def cmd_runtime(message: types.Message) -> None:
     if not _is_admin(message):
         return
 
-    port_env = os.getenv("PORT")
-    port = port_env or str(settings.WEBAPP_PORT)
     text = (
         "<b>runtime</b>\n"
         f"MODE: <code>{settings.MODE}</code>\n"
-        f"PORT: <code>{port}</code>\n"
+        f"PORT: <code>{get_runtime_port()}</code>\n"
         f"WEBHOOK_URL: {settings.WEBHOOK_URL or '-'}"
     )
     await message.reply(text, parse_mode="HTML")

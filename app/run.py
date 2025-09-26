@@ -15,7 +15,7 @@ from .utils.logging import setup_logging
 setup_logging()
 
 from . import webhook
-from .config import settings
+from .config import get_runtime_port, settings
 from .handlers import (  # noqa: E402  (setup_logging must run before handlers)
     admin as h_admin,
     admin_debug,
@@ -83,15 +83,7 @@ bot = dp.bot
 
 
 def _resolve_listen_port() -> int:
-    port_env = os.getenv("PORT")
-    if port_env is None:
-        if settings.MODE == "webhook":
-            raise RuntimeError("PORT environment variable must be set in webhook mode")
-        return settings.WEBAPP_PORT
-    try:
-        return int(port_env)
-    except ValueError as exc:
-        raise RuntimeError("PORT environment variable must be an integer") from exc
+    return get_runtime_port()
 
 
 def _validate_webhook_url() -> None:
@@ -118,8 +110,6 @@ def main() -> None:
     listen_port = _resolve_listen_port()
     if settings.MODE == "webhook":
         _validate_webhook_url()
-    settings.WEBAPP_PORT = listen_port
-
     logger.info(
         "Final configuration: mode=%s, webhook_url=%s, port=%s",
         settings.MODE,
@@ -150,16 +140,14 @@ def main() -> None:
 
             config = uvicorn.Config(
                 webhook.app,
-                host=settings.WEBAPP_HOST,
+                host="0.0.0.0",
                 port=listen_port,
                 log_level="info",
             )
             server = uvicorn.Server(config)
-            log_event(
-                "server_start",
-                message=f"Starting server on {settings.WEBAPP_HOST}:{listen_port}",
-            )
-            logger.info("Uvicorn running on http://%s:%s", settings.WEBAPP_HOST, listen_port)
+            start_message = f"Starting server on 0.0.0.0:{listen_port}"
+            log_event("server_start", message=start_message)
+            logger.info(start_message)
             await server.serve()
         finally:
             # Only try to remove webhook if it was successfully set
