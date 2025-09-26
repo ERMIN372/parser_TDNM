@@ -1,27 +1,22 @@
 from __future__ import annotations
 
-import os
 import shutil
 from pathlib import Path
 
 from peewee import SqliteDatabase
 
 
+from app.config import settings
+
 _LEGACY_DB_DIR = Path("data")
 _LEGACY_DB_NAME = "bot.db"
-_DEFAULT_DB_PATH = Path("var/db") / _LEGACY_DB_NAME
 
 
 def _resolve_db_path() -> Path:
     """Return the path to the SQLite database and migrate legacy locations."""
 
-    env_value = os.getenv("DB_PATH")
-    if env_value:
-        db_path = Path(env_value)
-    else:
-        db_path = _DEFAULT_DB_PATH
-        _migrate_legacy_db(db_path)
-
+    db_path = Path(settings.DB_PATH)
+    _migrate_legacy_db(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return db_path
 

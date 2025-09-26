@@ -13,6 +13,7 @@ class Settings:
     WEBAPP_PORT: int
     WEBAPP_PORT_SOURCE: str
     WEBHOOK_URL: str
+    DB_PATH: Path
     REPORT_DIR: Path
     BUILD_VERSION: str
     PARSER_USER_AGENT: str | None = None
@@ -52,6 +53,9 @@ def _load() -> Settings:
         port_source = f"{port_source}:invalid"
         port_value = 8090
 
+    db_path = Path(os.getenv("DB_PATH", "var/db/bot.db"))
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
     cfg = Settings(
         TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         MODE=os.getenv("MODE", "polling"),
@@ -59,6 +63,7 @@ def _load() -> Settings:
         WEBAPP_PORT=port_value,
         WEBAPP_PORT_SOURCE=port_source,
         WEBHOOK_URL=os.getenv("WEBHOOK_URL", ""),
+        DB_PATH=db_path,
         REPORT_DIR=Path(os.getenv("REPORT_DIR", "./reports")),
         BUILD_VERSION=os.getenv("BUILD_VERSION")
         or os.getenv("REPLIT_RELEASE", "dev"),
