@@ -73,7 +73,7 @@ def handle_start(
             inviter_token=token,
             invitee_id=invitee_id,
         )
-        return StartResult(status="rejected", message="Реферальная ссылка недействительна.")
+        return StartResult(status="rejected", message="Реферальная ссылка недействительна")
     log_event(
         "referral_link_opened",
         inviter_id=stats.user_id,
