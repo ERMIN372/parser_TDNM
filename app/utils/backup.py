@@ -1,11 +1,10 @@
 from __future__ import annotations
-import os
+
 import sqlite3
 import zipfile
 from pathlib import Path
 
-# можно переопределить в .env: DB_PATH=data/bot.db
-DB_PATH = os.getenv("DB_PATH", "data/bot.db")
+from app.storage.db import DB_FILE  # путь можно переопределить через переменную окружения DB_PATH
 
 def make_sqlite_backup(dst_zip: Path | str) -> Path:
     """
@@ -18,7 +17,7 @@ def make_sqlite_backup(dst_zip: Path | str) -> Path:
     # временный файл для копии
     tmp_db = dst_zip.with_suffix(".tmp.db")
 
-    src = sqlite3.connect(DB_PATH, check_same_thread=False)
+    src = sqlite3.connect(str(DB_FILE), check_same_thread=False)
     try:
         # делаем «горячий» бэкап
         dst = sqlite3.connect(tmp_db)
