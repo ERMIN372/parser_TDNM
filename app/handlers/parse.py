@@ -45,7 +45,7 @@ from app import keyboards
 from app.utils.admins import is_admin
 from app.utils.callbacks import safe_answer
 from app.utils.logging import complete_operation, log_event, update_context
-from app.utils.progress import ProgressMessage
+from app.utils.progress import ProgressReporter, create_preview_progress, create_report_progress
 from app.utils.normalize import normalize_city, normalize_role
 
 log = logging.getLogger(__name__)
@@ -55,77 +55,33 @@ _WARN_CACHE: Dict[int, Tuple[str, str, dict]] = {}
 # Кеш шага выбора объёма: user_id -> (norm_title, city, area_id, overrides, max_total)
 _PENDING_QTY: Dict[int, Tuple[str, str, int, dict, int]] = {}
 
-PROGRESS_STEPS_2 = (
-    "Шаг 1/2: собираю вакансии… {spinner}",
-    "Шаг 2/2: формирую Excel-отчёт… {spinner}",
-)
-PROGRESS_STEPS_3 = (
-    "Шаг 1/3: собираю вакансии… {spinner}",
-    "Шаг 2/3: фильтрую по ключевым словам… {spinner}",
-    "Шаг 3/3: формирую Excel-отчёт… {spinner}",
-)
-PREVIEW_TEMPLATE = "Готовлю превью (5 вакансий)… {spinner}"
 DONE_TEXT = "Готово ✅"
 FAIL_TEXT = "❌ Не получилось (ошибка/таймаут). Попробуй позже."
-
-
-class ReportProgressTracker:
-    def __init__(self, progress: ProgressMessage, steps: tuple[str, ...]):
-        self._progress = progress
-        self._steps = steps
-        self._current = 0
-        self._finished = False
-
-    @property
-    def has_filter(self) -> bool:
-        return len(self._steps) == len(PROGRESS_STEPS_3)
-
-    async def handle_event(self, kind: str, payload: dict) -> None:
-        if self._finished:
-            return
-        if kind == "status":
-            status = payload.get("status")
-            if status == "csv":
-                await self._set_step(1 if len(self._steps) > 1 else 0)
-            elif status == "report" and payload.get("format") == "xlsx":
-                if not self.has_filter and len(self._steps) > 1:
-                    await self._set_step(len(self._steps) - 1)
-        elif kind == "filter_start":
-            if self.has_filter:
-                await self._set_step(1)
-        elif kind == "filter_done":
-            if self.has_filter:
-                await self._set_step(2)
-
-    async def _set_step(self, index: int) -> None:
-        if index < 0 or index >= len(self._steps):
-            return
-        if index == self._current:
-            return
-        self._current = index
-        await self._progress.update_template(self._steps[index])
-
-    async def finish_success(self, *, delete_after: float | None = 45.0) -> None:
-        if self._finished:
-            return
-        self._finished = True
-        await self._progress.finish(DONE_TEXT, delete_after=delete_after)
-
-    async def fail(self) -> None:
-        if self._finished:
-            return
-        self._finished = True
-        await self._progress.fail(FAIL_TEXT)
 
 
 async def _start_report_progress(
     message: types.Message,
     include: list[str] | None = None,
     exclude: list[str] | None = None,
-) -> ReportProgressTracker:
-    steps = PROGRESS_STEPS_3 if (include or exclude) else PROGRESS_STEPS_2
-    progress = await ProgressMessage.create(message.bot, message.chat.id, steps[0])
-    return ReportProgressTracker(progress, steps)
+) -> ProgressReporter:
+    return create_report_progress(message.bot, message.chat.id)
+
+
+async def _close_progress_success(
+    tracker: ProgressReporter | None,
+    *,
+    delete_after: float | None = 45.0,
+) -> None:
+    if tracker:
+        await tracker.close(True, message=DONE_TEXT, delete_after=delete_after)
+
+
+async def _close_progress_fail(
+    tracker: ProgressReporter | None,
+    text: str = FAIL_TEXT,
+) -> None:
+    if tracker:
+        await tracker.close(False, message=text)
 
 
 def _is_timeout_error(exc: BaseException) -> bool:
@@ -592,7 +548,7 @@ async def _run_parser_bypass_validation(
         city=city,
         overrides=overrides,
     )
-    tracker: ReportProgressTracker | None = None
+    tracker: ProgressReporter | None = None
     decision: QuotaDecision | None = None
     result: parser_adapter.ReportResult | None = None
     try:
@@ -612,7 +568,10 @@ async def _run_parser_bypass_validation(
 
         async def _progress(kind: str, payload: dict) -> None:
             if tracker:
-                await tracker.handle_event(kind, payload)
+                try:
+                    await tracker.handle_event(kind, payload)
+                except Exception:  # pragma: no cover
+                    log.warning("report progress callback failed", exc_info=True)
 
         result = await parser_adapter.run_report(
             uid,
@@ -625,8 +584,7 @@ async def _run_parser_bypass_validation(
             **{k: v for k, v in overrides.items() if k not in {"include", "exclude"}},
         )
     except Exception as e:  # pragma: no cover
-        if tracker:
-            await tracker.fail()
+        await _close_progress_fail(tracker)
         event = "parse_timeout" if _is_timeout_error(e) else "parse_error"
         err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
         log_event(event, level="ERROR", err=err_text)
@@ -647,11 +605,9 @@ async def _run_parser_bypass_validation(
                 exclude=overrides.get("exclude"),
                 reply_markup=_main_menu_kb(message, user=user),
             )
-            if tracker:
-                await tracker.finish_success()
+            await _close_progress_success(tracker)
         else:
-            if tracker:
-                await tracker.fail()
+            await _close_progress_fail(tracker)
             await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
             log_event("parse_error", level="ERROR", err="report_missing")
             complete_operation(ok=False, err="report_missing")
@@ -702,7 +658,7 @@ async def _run_with_amount(
         approx_total=total,
     )
     decision: QuotaDecision | None = None
-    tracker: ReportProgressTracker | None = None
+    tracker: ProgressReporter | None = None
     result: parser_adapter.ReportResult | None = None
 
     try:
@@ -723,7 +679,10 @@ async def _run_with_amount(
 
         async def _progress(kind: str, payload: dict) -> None:
             if tracker:
-                await tracker.handle_event(kind, payload)
+                try:
+                    await tracker.handle_event(kind, payload)
+                except Exception:  # pragma: no cover
+                    log.warning("report progress callback failed", exc_info=True)
 
         run_kwargs = {k: v for k, v in ov.items() if k not in {"include", "exclude"}}
         result = await parser_adapter.run_report(
@@ -738,8 +697,7 @@ async def _run_with_amount(
             **run_kwargs,
         )
     except Exception as e:
-        if tracker:
-            await tracker.fail()
+        await _close_progress_fail(tracker)
         err_text = (str(e) or "").strip() or "Не удалось получить отчёт: парсер вернул ошибку. Попробуйте позже"
         event = "parse_timeout" if _is_timeout_error(e) else "parse_error"
         log_event(event, level="ERROR", err=err_text)
@@ -762,11 +720,9 @@ async def _run_with_amount(
                 exclude=ov.get("exclude"),
                 reply_markup=_main_menu_kb(message, user=user),
             )
-            if tracker:
-                await tracker.finish_success()
+            await _close_progress_success(tracker)
         else:
-            if tracker:
-                await tracker.fail()
+            await _close_progress_fail(tracker)
             await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
             log_event("parse_error", level="ERROR", err="report_missing")
             complete_operation(ok=False, err="report_missing")
@@ -845,7 +801,7 @@ async def _run_parser(
             overrides=ov,
         )
         decision: QuotaDecision | None = None
-        tracker: ReportProgressTracker | None = None
+        tracker: ProgressReporter | None = None
         result: parser_adapter.ReportResult | None = None
         try:
             decision = await _ensure_quota(
@@ -864,7 +820,10 @@ async def _run_parser(
 
             async def _progress(kind: str, payload: dict) -> None:
                 if tracker:
-                    await tracker.handle_event(kind, payload)
+                    try:
+                        await tracker.handle_event(kind, payload)
+                    except Exception:  # pragma: no cover
+                        log.warning("report progress callback failed", exc_info=True)
 
             run_kwargs = {k: v for k, v in ov.items() if k not in {"include", "exclude"}}
             result = await parser_adapter.run_report(
@@ -901,11 +860,9 @@ async def _run_parser(
                     exclude=ov.get("exclude"),
                     reply_markup=_main_menu_kb(message, user=user),
                 )
-                if tracker:
-                    await tracker.finish_success()
+                await _close_progress_success(tracker)
             else:
-                if tracker:
-                    await tracker.fail()
+                await _close_progress_fail(tracker)
                 await message.answer("Отчёт не найден. Проверьте логи.", reply_markup=_main_menu_kb(message, user=user))
                 log_event("parse_error", level="ERROR", err="report_missing")
                 complete_operation(ok=False, err="report_missing")
@@ -1279,7 +1236,7 @@ async def cb_preview(call: types.CallbackQuery, state: FSMContext):
     if not await safe_answer(call, "Готовлю превью…", show_alert=False):
         return
 
-    progress: ProgressMessage | None = None
+    tracker: ProgressReporter | None = None
     try:
         payload = _PENDING_QTY.get(uid)   # ВАЖНО: .get(), НЕ .pop()!
         if not payload:
@@ -1309,8 +1266,16 @@ async def cb_preview(call: types.CallbackQuery, state: FSMContext):
             if not decision:
                 return
 
-        progress = await ProgressMessage.create(call.message.bot, call.message.chat.id, PREVIEW_TEMPLATE)
+        tracker = create_preview_progress(call.message.bot, call.message.chat.id)
         _log_preview_start(title, city, overrides)
+
+        async def _progress(kind: str, payload: dict) -> None:
+            if tracker:
+                try:
+                    await tracker.handle_event(kind, payload)
+                except Exception:  # pragma: no cover
+                    log.warning("preview progress callback failed", exc_info=True)
+
         try:
             preview_result = await parser_adapter.preview_rows(
                 uid,
@@ -1319,11 +1284,11 @@ async def cb_preview(call: types.CallbackQuery, state: FSMContext):
                 area=area_id,
                 include=include,
                 exclude=exclude,
+                progress=_progress,
             )
         except parser_adapter.DiagnosticError as exc:
             _log_preview_timeout(title, city, overrides, err=str(exc))
-            if progress:
-                await progress.fail()
+            await _close_progress_fail(tracker)
             await call.message.answer(
                 "Не получилось подготовить превью 😔\n"
                 "Попробуйте ещё раз позже.\n"
@@ -1333,8 +1298,7 @@ async def cb_preview(call: types.CallbackQuery, state: FSMContext):
             return
         except Exception as exc:
             _log_preview_timeout(title, city, overrides, err=str(exc))
-            if progress:
-                await progress.fail()
+            await _close_progress_fail(tracker)
             await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
             return
 
@@ -1342,8 +1306,7 @@ async def cb_preview(call: types.CallbackQuery, state: FSMContext):
         if not rows:
             await call.message.answer("Совпадений не нашлось по текущим критериям.")
             _log_preview_ready(title, city, 0, overrides)
-            if progress:
-                await progress.finish(DONE_TEXT, delete_after=45.0)
+            await _close_progress_success(tracker)
             return
 
         # аккуратный текст превью
@@ -1361,8 +1324,7 @@ async def cb_preview(call: types.CallbackQuery, state: FSMContext):
         txt = "<b>Предпросмотр (первые совпадения):</b>\n" + "\n".join(lines)
         await call.message.answer(txt, disable_web_page_preview=True)
         _log_preview_ready(title, city, len(rows), overrides)
-        if progress:
-            await progress.finish(DONE_TEXT, delete_after=45.0)
+        await _close_progress_success(tracker)
     finally:
         clear_busy(uid)
 

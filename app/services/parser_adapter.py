@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
 
 from app.utils.diagnostics import write_bundle
-from app.utils.logging import log_event
+from app.utils.logging import get_operation_context, log_event
 
 log = logging.getLogger(__name__)
 
@@ -354,6 +354,7 @@ async def preview_rows(
     area: Optional[int] = None,
     include: Iterable[str] | str | None = None,
     exclude: Iterable[str] | str | None = None,
+    progress: ProgressCallback | None = None,
 ) -> PreviewResult:
     """Возвращает первые строки превью вместе с диагностикой."""
 
@@ -400,7 +401,62 @@ async def preview_rows(
         "exclude": exclude_list,
     }
 
+    STAGE_KEYS = ("preflight", "fetch", "normalize", "write_xlsx")
+    STAGE_WEIGHTS = {"preflight": 5.0, "fetch": 60.0, "normalize": 20.0, "write_xlsx": 15.0}
+    stage_progress: Dict[str, float] = {key: 0.0 for key in STAGE_KEYS}
+    progress_state: Dict[str, Any] = {
+        "percent": 0.0,
+        "stage": None,
+        "stages": {key: 0.0 for key in STAGE_KEYS},
+    }
+    ctx = get_operation_context()
+    correlation_id = ctx.correlation_id if ctx else str(uuid.uuid4())
+
+    async def _emit(event: str, payload: dict) -> None:
+        if not progress:
+            return
+        try:
+            await progress(event, payload)
+        except Exception:  # pragma: no cover
+            log.warning("preview progress callback failed", exc_info=True)
+
+    def _update(stage: str, value: float) -> None:
+        if stage not in stage_progress:
+            return
+        val = max(0.0, min(1.0, value))
+        if val >= stage_progress[stage]:
+            stage_progress[stage] = val
+        percent = 0.0
+        for key, weight in STAGE_WEIGHTS.items():
+            percent += weight * stage_progress[key]
+        if stage_progress["write_xlsx"] < 1.0:
+            percent = min(percent, 99.0)
+        progress_state["percent"] = round(percent, 2)
+        progress_state["stage"] = stage
+        progress_state["stages"] = {key: round(val, 4) for key, val in stage_progress.items()}
+
+    def _progress_snapshot() -> Dict[str, Any]:
+        return {
+            "percent": progress_state.get("percent"),
+            "stage": progress_state.get("stage"),
+            "stages": dict(progress_state.get("stages", {})),
+        }
+
+    _update("preflight", 1.0)
+    if progress:
+        await _emit(
+            "start",
+            {
+                "correlation_id": correlation_id,
+                "mode": "preview",
+                "site": "hh",
+            },
+        )
+        await _emit("update", {"stage": "preflight", "subprogress": 1.0})
+
     try:
+        _update("fetch", 0.1)
+        await _emit("update", {"stage": "fetch", "subprogress": 0.1})
         rows_raw = await preview_report(
             user_id,
             query,
@@ -410,6 +466,8 @@ async def preview_rows(
             exclude=exclude,
             diagnostic=diagnostic,
         )
+        _update("fetch", 1.0)
+        await _emit("update", {"stage": "fetch", "subprogress": 1.0})
     except Exception as exc:
         stack_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         error_meta = dict(base_meta)
@@ -423,6 +481,7 @@ async def preview_rows(
                 "returncode": diagnostic.get("returncode"),
             }
         )
+        error_meta["progress"] = _progress_snapshot()
         bundle = write_bundle(
             user_dir,
             bundle_prefix,
@@ -488,6 +547,13 @@ async def preview_rows(
                 }
             )
 
+    _update("normalize", 1.0)
+    await _emit("update", {"stage": "normalize", "subprogress": 1.0})
+
+    if stage_progress["write_xlsx"] < 0.2:
+        _update("write_xlsx", 0.2)
+        await _emit("update", {"stage": "write_xlsx", "subprogress": 0.2})
+
     success_meta = dict(base_meta)
     success_meta.update(
         {
@@ -500,6 +566,9 @@ async def preview_rows(
             "error": diagnostic.get("error"),
         }
     )
+    _update("write_xlsx", 1.0)
+    await _emit("update", {"stage": "write_xlsx", "subprogress": 1.0})
+    success_meta["progress"] = _progress_snapshot()
 
     bundle = write_bundle(
         user_dir,
@@ -619,6 +688,81 @@ async def run_report(
     }
     bundle_prefix = f"report_{uuid.uuid4().hex[:6]}"
 
+    STAGE_KEYS = ("preflight", "fetch", "normalize", "write_xlsx")
+    STAGE_WEIGHTS = {"preflight": 5.0, "fetch": 60.0, "normalize": 20.0, "write_xlsx": 15.0}
+    stage_progress: Dict[str, float] = {key: 0.0 for key in STAGE_KEYS}
+    progress_state: Dict[str, Any] = {
+        "percent": 0.0,
+        "pages_done": 0,
+        "pages_total": pages or 0,
+        "stage": None,
+        "stages": {key: 0.0 for key in STAGE_KEYS},
+    }
+    ctx = get_operation_context()
+    correlation_id = ctx.correlation_id if ctx else str(uuid.uuid4())
+
+    async def _emit(event: str, payload: dict) -> None:
+        if not progress:
+            return
+        try:
+            await progress(event, payload)
+        except Exception:  # pragma: no cover
+            log.warning("progress callback failed", exc_info=True)
+
+    def _update_snapshot(
+        stage: str,
+        subprogress: float,
+        *,
+        pages_done: int | None = None,
+        pages_total: int | None = None,
+    ) -> None:
+        if stage not in stage_progress:
+            return
+        value = max(0.0, min(1.0, subprogress))
+        if value >= stage_progress[stage]:
+            stage_progress[stage] = value
+        if pages_total is not None and pages_total > 0:
+            progress_state["pages_total"] = pages_total
+        if pages_done is not None and pages_done >= 0:
+            progress_state["pages_done"] = pages_done
+        percent = 0.0
+        for key, weight in STAGE_WEIGHTS.items():
+            percent += weight * min(1.0, stage_progress[key])
+        if stage_progress["write_xlsx"] < 1.0:
+            percent = min(percent, 99.0)
+        progress_state["percent"] = round(percent, 2)
+        progress_state["stage"] = stage
+        progress_state["stages"] = {key: round(val, 4) for key, val in stage_progress.items()}
+
+    def _progress_snapshot() -> Dict[str, Any]:
+        return {
+            "percent": progress_state.get("percent"),
+            "stage": progress_state.get("stage"),
+            "pages_done": progress_state.get("pages_done"),
+            "pages_total": progress_state.get("pages_total"),
+            "stages": dict(progress_state.get("stages", {})),
+        }
+
+    _update_snapshot("preflight", 1.0, pages_total=pages)
+    if progress:
+        await _emit(
+            "start",
+            {
+                "correlation_id": correlation_id,
+                "mode": "report",
+                "pages_total": pages,
+                "site": site,
+            },
+        )
+        await _emit(
+            "update",
+            {
+                "stage": "preflight",
+                "subprogress": 1.0,
+                "pages_total": pages,
+            },
+        )
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -635,20 +779,51 @@ async def run_report(
                     break
                 text_line = line.decode(errors="ignore").rstrip("\r\n")
                 stdout_lines.append(text_line)
-                if progress:
+                try:
+                    payload = json.loads(text_line)
+                except json.JSONDecodeError:
+                    continue
+                status = payload.get("status")
+                if status == "fetch_progress":
+                    pages_done = int(payload.get("pages_done") or 0)
+                    pages_total = int(payload.get("pages_total") or 0) or progress_state.get("pages_total") or (pages or 0)
+                    sub = float(pages_done / pages_total) if pages_total else 0.0
+                    _update_snapshot("fetch", sub, pages_done=pages_done, pages_total=pages_total)
+                    await _emit(
+                        "update",
+                        {
+                            "stage": "fetch",
+                            "subprogress": sub,
+                            "pages_done": pages_done,
+                            "pages_total": pages_total,
+                        },
+                    )
+                    continue
+                if status == "csv" and payload.get("path"):
                     try:
-                        payload = json.loads(text_line)
-                    except json.JSONDecodeError:
-                        continue
-                    if payload.get("status") == "csv" and payload.get("path"):
-                        try:
-                            csv_path = Path(payload["path"])
-                        except Exception:  # pragma: no cover
-                            csv_path = None
-                    try:
-                        await progress("status", payload)
+                        csv_path = Path(payload["path"])
                     except Exception:  # pragma: no cover
-                        log.warning("progress callback failed", exc_info=True)
+                        csv_path = None
+                    total_pages = progress_state.get("pages_total") or (pages or 0)
+                    done_pages = progress_state.get("pages_done") or total_pages
+                    _update_snapshot("fetch", 1.0, pages_done=done_pages, pages_total=total_pages)
+                    await _emit(
+                        "update",
+                        {
+                            "stage": "fetch",
+                            "subprogress": 1.0,
+                            "pages_done": done_pages,
+                            "pages_total": total_pages,
+                        },
+                    )
+                    if stage_progress["normalize"] < 0.05:
+                        _update_snapshot("normalize", 0.05)
+                        await _emit("update", {"stage": "normalize", "subprogress": 0.05})
+                    continue
+                if status == "report" and payload.get("format") == "xlsx":
+                    _update_snapshot("write_xlsx", 1.0)
+                    await _emit("update", {"stage": "write_xlsx", "subprogress": 1.0})
+                    continue
 
         async def _read_stderr() -> None:
             assert proc.stderr is not None
@@ -685,24 +860,36 @@ async def run_report(
             )
 
         if inc or exc:
-            if progress:
-                try:
-                    await progress("filter_start", {"csv_path": str(csv_path) if csv_path else None})
-                except Exception:  # pragma: no cover
-                    log.warning("progress callback failed on filter_start", exc_info=True)
+            if stage_progress["normalize"] < 0.2:
+                _update_snapshot("normalize", 0.2)
+                await _emit("update", {"stage": "normalize", "subprogress": 0.2})
             await asyncio.to_thread(_postfilter_any, out_path, inc, exc, csv_path=csv_path)
-            if progress:
-                try:
-                    await progress("filter_done", {"csv_path": str(csv_path) if csv_path else None})
-                except Exception:  # pragma: no cover
-                    log.warning("progress callback failed on filter_done", exc_info=True)
+            _update_snapshot("normalize", 1.0)
+            await _emit(
+                "update",
+                {
+                    "stage": "normalize",
+                    "subprogress": 1.0,
+                    "csv_path": str(csv_path) if csv_path else None,
+                },
+            )
+        else:
+            if stage_progress["normalize"] < 1.0:
+                _update_snapshot("normalize", 1.0)
+                await _emit("update", {"stage": "normalize", "subprogress": 1.0})
+
+        if stage_progress["write_xlsx"] < 0.2:
+            _update_snapshot("write_xlsx", 0.2)
+            await _emit("update", {"stage": "write_xlsx", "subprogress": 0.2})
 
         bundle_meta["csv_path"] = str(csv_path) if csv_path else None
+        bundle_meta["progress"] = _progress_snapshot()
     except Exception as exc:
         stack_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         error_meta = dict(bundle_meta)
         error_meta["status"] = "error"
         error_meta["error"] = str(exc)
+        error_meta["progress"] = _progress_snapshot()
         bundle = write_bundle(
             user_dir,
             bundle_prefix,
@@ -729,6 +916,7 @@ async def run_report(
 
     success_meta = dict(bundle_meta)
     success_meta["status"] = "ok"
+    success_meta["progress"] = _progress_snapshot()
     bundle = write_bundle(
         user_dir,
         bundle_prefix,
