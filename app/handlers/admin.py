@@ -8,14 +8,13 @@ from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from aiogram.utils.exceptions import BotBlocked, ChatNotFound, RetryAfter, MessageNotModified
-from pathlib import Path
 
 from peewee import IntegrityError
 
 from app.storage import promo_repo, repo
 from app.storage.models import User
 from app.services import promo as promo_service, referrals as referral_service
-from app.utils.backup import make_sqlite_backup
+from app.utils.backup import create_timestamped_backup
 from app.utils.admins import is_admin
 from app.utils.callbacks import safe_answer
 
@@ -808,10 +807,8 @@ async def cast_cmd(message: types.Message):
 # -------- бэкап БД --------
 async def cb_backup(call: types.CallbackQuery):
     if not _guard(call.from_user.id): return
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    out = Path(f"backups/botdb_{ts}.zip")
     try:
-        z = make_sqlite_backup(out)
+        z = create_timestamped_backup()
         await call.message.reply_document(InputFile(z), caption=f"Бэкап {z.name}")
     except Exception as e:
         await call.message.reply(f"Не удалось сделать бэкап: {e}")
