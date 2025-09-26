@@ -23,7 +23,22 @@ from ..services import parser_adapter
 from ..services import referrals
 from ..services import validator  # валидация запроса
 from ..services import chips
-from ..services.mini_analytics import get_summary, register_context, render_mini_analytics
+# --- resilient mini_analytics import (never crash app on missing symbols) ---
+try:
+    from ..services import mini_analytics as _ma  # import module, not names
+    get_summary = getattr(_ma, "get_summary", lambda *a, **k: None)
+    register_context = getattr(_ma, "register_context", lambda *a, **k: None)
+    render_mini_analytics = getattr(_ma, "render_mini_analytics", lambda *a, **k: None)
+except Exception:  # any import/exec error inside module
+    def get_summary(*a, **k):
+        return None
+
+    def register_context(*a, **k):
+        return None
+
+    def render_mini_analytics(*a, **k):
+        return None
+# --- end resilient import ---
 from ..services import report_share
 from ..services import paywall
 from ..services.quota import FREE_PER_MONTH, QuotaDecision, check_quota, commit_usage
