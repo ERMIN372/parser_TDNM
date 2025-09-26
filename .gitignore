@@ -73,3 +73,6 @@ Thumbs.db
 *.tmp
 *.temp
 tmp/
+
+# Runtime data
+data/bot.db*
