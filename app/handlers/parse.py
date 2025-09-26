@@ -33,6 +33,8 @@ from app.utils.logging import complete_operation, log_event, update_context
 from app.utils.progress import ProgressMessage
 from app.utils.normalize import normalize_city, normalize_role
 
+log = logging.getLogger(__name__)
+
 # Кеш последнего «сомнительного» запроса: user_id -> (query, city, overrides)
 _WARN_CACHE: Dict[int, Tuple[str, str, dict]] = {}
 # Кеш шага выбора объёма: user_id -> (norm_title, city, area_id, overrides, max_total)
@@ -430,13 +432,41 @@ async def _send_report_with_analytics(
         chips.record_success(person.id, title, city)
     include_list = _ensure_str_list(include)
     exclude_list = _ensure_str_list(exclude)
-    text = render_mini_analytics(
-        path,
-        approx_total=approx_total,
-        include=include_list,
-        exclude=exclude_list,
-    )
-    summary = get_summary(path)
+
+    report_ref = str(path)
+    analytics_text: str | None = None
+    try:
+        analytics_text = render_mini_analytics(
+            path,
+            approx_total=approx_total,
+            include=include_list,
+            exclude=exclude_list,
+        )
+        if not analytics_text:
+            log.warning("mini_analytics: analytics unavailable for %s", report_ref)
+    except Exception as exc:
+        log.warning(
+            "mini_analytics: failed to render analytics for %s: %s",
+            report_ref,
+            exc,
+            exc_info=True,
+        )
+        analytics_text = None
+
+    summary = None
+    summary_error = False
+    try:
+        summary = get_summary(path)
+    except Exception as exc:
+        summary_error = True
+        log.warning(
+            "mini_analytics: failed to build summary for %s: %s",
+            report_ref,
+            exc,
+            exc_info=True,
+        )
+    if summary is None and not summary_error:
+        log.warning("mini_analytics: summary unavailable for %s", report_ref)
     if person:
         report_share.save_last_report(
             person.id,
@@ -451,8 +481,12 @@ async def _send_report_with_analytics(
             high=getattr(summary, "high", None),
             top_companies=getattr(summary, "top_companies", None),
         )
-    if text:
-        await message.answer(text, disable_web_page_preview=True, reply_markup=reply_markup)
+    if analytics_text:
+        await message.answer(
+            analytics_text,
+            disable_web_page_preview=True,
+            reply_markup=reply_markup,
+        )
     elif reply_markup is not None:
         await message.answer("Готово ✅", reply_markup=reply_markup)
     activation = referrals.handle_activation_trigger(message.from_user.id, "report")

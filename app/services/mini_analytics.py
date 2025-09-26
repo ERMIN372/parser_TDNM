@@ -5,6 +5,7 @@ import logging
 import math
 import re
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -22,7 +23,233 @@ _CONTEXT: dict[str, tuple[str, str]] = {}
 
 _THIN_NBSP = "\u202f"
 
-__all__ = ["register_context", "render_mini_analytics"]
+__all__ = ["get_summary", "register_context", "render_mini_analytics"]
+
+
+MINI_ANALYTICS_AVAILABLE = pd is not None and np is not None
+
+if MINI_ANALYTICS_AVAILABLE:
+    log.info("mini_analytics: enabled")
+else:  # pragma: no cover - executed only when pandas/numpy missing
+    log.info("mini_analytics: disabled (using stubs)")
+
+
+@dataclass(slots=True)
+class MiniAnalyticsSummary:
+    median: int | None = None
+    low: int | None = None
+    high: int | None = None
+    top_companies: list[str] | None = None
+
+
+@dataclass(slots=True)
+class _AnalyticsContext:
+    df: "pd.DataFrame"
+    processed: int
+    raw_map: dict[str, str]
+    title_text: str
+    city_text: str
+
+
+@dataclass(slots=True)
+class _SalaryStats:
+    median: float
+    low: float
+    high: float
+    share: float | None
+
+
+_SUMMARY_CACHE: dict[str, MiniAnalyticsSummary | None] = {}
+
+
+def _analytics_key(path: Path) -> str:
+    return str(Path(path).resolve())
+
+
+def _normalize_total(value: int | float | str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        text = str(value).replace(" ", "").replace(",", ".")
+        return int(float(text))
+    except Exception:
+        return None
+
+
+def _resolve_context_labels(path: Path, *, consume: bool = True) -> tuple[str, str]:
+    key = _analytics_key(path)
+    if consume:
+        context = _CONTEXT.pop(key, None)
+    else:
+        context = _CONTEXT.get(key)
+    if context is None:
+        return "—", "—"
+    raw_title, raw_city = context
+    return (raw_title or "—"), (raw_city or "—")
+
+
+def _prepare_context(path: Path, *, consume_context: bool = True) -> _AnalyticsContext | None:
+    if not MINI_ANALYTICS_AVAILABLE:  # pragma: no cover - handled by stub
+        return None
+
+    df = _load_dataframe(path)
+    if df is None or df.empty:
+        return None
+
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    rename_map, raw_map = _resolve_columns(df)
+    df = df.rename(columns=rename_map)
+
+    if "title" not in df.columns or "link" not in df.columns:
+        return None
+
+    df["title"] = df["title"].apply(_clean_text)
+    df["link"] = df["link"].apply(_clean_text)
+    if "company" in df.columns:
+        df["company"] = df["company"].apply(_clean_text)
+    else:
+        df["company"] = ""
+
+    valid_mask = (df["title"].str.len() > 0) & (df["link"].str.len() > 0)
+    df = df.loc[valid_mask].copy()
+    if df.empty:
+        return None
+
+    key_series = (
+        df["title"].str.lower()
+        + "||"
+        + df["company"].str.lower()
+        + "||"
+        + df["link"].str.lower()
+    )
+    df = df.loc[~key_series.duplicated()].copy()
+    if df.empty:
+        return None
+
+    processed = int(df.shape[0])
+    title_text, city_text = _resolve_context_labels(path, consume=consume_context)
+
+    return _AnalyticsContext(
+        df=df,
+        processed=processed,
+        raw_map=raw_map,
+        title_text=title_text,
+        city_text=city_text,
+    )
+
+
+def _build_salary_block(context: _AnalyticsContext) -> tuple[list[str], _SalaryStats | None]:
+    df = context.df
+    if "salary_from" not in df.columns and "salary_to" not in df.columns:
+        return [], None
+
+    salary_from = df.get("salary_from")
+    salary_to = df.get("salary_to")
+
+    if salary_from is not None:
+        scale_from = _detect_scale(context.raw_map.get("salary_from"))
+        min_series = salary_from.apply(_to_number) * scale_from
+    else:
+        min_series = pd.Series(np.nan, index=df.index)
+
+    if salary_to is not None:
+        scale_to = _detect_scale(context.raw_map.get("salary_to"))
+        max_series = salary_to.apply(_to_number) * scale_to
+    else:
+        max_series = pd.Series(np.nan, index=df.index)
+
+    if "salary_currency" in df.columns:
+        currencies = df["salary_currency"].apply(_normalize_currency)
+    else:
+        currencies = pd.Series(["RUB"] * len(df), index=df.index)
+    currencies = currencies.replace({"RUR": "RUB"})
+    currency_mask = currencies.eq("RUB")
+
+    available_mask = currency_mask & (~min_series.isna() | ~max_series.isna())
+    if not available_mask.any():
+        return [], None
+
+    mid_values = []
+    for a, b in zip(min_series, max_series):
+        if pd.isna(a) and pd.isna(b):
+            mid_values.append(np.nan)
+        elif pd.isna(a):
+            mid_values.append(b)
+        elif pd.isna(b):
+            mid_values.append(a)
+        else:
+            mid_values.append((a + b) / 2)
+
+    mid = pd.Series(mid_values, index=df.index)
+    mid = mid.where(available_mask, np.nan)
+    mid_valid = mid.dropna()
+    if mid_valid.empty:
+        return [], None
+
+    median_val = float(np.nanmedian(mid_valid.values))
+    p10_val = float(np.nanpercentile(mid_valid.values, 10))
+    p90_val = float(np.nanpercentile(mid_valid.values, 90))
+    share_val: float | None = None
+    if context.processed:
+        share_val = (available_mask.sum() / context.processed) * 100
+
+    lines = ["<b>💰 Вилки (₽/мес, midpoint)</b>"]
+    lines.append(f"• медиана: {_format_money(median_val)}")
+    lines.append(f"• низ рынка: {_format_money(p10_val)}")
+    lines.append(f"• верх рынка: {_format_money(p90_val)}")
+    if share_val is not None:
+        lines.append(f"• с вилкой: {_format_percent(share_val)}")
+
+    stats = _SalaryStats(median=median_val, low=p10_val, high=p90_val, share=share_val)
+    return lines, stats
+
+
+def _build_top_companies_block(df: "pd.DataFrame") -> tuple[list[str], list[str]]:
+    companies = df["company"].apply(_clean_text)
+    if not companies.str.len().gt(0).any():
+        return [], []
+
+    normalized = companies.str.lower()
+    combined = pd.DataFrame({"orig": companies, "norm": normalized})
+    combined = combined[combined["norm"].str.len() > 0]
+    if combined.empty:
+        return [], []
+
+    counts = combined.groupby("norm").size().sort_values(ascending=False)
+    top_rows: list[str] = []
+    top_names: list[str] = []
+    for idx, (norm_name, count) in enumerate(counts.head(5).items(), start=1):
+        display_name = combined[combined["norm"] == norm_name]["orig"].iloc[0]
+        top_rows.append(f"{idx}) {html.escape(display_name)} — {_format_int(count)}")
+        top_names.append(str(display_name))
+
+    if not top_rows:
+        return [], []
+
+    lines = ["<b>🏢 Топ работодателей по кол-ву вакансий</b>"] + top_rows
+    return lines, top_names
+
+
+def _build_summary(stats: _SalaryStats | None, top_companies: list[str]) -> MiniAnalyticsSummary | None:
+    if stats is None and not top_companies:
+        return None
+
+    def _safe_round(value: float | None) -> int | None:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return None
+        return int(round(value))
+
+    summary = MiniAnalyticsSummary(
+        median=_safe_round(getattr(stats, "median", None)),
+        low=_safe_round(getattr(stats, "low", None)),
+        high=_safe_round(getattr(stats, "high", None)),
+        top_companies=top_companies or None,
+    )
+    if summary.median is None and summary.low is None and summary.high is None and not summary.top_companies:
+        return None
+    return summary
 
 _SPARKLINE_LEVELS = "▁▂▃▄▅▆▇█"
 _SCHEDULE_MAP = (
@@ -346,154 +573,41 @@ def render_mini_analytics(
 ) -> str | None:
     """Render compact analytics message for a generated report."""
 
-    if pd is None or np is None:  # pragma: no cover - pandas missing
+    key = _analytics_key(path)
+    if not MINI_ANALYTICS_AVAILABLE:  # pragma: no cover - pandas missing
+        _SUMMARY_CACHE.setdefault(key, None)
         return None
 
     try:
-        df = _load_dataframe(path)
-        if df is None or df.empty:
-            return None
-
-        df = df.copy()
-        df.columns = [str(c).strip() for c in df.columns]
-
-        rename_map, raw_map = _resolve_columns(df)
-        df = df.rename(columns=rename_map)
-
-        if "title" not in df.columns or "link" not in df.columns:
-            return None
-
-        df["title"] = df["title"].apply(_clean_text)
-        df["link"] = df["link"].apply(_clean_text)
-        if "company" in df.columns:
-            df["company"] = df["company"].apply(_clean_text)
-        else:
-            df["company"] = ""
-
-        valid_mask = (df["title"].str.len() > 0) & (df["link"].str.len() > 0)
-        df = df.loc[valid_mask].copy()
-        if df.empty:
-            return None
-
-        key_series = (
-            df["title"].str.lower()
-            + "||"
-            + df["company"].str.lower()
-            + "||"
-            + df["link"].str.lower()
-        )
-        df = df.loc[~key_series.duplicated()].copy()
-        if df.empty:
-            return None
-
-        processed = int(df.shape[0])
-
-        approx_val: int | None = None
-        if approx_total is not None:
-            try:
-                approx_val = int(float(str(approx_total).replace(" ", "").replace(",", ".")))
-            except Exception:
-                approx_val = None
-
-        key = str(Path(path).resolve())
-        context = _CONTEXT.pop(key, None)
+        context = _prepare_context(path, consume_context=True)
         if context is None:
-            title_text, city_text = "—", "—"
-        else:
-            raw_title, raw_city = context
-            title_text = raw_title or "—"
-            city_text = raw_city or "—"
+            _SUMMARY_CACHE[key] = None
+            return None
 
+        approx_val = _normalize_total(approx_total)
         header_lines = [
             "<b>📊 HR-Assist — мини-аналитика</b>",
-            f"Запрос: «{html.escape(title_text)}» • {html.escape(city_text)}",
+            f"Запрос: «{html.escape(context.title_text)}» • {html.escape(context.city_text)}",
         ]
-        processed_line = f"Обработано: {_format_int(processed)}"
+        processed_line = f"Обработано: {_format_int(context.processed)}"
         if approx_val is not None:
             processed_line += f" из ~{_format_int(approx_val)}"
         header_lines.append(processed_line)
 
         sections: list[str] = ["\n".join(header_lines)]
 
-        # Salary block
-        salary_lines: list[str] = []
-        if "salary_from" in df.columns or "salary_to" in df.columns:
-            scale_from = _detect_scale(raw_map.get("salary_from"))
-            scale_to = _detect_scale(raw_map.get("salary_to"))
-
-            salary_from = df.get("salary_from")
-            salary_to = df.get("salary_to")
-
-            if salary_from is not None:
-                min_series = salary_from.apply(_to_number) * scale_from
-            else:
-                min_series = pd.Series(np.nan, index=df.index)
-            if salary_to is not None:
-                max_series = salary_to.apply(_to_number) * scale_to
-            else:
-                max_series = pd.Series(np.nan, index=df.index)
-
-            if "salary_currency" in df.columns:
-                currencies = df["salary_currency"].apply(_normalize_currency)
-            else:
-                currencies = pd.Series(["RUB"] * len(df), index=df.index)
-            currencies = currencies.replace({"RUR": "RUB"})
-            currency_mask = currencies.eq("RUB")
-
-            available_mask = currency_mask & (~min_series.isna() | ~max_series.isna())
-            if available_mask.any():
-                mid_values = []
-                for a, b in zip(min_series, max_series):
-                    if pd.isna(a) and pd.isna(b):
-                        mid_values.append(np.nan)
-                    elif pd.isna(a):
-                        mid_values.append(b)
-                    elif pd.isna(b):
-                        mid_values.append(a)
-                    else:
-                        mid_values.append((a + b) / 2)
-                mid = pd.Series(mid_values, index=df.index)
-                mid = mid.where(available_mask, np.nan)
-                mid_valid = mid.dropna()
-                if not mid_valid.empty:
-                    median_val = float(np.nanmedian(mid_valid.values))
-                    p10_val = float(np.nanpercentile(mid_valid.values, 10))
-                    p90_val = float(np.nanpercentile(mid_valid.values, 90))
-                    share_val: float | None = None
-                    if processed:
-                        share_val = (available_mask.sum() / processed) * 100
-
-                    salary_lines.extend(
-                        [
-                            "<b>💰 Вилки (₽/мес, midpoint)</b>",
-                            f"• медиана: {_format_money(median_val)}",
-                            f"• низ рынка: {_format_money(p10_val)}",
-                            f"• верх рынка: {_format_money(p90_val)}",
-                        ]
-                    )
-                    if share_val is not None:
-                        salary_lines.append(f"• с вилкой: {_format_percent(share_val)}")
+        salary_lines, salary_stats = _build_salary_block(context)
         if salary_lines:
             sections.append("\n".join(salary_lines))
 
-        # Top companies
-        companies = df["company"].apply(_clean_text)
-        if companies.str.len().gt(0).any():
-            normalized = companies.str.lower()
-            combined = pd.DataFrame({"orig": companies, "norm": normalized})
-            combined = combined[combined["norm"].str.len() > 0]
-            if not combined.empty:
-                counts = combined.groupby("norm").size().sort_values(ascending=False)
-                top_rows = []
-                for idx, (norm_name, count) in enumerate(counts.head(5).items(), start=1):
-                    display_name = combined[combined["norm"] == norm_name]["orig"].iloc[0]
-                    top_rows.append(f"{idx}) {html.escape(display_name)} — {_format_int(count)}")
-                if top_rows:
-                    sections.append("\n".join(["<b>🏢 Топ работодателей по кол-ву вакансий</b>"] + top_rows))
+        top_lines, top_names = _build_top_companies_block(context.df)
+        if top_lines:
+            sections.append("\n".join(top_lines))
+        else:
+            top_names = []
 
-        # Schedule / format
-        if "schedule" in df.columns:
-            schedule_series = df["schedule"].apply(_clean_text)
+        if "schedule" in context.df.columns:
+            schedule_series = context.df["schedule"].apply(_clean_text)
             schedule_series = schedule_series[schedule_series.str.len() > 0]
             if not schedule_series.empty:
                 normalized = schedule_series.apply(lambda x: _schedule_label(x) if x else "")
@@ -504,9 +618,8 @@ def render_mini_analytics(
                     if line:
                         sections.append("\n".join(["<b>🗓 График/формат</b>", line]))
 
-        # Experience
-        if "experience" in df.columns:
-            exp_series = df["experience"].apply(_clean_text)
+        if "experience" in context.df.columns:
+            exp_series = context.df["experience"].apply(_clean_text)
             exp_series = exp_series[exp_series.str.len() > 0]
             if not exp_series.empty:
                 mapped = exp_series.apply(_map_experience)
@@ -523,9 +636,8 @@ def render_mini_analytics(
                     if parts:
                         sections.append("\n".join(["<b>🧩 Опыт</b>", " • ".join(parts)]))
 
-        # Published at / new in 7 days
-        if "published_at" in df.columns:
-            dates = pd.to_datetime(df["published_at"], errors="coerce", utc=True, dayfirst=True)
+        if "published_at" in context.df.columns:
+            dates = pd.to_datetime(context.df["published_at"], errors="coerce", utc=True, dayfirst=True)
             dates = dates.dropna()
             if not dates.empty:
                 now = datetime.now(timezone.utc)
@@ -549,9 +661,8 @@ def render_mini_analytics(
                     )
                 )
 
-        # Source shares
-        if "source" in df.columns:
-            sources = df["source"].apply(_clean_text)
+        if "source" in context.df.columns:
+            sources = context.df["source"].apply(_clean_text)
             sources = sources[sources.str.len() > 0]
             if not sources.empty:
                 normalized = sources.str.lower().map(lambda x: _SOURCE_ALIASES.get(x, x))
@@ -565,7 +676,39 @@ def render_mini_analytics(
         if filters_line:
             sections.append(filters_line)
 
-        return "\n\n".join(sections)
+        text = "\n\n".join(sections)
+        summary = _build_summary(salary_stats, top_names)
+        _SUMMARY_CACHE[key] = summary
+        return text or None
     except Exception as exc:  # pragma: no cover
         log.warning("mini_analytics: failed to render analytics for %s: %s", path, exc, exc_info=True)
+        _SUMMARY_CACHE[key] = None
+        return None
+
+
+def get_summary(path: Path) -> MiniAnalyticsSummary | None:
+    """Return structured analytics summary for the given report path."""
+
+    key = _analytics_key(path)
+    if key in _SUMMARY_CACHE:
+        return _SUMMARY_CACHE[key]
+
+    if not MINI_ANALYTICS_AVAILABLE:  # pragma: no cover - pandas missing
+        _SUMMARY_CACHE[key] = None
+        return None
+
+    try:
+        context = _prepare_context(path, consume_context=False)
+        if context is None:
+            _SUMMARY_CACHE[key] = None
+            return None
+
+        _, salary_stats = _build_salary_block(context)
+        _, top_names = _build_top_companies_block(context.df)
+        summary = _build_summary(salary_stats, top_names)
+        _SUMMARY_CACHE[key] = summary
+        return summary
+    except Exception as exc:  # pragma: no cover
+        log.warning("mini_analytics: failed to summarize analytics for %s: %s", path, exc, exc_info=True)
+        _SUMMARY_CACHE[key] = None
         return None
