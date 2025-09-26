@@ -150,11 +150,17 @@ def grant_credit(
     with db.atomic():
         repo.ensure_user(user_id, None, None)
         credit, _ = Credit.get_or_create(user=user_id, defaults={"balance": 0})
+        current_balance = (
+            Credit.select(Credit.balance)
+            .where(Credit.id == credit.id)
+            .scalar()
+            or 0
+        )
         if operation_id:
             ledger_entry = Ledger.get_or_none(Ledger.operation_id == operation_id)
             if ledger_entry:
-                return ledger_entry.balance_after or credit.balance
-        new_balance = max(0, credit.balance + delta)
+                return ledger_entry.balance_after or current_balance
+        new_balance = max(0, current_balance + delta)
         Credit.update(balance=new_balance).where(Credit.id == credit.id).execute()
         Ledger.create(
             user=user_id,

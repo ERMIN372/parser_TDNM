@@ -117,3 +117,36 @@ def test_redeem_promo_invalid_and_expired(promo_env):
     expired = promo_service.redeem_promo(51, "EXPIRE")
     assert not expired.ok
     assert "недействителен" in expired.message
+
+
+def test_redeem_promo_preserves_existing_balance(promo_env):
+    repo = promo_env["repo"]
+    promo_repo = promo_env["promo_repo"]
+    promo_service = promo_env["promo_service"]
+    user_id = 123
+    now = datetime.utcnow()
+    promo_repo.create_code(
+        code="STACKUP",
+        normalized_code="STACKUP",
+        bonus_credits=5,
+        title=None,
+        starts_at=now - timedelta(days=1),
+        expires_at=now + timedelta(days=1),
+        max_redemptions=None,
+        created_by=999,
+        meta=None,
+    )
+
+    repo.ensure_user(user_id, "tester", "Test User")
+    repo.add_credits(user_id, 15)
+    repo.set_unlimited(user_id, 30)
+
+    result = promo_service.redeem_promo(user_id, "STACKUP")
+
+    assert result.ok
+    assert result.new_balance == 20
+    assert repo.get_credits(user_id) == 20
+
+    active, until = repo.is_unlimited_active(user_id)
+    assert active
+    assert until is not None
