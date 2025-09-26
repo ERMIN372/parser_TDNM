@@ -343,7 +343,7 @@ def apply_promocode(invitee_id: int, code: str, *, is_new: bool) -> tuple[bool, 
 def render_rules_text() -> str:
     return (
         "Зови друзей и получай бонусы 🎁\n"
-        "Другу +1 кредит, тебе +1 после первого отчёта/оплаты.\n"
+        "Другу +1 кредит, тебе +1 после первого отчёта.\n"
         f"Лимиты: до {settings.REF_MAX_BONUS_PER_DAY} бонусов/день, до {settings.REF_MAX_BONUS_TOTAL} всего."
     )
 
