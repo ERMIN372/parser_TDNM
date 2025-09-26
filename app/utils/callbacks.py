@@ -6,7 +6,22 @@ from typing import Any, Dict
 
 from aiogram import types
 
-from app.compat import BadRequest, InvalidQueryID, QueryIdInvalid, callback_invalid_exc
+try:  # pragma: no cover - exercised only when compat is missing
+    from app.compat import (
+        BadRequest,
+        InvalidQueryID,
+        QueryIdInvalid,
+        callback_invalid_exc,
+    )
+except Exception:  # pragma: no cover - defensive fallback for legacy deployments
+    from aiogram.utils import exceptions as _aio_exceptions
+
+    BadRequest = _aio_exceptions.BadRequest
+    InvalidQueryID = getattr(_aio_exceptions, "InvalidQueryID", BadRequest)
+    QueryIdInvalid = getattr(_aio_exceptions, "QueryIdInvalid", InvalidQueryID)
+    callback_invalid_exc = tuple(
+        exc for exc in {InvalidQueryID, QueryIdInvalid, BadRequest} if exc is not None
+    )
 from app.utils.logging import log_event
 
 STALE_MARKERS = ("query is too old", "query_id_invalid")
