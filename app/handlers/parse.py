@@ -3,6 +3,7 @@ import logging
 import asyncio
 import math
 import os
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from aiogram import Bot, Dispatcher, types
@@ -323,9 +324,10 @@ def _main_menu_kb(message: types.Message, *, user: types.User | None = None):
     return keyboards.main_kb(is_admin=is_admin(user_id))
 
 
-def _report_actions_keyboard() -> InlineKeyboardMarkup:
+def _report_actions_keyboard(*, allow_share: bool = True) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("📬 Поделиться отчётом", callback_data="report_share"))
+    if allow_share:
+        kb.add(InlineKeyboardButton("📬 Поделиться отчётом", callback_data="report_share"))
     kb.add(InlineKeyboardButton("🔁 Ещё раз", callback_data="report_again"))
     kb.add(InlineKeyboardButton("🏠 Меню", callback_data="report_menu"))
     return kb
@@ -438,8 +440,10 @@ async def _send_report_with_analytics(
     exclude=None,
     reply_markup=None,
 ) -> None:
+    path = Path(path)
     register_context(path, title=title, city=city)
-    share_kb = _report_actions_keyboard()
+    allow_share = path.suffix.lower() != ".xlsx"
+    share_kb = _report_actions_keyboard(allow_share=allow_share)
     await message.answer_document(InputFile(path), reply_markup=share_kb)
     person = getattr(message, "from_user", None)
     if person:
