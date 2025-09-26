@@ -47,6 +47,7 @@ def create_dispatcher() -> Dispatcher:
     bot = LoggedBot(token=settings.TELEGRAM_BOT_TOKEN, parse_mode="HTML")
     Bot.set_current(bot)
     dp = Dispatcher(bot, storage=MemoryStorage())
+    Dispatcher.set_current(dp)
 
     # ---- global errors handler (aiogram v2) ----
     @dp.errors_handler()
