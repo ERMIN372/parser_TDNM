@@ -352,7 +352,7 @@ async def _handle_role_value(
     update_context(dialog_step=_dialog_step("query", role))
     await state.update_data(query=role)
     prompt = await message.answer("Город?")
-    await ParseForm.waiting_city.set()
+    await state.set_state(ParseForm.waiting_city.state)
     await chips.render_city_chips(prompt, user_id)
     return role
 
@@ -779,6 +779,7 @@ async def _run_parser(
     *,
     uid: int | None = None,
     user: types.User | None = None,
+    state: FSMContext | None = None,
 ):
     args_payload = _build_args(query, city, overrides)
     update_context(command="/parse", args=args_payload)
@@ -811,7 +812,14 @@ async def _run_parser(
               "Это может списать 1 кредит/лимит.",
             reply_markup=kb,
         )
-        await ParseForm.waiting_query.set()
+        if state is not None:
+            await state.set_state(ParseForm.waiting_query.state)
+        else:
+            log_event(
+                "fsm_state_missing",
+                level="WARN",
+                message="FSM context unavailable when resetting to waiting_query",
+            )
         complete_operation(ok=False, err="validation_warning")
         return
 
@@ -953,13 +961,13 @@ async def cmd_parse(message: types.Message, state: FSMContext):
                 )
                 complete_operation(ok=False, err=str(exc))
                 return
-        await _run_parser(message, query, city, overrides)
+        await _run_parser(message, query, city, overrides, state=state)
         return
 
     update_context(command="parse_dialog")
     log_event("request_parsed", message="parse dialog start", command="parse_dialog")
     prompt = await message.answer("Введите должность:", reply_markup=ReplyKeyboardRemove())
-    await ParseForm.waiting_query.set()
+    await state.set_state(ParseForm.waiting_query.state)
     await chips.render_role_chips(prompt, message.from_user.id)
 
 
@@ -1118,7 +1126,7 @@ async def cb_kw_yes(call: types.CallbackQuery, state: FSMContext):
         "Если не нужно — пришли пусто или «-».",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await ParseForm.waiting_kw_include.set()
+    await state.set_state(ParseForm.waiting_kw_include.state)
 
 
 async def cb_kw_no(call: types.CallbackQuery, state: FSMContext):
@@ -1139,6 +1147,7 @@ async def cb_kw_no(call: types.CallbackQuery, state: FSMContext):
         {},
         uid=call.from_user.id,
         user=call.from_user,
+        state=state,
     )  # без уточнений
 
 
@@ -1154,7 +1163,7 @@ async def process_kw_include(message: types.Message, state: FSMContext):
         "Теперь слова, которые НУЖНО исключить (через запятую). Пример: стажёр, помощник.\n"
         "Если не нужно — пришли пусто или «-».",
     )
-    await ParseForm.waiting_kw_exclude.set()
+    await state.set_state(ParseForm.waiting_kw_exclude.state)
 
 
 async def process_kw_exclude(message: types.Message, state: FSMContext):
@@ -1169,7 +1178,13 @@ async def process_kw_exclude(message: types.Message, state: FSMContext):
     city = data.get("city")
     include = data.get("include", [])
     await state.finish()
-    await _run_parser(message, query, city, {"include": include, "exclude": exclude})
+    await _run_parser(
+        message,
+        query,
+        city,
+        {"include": include, "exclude": exclude},
+        state=state,
+    )
 
 
 # ---------- callbacks из предупреждения / объём / превью ----------
@@ -1182,7 +1197,7 @@ async def cb_parse_force(call: types.CallbackQuery, state: FSMContext):
         return
     if not payload:
         await call.message.answer("Не нашёл последний запрос. Введи должность ещё раз:")
-        await ParseForm.waiting_query.set()
+        await state.set_state(ParseForm.waiting_query.state)
         return
     query, city, overrides = payload
     update_context(dialog_step=_dialog_step("force_parse", f"{query}; {city}"))
@@ -1200,7 +1215,7 @@ async def cb_parse_force(call: types.CallbackQuery, state: FSMContext):
     )
 
 
-async def cb_parse_fix(call: types.CallbackQuery):
+async def cb_parse_fix(call: types.CallbackQuery, state: FSMContext):
     if is_busy(call.from_user.id):
         await safe_answer(call, BUSY_TEXT, show_alert=False)
         return
@@ -1209,10 +1224,10 @@ async def cb_parse_fix(call: types.CallbackQuery):
         return
     update_context(dialog_step=_dialog_step("fix_query", ""))
     await call.message.answer("Окей! Введи должность ещё раз:", reply_markup=ReplyKeyboardRemove())
-    await ParseForm.waiting_query.set()
+    await state.set_state(ParseForm.waiting_query.state)
 
 
-async def cb_qty(call: types.CallbackQuery):
+async def cb_qty(call: types.CallbackQuery, state: FSMContext):
     # если занят — просто подсказка и выходим
     if is_busy(call.from_user.id):
         await safe_answer(call, BUSY_TEXT, show_alert=False)
@@ -1223,7 +1238,7 @@ async def cb_qty(call: types.CallbackQuery):
         return
     if not payload:
         await call.message.answer("Не нашёл предыдущий запрос. Введи должность ещё раз:")
-        await ParseForm.waiting_query.set()
+        await state.set_state(ParseForm.waiting_query.state)
         return
 
     title, city, area_id, overrides, max_total = payload
@@ -1250,7 +1265,7 @@ async def cb_qty(call: types.CallbackQuery):
     )
 
 
-async def cb_preview(call: types.CallbackQuery):
+async def cb_preview(call: types.CallbackQuery, state: FSMContext):
     """Показать 5 первых совпадений без уничтожения кеша запроса."""
     uid = call.from_user.id
     if not set_busy(uid):
@@ -1265,7 +1280,7 @@ async def cb_preview(call: types.CallbackQuery):
         payload = _PENDING_QTY.get(uid)   # ВАЖНО: .get(), НЕ .pop()!
         if not payload:
             await call.message.answer("Не нашёл предыдущий запрос. Введи должность ещё раз:")
-            await ParseForm.waiting_query.set()
+            await state.set_state(ParseForm.waiting_query.state)
             return
 
         title, city, area_id, overrides, _max_total = payload
@@ -1381,7 +1396,7 @@ async def prompt_resume(bot: Bot, user_id: int) -> None:
         )
 
 
-async def cb_resume_yes(call: types.CallbackQuery):
+async def cb_resume_yes(call: types.CallbackQuery, state: FSMContext):
     if not await safe_answer(call):
         return
     request = paywall.consume_request(call.from_user.id)
@@ -1414,6 +1429,7 @@ async def cb_resume_yes(call: types.CallbackQuery):
             request.overrides,
             uid=call.from_user.id,
             user=call.from_user,
+            state=state,
         )
     elif request.kind == "bypass":
         await _run_parser_bypass_validation(
