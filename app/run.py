@@ -13,6 +13,7 @@ from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils.exceptions import TelegramAPIError
 
 from . import webhook
+from .compat import callback_invalid_exc_names
 from .config import settings
 from .handlers import (
     admin as h_admin,
@@ -121,6 +122,9 @@ def main() -> None:
             f"Starting bot in {settings.MODE} mode "
             f"(aiogram={aiogram.__version__}, aiohttp={aiohttp.__version__})"
         ),
+        aiogram_version=aiogram.__version__,
+        aiohttp_version=aiohttp.__version__,
+        callback_invalid_exceptions=list(callback_invalid_exc_names),
     )
 
     logger.info("startup_ok", extra={"event": "startup"})
