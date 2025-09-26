@@ -1,5 +1,5 @@
 # parsers/fetch_vacancies.py
-import time, argparse, pandas as pd, re, urllib.parse, html
+import time, argparse, pandas as pd, re, urllib.parse, html, json
 from typing import List, Dict, Any, Tuple, Optional
 
 try:  # pragma: no cover - import shim for script execution
@@ -309,6 +309,7 @@ def pick_benefits(text: str) -> Optional[str]:
 # =================== HH.RU ===================
 def hh_search(query: str, area: int, pages: int, per_page: int, pause: float, search_in: str) -> List[Dict[str, Any]]:
     items=[]
+    total_pages = max(1, pages)
     for page in range(pages):
         p={"text":query,"area":area,"page":page,"per_page":per_page,"only_with_salary":"false"}
         if search_in in ("name","description","company_name","everything"):
@@ -316,7 +317,15 @@ def hh_search(query: str, area: int, pages: int, per_page: int, pause: float, se
         r=requests.get("https://api.hh.ru/vacancies", params=p, headers=HEADERS, timeout=20)
         if r.status_code!=200: break
         data=r.json(); items+=data.get("items",[])
-        if page>=data.get("pages",0)-1: break
+        api_pages = data.get("pages")
+        if isinstance(api_pages, int) and api_pages > 0:
+            total_pages = max(1, min(pages, api_pages))
+        done_pages = min(page + 1, total_pages)
+        try:
+            print(json.dumps({"status": "fetch_progress", "pages_done": done_pages, "pages_total": total_pages}), flush=True)
+        except Exception:
+            pass
+        if page>= (api_pages if isinstance(api_pages, int) and api_pages > 0 else total_pages) -1: break
         time.sleep(pause)
     return items
 
