@@ -65,7 +65,7 @@ async def handle_update(request: Request):
     except LookupError:
         previous_dp = None
 
-    if _bot:
+    if _bot is not None:
         Bot.set_current(_bot)
 
     if previous_dp is None:
@@ -79,9 +79,9 @@ async def handle_update(request: Request):
     try:
         await _dp.process_update(update)
     finally:
-        if previous_dp:
+        if previous_dp is not None:
             Dispatcher.set_current(previous_dp)
-        if previous_bot:
+        if previous_bot is not None:
             Bot.set_current(previous_bot)
     return {"status": "ok"}
 
