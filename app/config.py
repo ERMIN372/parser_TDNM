@@ -11,8 +11,10 @@ class Settings:
     MODE: str
     WEBAPP_HOST: str
     WEBAPP_PORT: int
+    WEBAPP_PORT_SOURCE: str
     WEBHOOK_URL: str
     REPORT_DIR: Path
+    BUILD_VERSION: str
     PARSER_USER_AGENT: str | None = None
     PARSER_HH_BASE: str | None = None
     PARSER_GORODRABOT_BASE: str | None = None
@@ -33,15 +35,33 @@ def _load() -> Settings:
             return default
         return value.strip().lower() in {"1", "true", "yes", "on"}
 
-    port_value = os.getenv("PORT") or os.getenv("WEBAPP_PORT") or "8080"
+    port_source = "default"
+    port_raw = os.getenv("WEBAPP_PORT")
+    if port_raw:
+        port_source = "env:WEBAPP_PORT"
+    else:
+        port_raw = os.getenv("PORT")
+        if port_raw:
+            port_source = "env:PORT"
+        else:
+            port_raw = "8090"
+
+    try:
+        port_value = int(str(port_raw).strip())
+    except (TypeError, ValueError):
+        port_source = f"{port_source}:invalid"
+        port_value = 8090
 
     cfg = Settings(
         TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         MODE=os.getenv("MODE", "polling"),
         WEBAPP_HOST="0.0.0.0",
-        WEBAPP_PORT=int(port_value),
+        WEBAPP_PORT=port_value,
+        WEBAPP_PORT_SOURCE=port_source,
         WEBHOOK_URL=os.getenv("WEBHOOK_URL", ""),
         REPORT_DIR=Path(os.getenv("REPORT_DIR", "./reports")),
+        BUILD_VERSION=os.getenv("BUILD_VERSION")
+        or os.getenv("REPLIT_RELEASE", "dev"),
         PARSER_USER_AGENT=os.getenv("PARSER_USER_AGENT"),
         PARSER_HH_BASE=os.getenv("PARSER_HH_BASE"),
         PARSER_GORODRABOT_BASE=os.getenv("PARSER_GORODRABOT_BASE"),

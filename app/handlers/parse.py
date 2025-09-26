@@ -42,6 +42,7 @@ from ..services import paywall
 from ..services.quota import FREE_PER_MONTH, QuotaDecision, check_quota, commit_usage
 from app import keyboards
 from app.utils.admins import is_admin
+from app.utils.callbacks import safe_answer
 from app.utils.logging import complete_operation, log_event, update_context
 from app.utils.progress import ProgressMessage
 from app.utils.normalize import normalize_city, normalize_role
@@ -521,7 +522,8 @@ async def _send_report_with_analytics(
 
 
 async def cb_report_share(call: types.CallbackQuery):
-    await call.answer()
+    if not await safe_answer(call):
+        return
     snapshot = report_share.get_last_report(call.from_user.id)
     if not snapshot:
         await call.message.answer("Сначала запусти поиск.")
@@ -543,22 +545,25 @@ async def cb_report_share(call: types.CallbackQuery):
 async def cb_report_share_copy(call: types.CallbackQuery):
     snapshot = report_share.get_last_report(call.from_user.id)
     if not snapshot:
-        await call.answer("Сначала запусти поиск.", show_alert=True)
+        await safe_answer(call, "Сначала запусти поиск.", show_alert=True)
         return
     me = await call.bot.get_me()
     link = report_share.build_share_link(me.username or "", call.from_user.id)
     share_text = report_share.build_share_text(snapshot, link)
-    await call.answer("Скопируй текст ниже 👇", show_alert=True)
+    if not await safe_answer(call, "Скопируй текст ниже 👇", show_alert=True):
+        return
     await call.message.answer(share_text, disable_web_page_preview=True)
 
 
 async def cb_report_again(call: types.CallbackQuery, state: FSMContext):
-    await call.answer()
+    if not await safe_answer(call):
+        return
     await cmd_parse(call.message, state)
 
 
 async def cb_report_menu(call: types.CallbackQuery):
-    await call.answer()
+    if not await safe_answer(call):
+        return
     kb = keyboards.main_kb(is_admin=is_admin(call.from_user.id))
     await call.message.answer("Главное меню:", reply_markup=kb)
 
@@ -981,11 +986,11 @@ async def cb_chip(call: types.CallbackQuery, state: FSMContext):
 
     kind = payload.get("kind")
     if kind not in {"role", "city"}:
-        await call.answer()
+        await safe_answer(call)
         return
 
     if is_busy(call.from_user.id):
-        await call.answer(BUSY_TEXT, show_alert=False)
+        await safe_answer(call, BUSY_TEXT, show_alert=False)
         return
 
     token = payload.get("token")
@@ -996,7 +1001,7 @@ async def cb_chip(call: types.CallbackQuery, state: FSMContext):
         or session.kind != kind
         or not chips.is_active(call.from_user.id, session.kind, session.token)
     ):
-        await call.answer("Эта клавиатура устарела. Начните заново.", show_alert=False)
+        await safe_answer(call, "Эта клавиатура устарела. Начните заново.", show_alert=False)
         return
 
     action = payload.get("action")
@@ -1007,7 +1012,7 @@ async def cb_chip(call: types.CallbackQuery, state: FSMContext):
         except (MessageCantBeEdited, MessageNotModified):
             pass
         chips.log_click(session.kind, "more", "control", position=None, action="more")
-        await call.answer()
+        await safe_answer(call)
         return
 
     if action == "prev":
@@ -1017,14 +1022,14 @@ async def cb_chip(call: types.CallbackQuery, state: FSMContext):
         except (MessageCantBeEdited, MessageNotModified):
             pass
         chips.log_click(session.kind, "prev", "control", position=None, action="prev")
-        await call.answer()
+        await safe_answer(call)
         return
 
     if action == "category":
         try:
             category_index = int(payload.get("value", "-1"))
         except ValueError:
-            await call.answer("Эта клавиатура устарела. Начните заново.", show_alert=False)
+            await safe_answer(call, "Эта клавиатура устарела. Начните заново.", show_alert=False)
             return
         markup = chips.show_category(session, category_index)
         try:
@@ -1038,7 +1043,7 @@ async def cb_chip(call: types.CallbackQuery, state: FSMContext):
             position=category_index + 1 if category_index >= 0 else None,
             action="category",
         )
-        await call.answer()
+        await safe_answer(call)
         return
 
     if action == "back":
@@ -1048,16 +1053,16 @@ async def cb_chip(call: types.CallbackQuery, state: FSMContext):
         except (MessageCantBeEdited, MessageNotModified):
             pass
         chips.log_click(session.kind, "back", "control", position=None, action="back")
-        await call.answer()
+        await safe_answer(call)
         return
 
     if action == "random":
         if session.kind != "role":
-            await call.answer()
+            await safe_answer(call)
             return
         value = chips.random_role()
         if not value:
-            await call.answer("Нет доступных вариантов", show_alert=False)
+            await safe_answer(call, "Нет доступных вариантов", show_alert=False)
             return
         chips.log_click("role", value, "base", position=None, action="random")
         chips.finish_session(call.from_user.id, "role")
@@ -1065,23 +1070,24 @@ async def cb_chip(call: types.CallbackQuery, state: FSMContext):
             await call.message.edit_reply_markup()
         except (MessageCantBeEdited, MessageNotModified):
             pass
-        await call.answer(f"Выбрано: {value}")
+        if not await safe_answer(call, f"Выбрано: {value}"):
+            return
         await _handle_role_value(call.message, state, value, user_id=call.from_user.id)
         return
 
     if action != "pick":
-        await call.answer()
+        await safe_answer(call)
         return
 
     try:
         index = int(payload.get("value", "-1"))
     except ValueError:
-        await call.answer("Эта клавиатура устарела. Начните заново.", show_alert=False)
+        await safe_answer(call, "Эта клавиатура устарела. Начните заново.", show_alert=False)
         return
 
     candidate = chips.resolve_candidate(session, index)
     if not candidate:
-        await call.answer("Эта клавиатура устарела. Начните заново.", show_alert=False)
+        await safe_answer(call, "Эта клавиатура устарела. Начните заново.", show_alert=False)
         return
 
     chips.log_click(session.kind, candidate.value, candidate.source, position=index + 1)
@@ -1090,7 +1096,8 @@ async def cb_chip(call: types.CallbackQuery, state: FSMContext):
         await call.message.edit_reply_markup()
     except (MessageCantBeEdited, MessageNotModified):
         pass
-    await call.answer(f"Выбрано: {candidate.value}")
+    if not await safe_answer(call, f"Выбрано: {candidate.value}"):
+        return
 
     if session.kind == "role":
         await _handle_role_value(call.message, state, candidate.value, user_id=call.from_user.id)
@@ -1101,9 +1108,10 @@ async def cb_chip(call: types.CallbackQuery, state: FSMContext):
 # ---------- ключевые слова (include/exclude) ----------
 async def cb_kw_yes(call: types.CallbackQuery, state: FSMContext):
     if is_busy(call.from_user.id):
-        await call.answer(BUSY_TEXT, show_alert=False)
+        await safe_answer(call, BUSY_TEXT, show_alert=False)
         return
-    await call.answer()
+    if not await safe_answer(call):
+        return
     update_context(dialog_step=_dialog_step("kw_prompt", "include"))
     await call.message.answer(
         "Введи слова, которые ДОЛЖНЫ встречаться (через запятую). Пример: электроника, b2b, pcb.\n"
@@ -1115,9 +1123,10 @@ async def cb_kw_yes(call: types.CallbackQuery, state: FSMContext):
 
 async def cb_kw_no(call: types.CallbackQuery, state: FSMContext):
     if is_busy(call.from_user.id):
-        await call.answer(BUSY_TEXT, show_alert=False)
+        await safe_answer(call, BUSY_TEXT, show_alert=False)
         return
-    await call.answer()
+    if not await safe_answer(call):
+        return
     update_context(dialog_step=_dialog_step("kw_skip", ""))
     data = await state.get_data()
     query = data.get("query")
@@ -1166,10 +1175,11 @@ async def process_kw_exclude(message: types.Message, state: FSMContext):
 # ---------- callbacks из предупреждения / объём / превью ----------
 async def cb_parse_force(call: types.CallbackQuery, state: FSMContext):
     if is_busy(call.from_user.id):
-        await call.answer(BUSY_TEXT, show_alert=False)
+        await safe_answer(call, BUSY_TEXT, show_alert=False)
         return
     payload = _WARN_CACHE.pop(call.from_user.id, None)
-    await call.answer()
+    if not await safe_answer(call):
+        return
     if not payload:
         await call.message.answer("Не нашёл последний запрос. Введи должность ещё раз:")
         await ParseForm.waiting_query.set()
@@ -1192,10 +1202,11 @@ async def cb_parse_force(call: types.CallbackQuery, state: FSMContext):
 
 async def cb_parse_fix(call: types.CallbackQuery):
     if is_busy(call.from_user.id):
-        await call.answer(BUSY_TEXT, show_alert=False)
+        await safe_answer(call, BUSY_TEXT, show_alert=False)
         return
     _WARN_CACHE.pop(call.from_user.id, None)
-    await call.answer()
+    if not await safe_answer(call):
+        return
     update_context(dialog_step=_dialog_step("fix_query", ""))
     await call.message.answer("Окей! Введи должность ещё раз:", reply_markup=ReplyKeyboardRemove())
     await ParseForm.waiting_query.set()
@@ -1204,11 +1215,12 @@ async def cb_parse_fix(call: types.CallbackQuery):
 async def cb_qty(call: types.CallbackQuery):
     # если занят — просто подсказка и выходим
     if is_busy(call.from_user.id):
-        await call.answer(BUSY_TEXT, show_alert=False)
+        await safe_answer(call, BUSY_TEXT, show_alert=False)
         return
 
     payload = _PENDING_QTY.get(call.from_user.id)
-    await call.answer()
+    if not await safe_answer(call):
+        return
     if not payload:
         await call.message.answer("Не нашёл предыдущий запрос. Введи должность ещё раз:")
         await ParseForm.waiting_query.set()
@@ -1242,10 +1254,11 @@ async def cb_preview(call: types.CallbackQuery):
     """Показать 5 первых совпадений без уничтожения кеша запроса."""
     uid = call.from_user.id
     if not set_busy(uid):
-        await call.answer(BUSY_TEXT, show_alert=False)
+        await safe_answer(call, BUSY_TEXT, show_alert=False)
         return
 
-    await call.answer("Готовлю превью…", show_alert=False)
+    if not await safe_answer(call, "Готовлю превью…", show_alert=False):
+        return
 
     progress: ProgressMessage | None = None
     try:
@@ -1280,7 +1293,7 @@ async def cb_preview(call: types.CallbackQuery):
         progress = await ProgressMessage.create(call.message.bot, call.message.chat.id, PREVIEW_TEMPLATE)
         _log_preview_start(title, city, overrides)
         try:
-            rows = await parser_adapter.preview_rows(
+            preview_result = await parser_adapter.preview_rows(
                 uid,
                 title,
                 city,
@@ -1288,11 +1301,16 @@ async def cb_preview(call: types.CallbackQuery):
                 include=include,
                 exclude=exclude,
             )
-        except asyncio.TimeoutError as exc:
+        except parser_adapter.DiagnosticError as exc:
             _log_preview_timeout(title, city, overrides, err=str(exc))
             if progress:
                 await progress.fail()
-            await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
+            await call.message.answer(
+                "Не получилось подготовить превью 😔\n"
+                "Попробуйте ещё раз позже.\n"
+                f"ID: `{exc.bundle_id}`",
+                parse_mode="Markdown",
+            )
             return
         except Exception as exc:
             _log_preview_timeout(title, city, overrides, err=str(exc))
@@ -1301,6 +1319,7 @@ async def cb_preview(call: types.CallbackQuery):
             await call.message.answer("⏳ Превью не успело загрузиться. Попробуй ещё раз.")
             return
 
+        rows = preview_result.rows
         if not rows:
             await call.message.answer("Совпадений не нашлось по текущим критериям.")
             _log_preview_ready(title, city, 0, overrides)
@@ -1363,7 +1382,8 @@ async def prompt_resume(bot: Bot, user_id: int) -> None:
 
 
 async def cb_resume_yes(call: types.CallbackQuery):
-    await call.answer()
+    if not await safe_answer(call):
+        return
     request = paywall.consume_request(call.from_user.id)
     if not request:
         await call.message.answer(
@@ -1417,7 +1437,8 @@ async def cb_resume_yes(call: types.CallbackQuery):
 
 
 async def cb_resume_skip(call: types.CallbackQuery):
-    await call.answer()
+    if not await safe_answer(call):
+        return
     request = paywall.get_request(call.from_user.id)
     paywall.clear_request(call.from_user.id)
     log_event("resume_skipped", message="resume skipped", args={"request": request.to_log() if request else None})

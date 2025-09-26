@@ -1,14 +1,20 @@
 from __future__ import annotations
-import os
-import sys
-import json
+
 import asyncio
-import subprocess
+import json
 import logging
-from pathlib import Path
-from datetime import datetime
-from typing import Awaitable, Callable, Iterable, List, Optional, Tuple
+import os
+import subprocess
+import sys
+import traceback
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Tuple
+
+from app.utils.diagnostics import write_bundle
+from app.utils.logging import log_event
 
 log = logging.getLogger(__name__)
 
@@ -151,6 +157,7 @@ def _hh_preview_rows(query: str, area: int | None, include, exclude, rows: int) 
 
     return rows_out[:rows]
 
+
 async def preview_report(
     user_id: int,
     query: str,
@@ -159,6 +166,7 @@ async def preview_report(
     area: Optional[int] = None,
     include: Iterable[str] | str | None = None,
     exclude: Iterable[str] | str | None = None,
+    diagnostic: Dict[str, Any] | None = None,
 ) -> Optional[List[Tuple[str, str, str]]]:
     """
     Быстрое превью первых PREVIEW_ROWS карточек:
@@ -166,14 +174,40 @@ async def preview_report(
     2) Если выбран режим *first* и он неудачный — пробуем второй вариант.
     Возвращает список [(title, company, url)] или None при полном фэйле/таймауте.
     """
+    if diagnostic is not None:
+        diagnostic.clear()
+        diagnostic.update(
+            {
+                "mode": None,
+                "command": None,
+                "stdout": [],
+                "stderr": [],
+                "attempt": None,
+                "error": None,
+                "returncode": None,
+            }
+        )
+
     if not query or not city:
         return None
 
-    # локальные шорткаты
-    def _try_api():
-        return _hh_preview_rows(query, area, include, exclude, PREVIEW_ROWS)
+    def _try_api() -> Optional[List[Tuple[str, str, str]]]:
+        rows = _hh_preview_rows(query, area, include, exclude, PREVIEW_ROWS)
+        if diagnostic is not None:
+            diagnostic.update(
+                {
+                    "mode": "api",
+                    "command": None,
+                    "stdout": [],
+                    "stderr": [],
+                    "attempt": None,
+                    "error": None,
+                    "returncode": None,
+                }
+            )
+        return rows
 
-    async def _try_pipeline():
+    async def _try_pipeline() -> Optional[List[Tuple[str, str, str]]]:
         uid_dir = REPORT_DIR / str(user_id)
         uid_dir.mkdir(parents=True, exist_ok=True)
 
@@ -186,7 +220,7 @@ async def preview_report(
                 "--pages", "1",
                 "--per_page", str(PREVIEW_PER_PAGE),
                 "--output", str(out),
-                "--formats", "csv",     # только csv для скорости
+                "--formats", "csv",
                 "--keep-csv",
                 "--site", "hh",
             ]
@@ -194,49 +228,102 @@ async def preview_report(
                 cmd += ["--area", str(area)]
 
             log.info("Preview attempt %d: %s", attempt, " ".join(map(str, cmd)))
+            if diagnostic is not None:
+                diagnostic.update(
+                    {
+                        "mode": "pipeline",
+                        "command": [str(part) for part in cmd],
+                        "attempt": attempt,
+                        "error": None,
+                        "stdout": [],
+                        "stderr": [],
+                        "returncode": None,
+                    }
+                )
             try:
                 proc = await asyncio.to_thread(
                     subprocess.run, cmd, capture_output=True, text=True, timeout=PREVIEW_TIMEOUT
                 )
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
                 log.warning("preview timeout (attempt %d)", attempt)
+                if diagnostic is not None:
+                    diagnostic.update(
+                        {
+                            "error": "timeout",
+                            "stdout": (exc.output or "").splitlines(),
+                            "stderr": (exc.stderr or "").splitlines(),
+                            "returncode": None,
+                        }
+                    )
+                continue
+            except Exception as exc:
+                log.warning("preview failed to start pipeline: %s", exc)
+                if diagnostic is not None:
+                    diagnostic.update(
+                        {
+                            "error": str(exc),
+                            "stdout": [],
+                            "stderr": [],
+                            "returncode": None,
+                        }
+                    )
                 continue
 
+            if diagnostic is not None:
+                diagnostic.update(
+                    {
+                        "stdout": (proc.stdout or "").splitlines(),
+                        "stderr": (proc.stderr or "").splitlines(),
+                        "returncode": proc.returncode,
+                    }
+                )
             if proc.returncode != 0:
                 log.warning("preview failed rc=%s: %s", proc.returncode, proc.stderr)
+                if diagnostic is not None:
+                    diagnostic["error"] = f"rc_{proc.returncode}"
                 continue
 
             df = _load_table(out.parent / "raw.csv", None)
             if df is None or df.empty:
+                if diagnostic is not None:
+                    diagnostic["error"] = "empty"
                 return []
 
-            # ранний include/exclude
-            inc = [w.lower() for w in _to_list(include)]
-            exc = [w.lower() for w in _to_list(exclude)]
-            if inc or exc:
+            inc_words = [w.lower() for w in _to_list(include)]
+            exc_words = [w.lower() for w in _to_list(exclude)]
+            if inc_words or exc_words:
                 text_cols = [c for c in df.columns if df[c].dtype == object]
                 blob = (df[text_cols].fillna("").astype(str).agg(" ".join, axis=1).str.lower())
                 mask_inc = True
-                if inc:
+                if inc_words:
                     mask_inc = False
-                    for w in inc:
+                    for w in inc_words:
                         mask_inc = mask_inc | blob.str.contains(w, na=False)
                 mask_exc = False
-                for w in exc:
+                for w in exc_words:
                     mask_exc = mask_exc | blob.str.contains(w, na=False)
                 df = df[mask_inc & (~mask_exc)]
 
-            # собрать строки
-            def _norm(s): return (s or "").strip()
-            col_title   = next((c for c in df.columns if c.lower() in {"name","title","vacancy","position"}), df.columns[0])
-            col_company = next((c for c in df.columns if "company" in c.lower()), df.columns[0])
-            col_url     = next((c for c in df.columns if "url" in c.lower() or "link" in c.lower()), df.columns[0])
+            def _norm(value: object) -> str:
+                if isinstance(value, str):
+                    return value.strip()
+                return str(value or "").strip()
 
-            rows: List[Tuple[str,str,str]] = []
-            for _, r in df.head(PREVIEW_ROWS).iterrows():
-                rows.append((_norm(str(r.get(col_title, ""))),
-                             _norm(str(r.get(col_company, ""))),
-                             _norm(str(r.get(col_url, "")))))
+            col_title = next((c for c in df.columns if c.lower() in {"name", "title", "vacancy", "position"}), df.columns[0])
+            col_company = next((c for c in df.columns if "company" in c.lower()), df.columns[0])
+            col_url = next((c for c in df.columns if "url" in c.lower() or "link" in c.lower()), df.columns[0])
+
+            rows: List[Tuple[str, str, str]] = []
+            for _, row in df.head(PREVIEW_ROWS).iterrows():
+                rows.append(
+                    (
+                        _norm(row.get(col_title, "")),
+                        _norm(row.get(col_company, "")),
+                        _norm(row.get(col_url, "")),
+                    )
+                )
+            if diagnostic is not None:
+                diagnostic["error"] = None
             return rows
 
         return None
@@ -247,14 +334,12 @@ async def preview_report(
     if mode == "pipeline_only":
         return await _try_pipeline()
 
-    # смешанные режимы
     if mode == "api_first":
         rows = _try_api()
         if rows:
             return rows
         return await _try_pipeline()
 
-    # pipeline_first (по умолчанию на случай опечатки)
     rows = await _try_pipeline()
     if rows:
         return rows
@@ -269,8 +354,8 @@ async def preview_rows(
     area: Optional[int] = None,
     include: Iterable[str] | str | None = None,
     exclude: Iterable[str] | str | None = None,
-) -> List[dict[str, str]]:
-    """Возвращает первые строки превью в виде списка словарей."""
+) -> PreviewResult:
+    """Возвращает первые строки превью вместе с диагностикой."""
 
     def _norm(val) -> str:
         if val is None:
@@ -298,63 +383,163 @@ async def preview_rows(
             return base
         return _norm(val)
 
-    rows_raw = await preview_report(
-        user_id,
-        query,
-        city,
-        area=area,
-        include=include,
-        exclude=exclude,
-    )
+    include_list = _to_list(include)
+    exclude_list = _to_list(exclude)
 
-    if not rows_raw:
-        return []
+    diagnostic: Dict[str, Any] = {}
+    user_dir = REPORT_DIR / str(user_id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+    bundle_prefix = f"preview_{uuid.uuid4().hex[:6]}"
+    base_meta: Dict[str, Any] = {
+        "mode": "preview",
+        "user_id": user_id,
+        "query": query,
+        "city": city,
+        "area": area,
+        "include": include_list,
+        "exclude": exclude_list,
+    }
+
+    try:
+        rows_raw = await preview_report(
+            user_id,
+            query,
+            city,
+            area=area,
+            include=include,
+            exclude=exclude,
+            diagnostic=diagnostic,
+        )
+    except Exception as exc:
+        stack_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        error_meta = dict(base_meta)
+        error_meta.update(
+            {
+                "status": "error",
+                "error": str(exc),
+                "source_mode": diagnostic.get("mode"),
+                "attempt": diagnostic.get("attempt"),
+                "command": diagnostic.get("command"),
+                "returncode": diagnostic.get("returncode"),
+            }
+        )
+        bundle = write_bundle(
+            user_dir,
+            bundle_prefix,
+            error_meta,
+            diagnostic.get("stdout") or [],
+            diagnostic.get("stderr") or [],
+            stack=stack_text,
+        )
+        log_event(
+            "diagnostic_bundle_ready",
+            level="ERROR",
+            message="Diagnostic bundle prepared",
+            kind="preview",
+            ok=False,
+            err=str(exc),
+            path=str(bundle.path),
+            bundle_id=bundle.bundle_id,
+        )
+        raise DiagnosticError(
+            str(exc) or "preview_failed",
+            bundle_path=bundle.path,
+            bundle_id=bundle.bundle_id,
+        ) from exc
 
     rows_out: List[dict[str, str]] = []
-    for item in rows_raw:
-        if isinstance(item, dict):
-            title = _norm(
-                item.get("title")
-                or item.get("name")
-                or item.get("vacancy")
-                or item.get("position")
+    if rows_raw:
+        for item in rows_raw:
+            if isinstance(item, dict):
+                title = _norm(
+                    item.get("title")
+                    or item.get("name")
+                    or item.get("vacancy")
+                    or item.get("position")
+                )
+                employer = item.get("employer") or {}
+                if not isinstance(employer, dict):
+                    employer = {"name": employer}
+                company = _norm(
+                    item.get("company")
+                    or item.get("employer_name")
+                    or employer.get("name")
+                )
+                salary = _norm_salary(item.get("salary"))
+                link = _norm(item.get("link") or item.get("url") or item.get("alternate_url"))
+            elif isinstance(item, (list, tuple)):
+                parts = list(item) + ["", "", ""]
+                title = _norm(parts[0])
+                company = _norm(parts[1])
+                link = _norm(parts[2])
+                salary = _norm(parts[3])
+            else:
+                title = _norm(item)
+                company = ""
+                link = ""
+                salary = ""
+
+            rows_out.append(
+                {
+                    "title": title,
+                    "company": company,
+                    "salary": salary,
+                    "link": link,
+                }
             )
-            employer = item.get("employer") or {}
-            if not isinstance(employer, dict):
-                employer = {"name": employer}
-            company = _norm(
-                item.get("company")
-                or item.get("employer_name")
-                or employer.get("name")
-            )
-            salary = _norm_salary(item.get("salary"))
-            link = _norm(item.get("link") or item.get("url") or item.get("alternate_url"))
-        elif isinstance(item, (list, tuple)):
-            parts = list(item) + ["", "", ""]
-            title = _norm(parts[0])
-            company = _norm(parts[1])
-            link = _norm(parts[2])
-            salary = _norm(parts[3])
-        else:
-            title = _norm(item)
-            company = ""
-            link = ""
-            salary = ""
 
-        rows_out.append({
-            "title": title,
-            "company": company,
-            "salary": salary,
-            "link": link,
-        })
+    success_meta = dict(base_meta)
+    success_meta.update(
+        {
+            "status": "ok",
+            "rows": len(rows_out),
+            "source_mode": diagnostic.get("mode"),
+            "attempt": diagnostic.get("attempt"),
+            "command": diagnostic.get("command"),
+            "returncode": diagnostic.get("returncode"),
+            "error": diagnostic.get("error"),
+        }
+    )
 
-    return rows_out
+    bundle = write_bundle(
+        user_dir,
+        bundle_prefix,
+        success_meta,
+        diagnostic.get("stdout") or [],
+        diagnostic.get("stderr") or [],
+    )
+    log_event(
+        "diagnostic_bundle_ready",
+        message="Diagnostic bundle prepared",
+        kind="preview",
+        ok=True,
+        path=str(bundle.path),
+        bundle_id=bundle.bundle_id,
+        rows=len(rows_out),
+    )
 
+    return PreviewResult(rows=rows_out, bundle_path=bundle.path, bundle_id=bundle.bundle_id)
 
 @dataclass
 class ReportResult:
     xlsx_path: Path
     csv_path: Path | None = None
+    bundle_path: Path | None = None
+    bundle_id: str | None = None
+
+
+@dataclass
+class PreviewResult:
+    rows: List[dict[str, str]]
+    bundle_path: Path | None = None
+    bundle_id: str | None = None
+
+
+class DiagnosticError(RuntimeError):
+    def __init__(self, message: str, *, bundle_path: Path, bundle_id: str):
+        super().__init__(message)
+        self.bundle_path = bundle_path
+        self.bundle_id = bundle_id
 
 
 ProgressCallback = Callable[[str, dict], Awaitable[None]]
@@ -392,7 +577,7 @@ async def run_report(
         "--query", query,
         "--city", city,
         "--output", str(out_path),
-        "--formats", "xlsx", "csv",   # отдельно значениями
+        "--formats", "xlsx", "csv",
         "--keep-csv",
     ]
     if role:
@@ -415,81 +600,153 @@ async def run_report(
     stderr_lines: list[str] = []
     csv_path: Path | None = None
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    async def _read_stdout() -> None:
-        nonlocal csv_path
-        assert proc.stdout is not None
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            text_line = line.decode(errors="ignore").rstrip("\r\n")
-            stdout_lines.append(text_line)
-            if progress:
-                try:
-                    payload = json.loads(text_line)
-                except json.JSONDecodeError:
-                    continue
-                if payload.get("status") == "csv" and payload.get("path"):
-                    try:
-                        csv_path = Path(payload["path"])
-                    except Exception:  # pragma: no cover
-                        csv_path = None
-                try:
-                    await progress("status", payload)
-                except Exception:  # pragma: no cover
-                    log.warning("progress callback failed", exc_info=True)
-
-    async def _read_stderr() -> None:
-        assert proc.stderr is not None
-        while True:
-            line = await proc.stderr.readline()
-            if not line:
-                break
-            stderr_lines.append(line.decode(errors="ignore").rstrip("\r\n"))
-
-    stdout_task = asyncio.create_task(_read_stdout())
-    stderr_task = asyncio.create_task(_read_stderr())
+    bundle_meta: Dict[str, object] = {
+        "mode": "report",
+        "user_id": user_id,
+        "query": query,
+        "city": city,
+        "role": role,
+        "pages": pages,
+        "per_page": per_page,
+        "pause": pause,
+        "site": site,
+        "area": area,
+        "include": inc,
+        "exclude": exc,
+        "timeout": eff_timeout,
+        "command": [str(part) for part in cmd],
+        "report_path": str(out_path),
+    }
+    bundle_prefix = f"report_{uuid.uuid4().hex[:6]}"
 
     try:
-        await asyncio.wait_for(proc.wait(), timeout=eff_timeout)
-    except asyncio.TimeoutError as e:
-        proc.kill()
-        await proc.wait()
-        log.error("Parser timeout")
-        raise RuntimeError("Превышено время ожидания парсера") from e
-    finally:
-        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-
-    if proc.returncode != 0:
-        stdout_text = "\n".join(stdout_lines)
-        stderr_text = "\n".join(stderr_lines)
-        log.error(
-            "Parser failed (rc=%s)\nstdout:\n%s\nstderr:\n%s",
-            proc.returncode,
-            stdout_text,
-            stderr_text,
-        )
-        raise RuntimeError(
-            f"Не удалось получить отчёт: парсер завершился с ошибкой {proc.returncode}"
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
 
-    if inc or exc:
-        if progress:
-            try:
-                await progress("filter_start", {"csv_path": str(csv_path) if csv_path else None})
-            except Exception:  # pragma: no cover
-                log.warning("progress callback failed on filter_start", exc_info=True)
-        await asyncio.to_thread(_postfilter_any, out_path, inc, exc, csv_path=csv_path)
-        if progress:
-            try:
-                await progress("filter_done", {"csv_path": str(csv_path) if csv_path else None})
-            except Exception:  # pragma: no cover
-                log.warning("progress callback failed on filter_done", exc_info=True)
+        async def _read_stdout() -> None:
+            nonlocal csv_path
+            assert proc.stdout is not None
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                text_line = line.decode(errors="ignore").rstrip("\r\n")
+                stdout_lines.append(text_line)
+                if progress:
+                    try:
+                        payload = json.loads(text_line)
+                    except json.JSONDecodeError:
+                        continue
+                    if payload.get("status") == "csv" and payload.get("path"):
+                        try:
+                            csv_path = Path(payload["path"])
+                        except Exception:  # pragma: no cover
+                            csv_path = None
+                    try:
+                        await progress("status", payload)
+                    except Exception:  # pragma: no cover
+                        log.warning("progress callback failed", exc_info=True)
 
-    return ReportResult(xlsx_path=out_path, csv_path=csv_path)
+        async def _read_stderr() -> None:
+            assert proc.stderr is not None
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                stderr_lines.append(line.decode(errors="ignore").rstrip("\r\n"))
+
+        stdout_task = asyncio.create_task(_read_stdout())
+        stderr_task = asyncio.create_task(_read_stderr())
+
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=eff_timeout)
+        except asyncio.TimeoutError as e:
+            proc.kill()
+            await proc.wait()
+            log.error("Parser timeout")
+            raise RuntimeError("Превышено время ожидания парсера") from e
+        finally:
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+
+        if proc.returncode != 0:
+            stdout_text = "\n".join(stdout_lines)
+            stderr_text = "\n".join(stderr_lines)
+            log.error(
+                "Parser failed (rc=%s)\nstdout:\n%s\nstderr:\n%s",
+                proc.returncode,
+                stdout_text,
+                stderr_text,
+            )
+            raise RuntimeError(
+                f"Не удалось получить отчёт: парсер завершился с ошибкой {proc.returncode}"
+            )
+
+        if inc or exc:
+            if progress:
+                try:
+                    await progress("filter_start", {"csv_path": str(csv_path) if csv_path else None})
+                except Exception:  # pragma: no cover
+                    log.warning("progress callback failed on filter_start", exc_info=True)
+            await asyncio.to_thread(_postfilter_any, out_path, inc, exc, csv_path=csv_path)
+            if progress:
+                try:
+                    await progress("filter_done", {"csv_path": str(csv_path) if csv_path else None})
+                except Exception:  # pragma: no cover
+                    log.warning("progress callback failed on filter_done", exc_info=True)
+
+        bundle_meta["csv_path"] = str(csv_path) if csv_path else None
+    except Exception as exc:
+        stack_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        error_meta = dict(bundle_meta)
+        error_meta["status"] = "error"
+        error_meta["error"] = str(exc)
+        bundle = write_bundle(
+            user_dir,
+            bundle_prefix,
+            error_meta,
+            stdout_lines,
+            stderr_lines,
+            stack=stack_text,
+        )
+        log_event(
+            "diagnostic_bundle_ready",
+            level="ERROR",
+            message="Diagnostic bundle prepared",
+            kind="report",
+            ok=False,
+            err=str(exc),
+            path=str(bundle.path),
+            bundle_id=bundle.bundle_id,
+        )
+        raise DiagnosticError(
+            str(exc) or "report_failed",
+            bundle_path=bundle.path,
+            bundle_id=bundle.bundle_id,
+        ) from exc
+
+    success_meta = dict(bundle_meta)
+    success_meta["status"] = "ok"
+    bundle = write_bundle(
+        user_dir,
+        bundle_prefix,
+        success_meta,
+        stdout_lines,
+        stderr_lines,
+    )
+    log_event(
+        "diagnostic_bundle_ready",
+        message="Diagnostic bundle prepared",
+        kind="report",
+        ok=True,
+        path=str(bundle.path),
+        bundle_id=bundle.bundle_id,
+    )
+    return ReportResult(
+        xlsx_path=out_path,
+        csv_path=csv_path,
+        bundle_path=bundle.path,
+        bundle_id=bundle.bundle_id,
+    )

@@ -13,6 +13,7 @@ from app.storage.models import User
 from app.services import referrals as referral_service
 from app.utils.backup import make_sqlite_backup
 from app.utils.admins import is_admin
+from app.utils.callbacks import safe_answer
 
 # --- доступ ---
 def _guard(uid: int) -> bool: return is_admin(uid)
@@ -104,7 +105,8 @@ async def admin_home(message: types.Message):
 async def cb_admin_home(call: types.CallbackQuery):
     if not _guard(call.from_user.id): return
     await _safe_edit_text(call.message, "🛠 Админ-панель", reply_markup=_kb_admin_home())
-    await call.answer()
+    if not await safe_answer(call):
+        return
 
 # -------- список пользователей --------
 async def cb_users(call: types.CallbackQuery):
@@ -113,7 +115,8 @@ async def cb_users(call: types.CallbackQuery):
     page = int(payload)
     text, kb = _users_page(page)
     await _safe_edit_text(call.message, text, reply_markup=kb)
-    await call.answer()
+    if not await safe_answer(call):
+        return
 
 # -------- карточка пользователя --------
 async def cb_user(call: types.CallbackQuery):
@@ -121,9 +124,11 @@ async def cb_user(call: types.CallbackQuery):
     _, uid = call.data.split(":")
     u = repo.get_user(int(uid))
     if not u:
-        await call.answer("Пользователь не найден", show_alert=True); return
+        await safe_answer(call, "Пользователь не найден", show_alert=True)
+        return
     await _safe_edit_text(call.message, _user_card_text(u), reply_markup=_kb_user(u), parse_mode="HTML")
-    await call.answer()
+    if not await safe_answer(call):
+        return
 
 
 def _render_referral_summary() -> tuple[str, InlineKeyboardMarkup]:
@@ -167,7 +172,8 @@ async def cb_ref_summary(call: types.CallbackQuery):
         return
     text, kb = _render_referral_summary()
     await _safe_edit_text(call.message, text, reply_markup=kb, parse_mode="HTML")
-    await call.answer()
+    if not await safe_answer(call):
+        return
 
 
 def _format_user(user: User | None) -> str:
@@ -195,7 +201,7 @@ async def cb_referral_card(call: types.CallbackQuery):
     rid_int = int(rid)
     details = referral_service.admin_referral_details(rid_int)
     if not details:
-        await call.answer("Реферал не найден", show_alert=True)
+        await safe_answer(call, "Реферал не найден", show_alert=True)
         return
     inviter = _format_user(details["inviter"])
     invitee = _format_user(details["invitee"])
@@ -213,7 +219,8 @@ async def cb_referral_card(call: types.CallbackQuery):
         text += f"Причина: {details['reason']}\n"
     text += f"Источник: {details['source']}\n"
     await _safe_edit_text(call.message, text, reply_markup=_kb_referral(rid_int), parse_mode="HTML")
-    await call.answer()
+    if not await safe_answer(call):
+        return
 
 
 async def cb_referral_activate(call: types.CallbackQuery):
@@ -221,7 +228,8 @@ async def cb_referral_activate(call: types.CallbackQuery):
         return
     _, rid = call.data.split(":")
     ok, msg = referral_service.admin_activate_referral(int(rid))
-    await call.answer(msg, show_alert=not ok)
+    if not await safe_answer(call, msg, show_alert=not ok):
+        return
     if ok:
         await cb_referral_card(call)
 
@@ -231,7 +239,8 @@ async def cb_referral_reject(call: types.CallbackQuery):
         return
     _, rid = call.data.split(":")
     ok, msg = referral_service.admin_reject_referral(int(rid), reason="manual_reject")
-    await call.answer(msg, show_alert=not ok)
+    if not await safe_answer(call, msg, show_alert=not ok):
+        return
     if ok:
         await cb_referral_card(call)
 
@@ -241,7 +250,8 @@ async def cb_unlim(call: types.CallbackQuery):
     _, uid, days = call.data.split(":")
     uid, days = int(uid), int(days)
     until = repo.set_unlimited(uid, days)
-    await call.answer("Выдан безлимит", show_alert=False)
+    if not await safe_answer(call, "Выдан безлимит", show_alert=False):
+        return
     u = repo.get_user(uid)
     await _safe_edit_text(call.message, _user_card_text(u), reply_markup=_kb_user(u), parse_mode="HTML")
 
@@ -250,7 +260,8 @@ async def cb_credit(call: types.CallbackQuery):
     _, uid, n = call.data.split(":")
     uid, n = int(uid), int(n)
     bal = repo.add_credits(uid, n)
-    await call.answer(f"+{n} кредит(ов). Баланс: {bal}", show_alert=False)
+    if not await safe_answer(call, f"+{n} кредит(ов). Баланс: {bal}", show_alert=False):
+        return
     u = repo.get_user(uid)
     await _safe_edit_text(call.message, _user_card_text(u), reply_markup=_kb_user(u), parse_mode="HTML")
 
@@ -268,7 +279,8 @@ async def cb_cast_menu(call: types.CallbackQuery):
         "Рассылка:\n— отправь текст ответом на это сообщение\n— или используй точечную по ID",
         reply_markup=kb,
     )
-    await call.answer()
+    if not await safe_answer(call):
+        return
 
 # 0) точечная из карточки пользователя (КНОПКА, которая не работала)
 async def cb_cast_user(call: types.CallbackQuery):
@@ -282,7 +294,8 @@ async def cb_cast_user(call: types.CallbackQuery):
     )
     await _safe_edit_text(call.message, prompt, parse_mode="HTML")
     _CAST_TARGETS[call.message.message_id] = uid
-    await call.answer()
+    if not await safe_answer(call):
+        return
 
 # ловим ответ на «точечная рассылка пользователю <uid>»
 async def catch_reply_cast_user(message: types.Message):
@@ -315,7 +328,8 @@ async def catch_reply_cast_user(message: types.Message):
 # 1) ответом на сообщение → всем
 async def cb_cast_all(call: types.CallbackQuery):
     if not _guard(call.from_user.id): return
-    await call.answer("Пришли текст рассылки ответом на это сообщение.")
+    if not await safe_answer(call, "Пришли текст рассылки ответом на это сообщение."):
+        return
     await _safe_edit_text(
         call.message,
         "Ответь на это сообщение текстом для рассылки всем пользователям.\nОтмена: /cancel",
@@ -356,7 +370,8 @@ async def cb_cast_prompt(call: types.CallbackQuery):
         "Отмена: /cancel",
         parse_mode="HTML",
     )
-    await call.answer()
+    if not await safe_answer(call):
+        return
 
 async def cast_cmd(message: types.Message):
     if not _guard(message.from_user.id): return
@@ -390,7 +405,7 @@ async def cb_backup(call: types.CallbackQuery):
         await call.message.reply_document(InputFile(z), caption=f"Бэкап {z.name}")
     except Exception as e:
         await call.message.reply(f"Не удалось сделать бэкап: {e}")
-    await call.answer("Готово")
+    await safe_answer(call, "Готово")
 
 # -------- регистрация --------
 def register(dp: Dispatcher):

@@ -6,6 +6,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from app import keyboards
 from app.handlers import parse
 from app.services import paywall, payments, referrals
+from app.utils.callbacks import safe_answer
 from app.utils.logging import complete_operation, log_event, update_context
 from app.utils.admins import is_admin
 
@@ -33,7 +34,7 @@ async def _start_payment_flow(call: types.CallbackQuery, pack: str) -> None:
 
     pending = paywall.get_pending_payment(call.from_user.id)
     if pending and pending.pack == pack:
-        await call.answer("Оплата уже открыта — проверь ссылку выше.")
+        await safe_answer(call, "Оплата уже открыта — проверь ссылку выше.")
         return
 
     me = await call.bot.get_me()
@@ -41,7 +42,7 @@ async def _start_payment_flow(call: types.CallbackQuery, pack: str) -> None:
         pid, url = payments.create_payment(call.from_user.id, pack, bot_username=me.username)
     except Exception as exc:
         log_event("payment_failed", level="ERROR", err=str(exc), message="create_payment failed")
-        await call.answer("Ошибка создания платежа", show_alert=True)
+        await safe_answer(call, "Ошибка создания платежа", show_alert=True)
         complete_operation(ok=False, err="payment_create_failed")
         return
 
@@ -59,7 +60,7 @@ async def _start_payment_flow(call: types.CallbackQuery, pack: str) -> None:
         reply_markup=kb,
     )
     await call.message.answer("Открыл оплату. После успешного платежа доступ появится автоматически.")
-    await call.answer()
+    await safe_answer(call)
 
 
 async def cb_create(call: types.CallbackQuery):
@@ -72,23 +73,26 @@ async def cb_create(call: types.CallbackQuery):
 async def cb_buy_pack(call: types.CallbackQuery):
     pack = _resolve_pack(call.data)
     if not pack:
-        await call.answer()
+        await safe_answer(call)
         return
     await _start_payment_flow(call, pack)
 
 
 async def cb_buy_open(call: types.CallbackQuery):
-    await call.answer()
+    if not await safe_answer(call):
+        return
     await call.message.answer(paywall.paywall_text(), reply_markup=paywall.paywall_keyboard())
 
 
 async def cb_buy_info(call: types.CallbackQuery):
-    await call.answer()
+    if not await safe_answer(call):
+        return
     await call.message.answer(paywall.paywall_text(), reply_markup=paywall.paywall_keyboard())
 
 
 async def cb_buy_back(call: types.CallbackQuery):
-    await call.answer()
+    if not await safe_answer(call):
+        return
     await call.message.answer(
         "Главное меню:", reply_markup=keyboards.main_kb(is_admin=is_admin(call.from_user.id))
     )
@@ -111,7 +115,7 @@ async def cb_check(call: types.CallbackQuery):
         paywall.clear_pending_payment(call.from_user.id)
     if status == "succeeded":
         await parse.prompt_resume(call.bot, call.from_user.id)
-    await call.answer()
+    await safe_answer(call)
 
 
 async def start_with_payload(message: types.Message):
