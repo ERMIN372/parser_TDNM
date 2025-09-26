@@ -138,12 +138,22 @@ def increment_bonuses(inviter_id: int, delta: int) -> None:
     ).where(ReferralStats.user == inviter_id).execute()
 
 
-def grant_credit(user_id: int, delta: int, reason: str, referral: Optional[Referral] = None) -> int:
+def grant_credit(
+    user_id: int,
+    delta: int,
+    reason: str,
+    referral: Optional[Referral] = None,
+    operation_id: str | None = None,
+) -> int:
     from . import repo
 
     with db.atomic():
         repo.ensure_user(user_id, None, None)
         credit, _ = Credit.get_or_create(user=user_id, defaults={"balance": 0})
+        if operation_id:
+            ledger_entry = Ledger.get_or_none(Ledger.operation_id == operation_id)
+            if ledger_entry:
+                return ledger_entry.balance_after or credit.balance
         new_balance = max(0, credit.balance + delta)
         Credit.update(balance=new_balance).where(Credit.id == credit.id).execute()
         Ledger.create(
@@ -153,6 +163,7 @@ def grant_credit(user_id: int, delta: int, reason: str, referral: Optional[Refer
             reason=reason,
             related_referral=referral,
             balance_after=new_balance,
+            operation_id=operation_id,
         )
         return new_balance
 

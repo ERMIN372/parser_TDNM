@@ -8,3 +8,9 @@ def main_kb(is_admin: bool = False) -> ReplyKeyboardMarkup:
     if is_admin:
         kb.add(KeyboardButton("🛠 Админ"))
     return kb
+
+
+def promo_result_kb() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(KeyboardButton("🔎 Поиск"), KeyboardButton("Купить ещё кредиты"))
+    return kb

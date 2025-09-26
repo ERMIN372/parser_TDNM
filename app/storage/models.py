@@ -95,6 +95,7 @@ class Ledger(BaseModel):
     related_referral = ForeignKeyField(Referral, null=True, on_delete="SET NULL")
     ts = DateTimeField(default=datetime.utcnow)
     balance_after = IntegerField(null=True)
+    operation_id = CharField(null=True, unique=True)
 
 
 class ReferralBan(BaseModel):
@@ -110,3 +111,41 @@ class SearchQuery(BaseModel):
     role = CharField()
     city = CharField()
     created_at = DateTimeField(default=datetime.utcnow, index=True)
+
+
+class PromoCreditCode(BaseModel):
+    code = CharField(primary_key=True, max_length=64)
+    normalized_code = CharField(unique=True, max_length=64)
+    title = CharField(null=True)
+    bonus_credits = IntegerField()
+    is_active = BooleanField(default=True)
+    starts_at = DateTimeField(null=True)
+    expires_at = DateTimeField(null=True)
+    max_redemptions = IntegerField(null=True)
+    redemptions_count = IntegerField(default=0)
+    created_at = DateTimeField(default=datetime.utcnow)
+    created_by = BigIntegerField()
+    meta = TextField(null=True)
+
+    class Meta:
+        table_name = "promo_codes"
+
+
+class PromoRedemption(BaseModel):
+    id = AutoField()
+    user = ForeignKeyField(User, backref="promo_redemptions", on_delete="CASCADE")
+    promo_code = ForeignKeyField(
+        PromoCreditCode,
+        backref="redemptions",
+        field=PromoCreditCode.code,
+        on_delete="CASCADE",
+        column_name="code",
+    )
+    created_at = DateTimeField(default=datetime.utcnow)
+    operation_id = CharField(unique=True)
+
+    class Meta:
+        table_name = "promo_redemptions"
+        indexes = (
+            (("user", "promo_code"), True),
+        )

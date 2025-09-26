@@ -1,16 +1,20 @@
 from __future__ import annotations
 import asyncio
 from datetime import datetime
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from aiogram import types, Dispatcher
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from aiogram.utils.exceptions import BotBlocked, ChatNotFound, RetryAfter, MessageNotModified
 from pathlib import Path
 
-from app.storage import repo
+from peewee import IntegrityError
+
+from app.storage import promo_repo, repo
 from app.storage.models import User
-from app.services import referrals as referral_service
+from app.services import promo as promo_service, referrals as referral_service
 from app.utils.backup import make_sqlite_backup
 from app.utils.admins import is_admin
 from app.utils.callbacks import safe_answer
@@ -28,6 +32,7 @@ def _kb_admin_home() -> InlineKeyboardMarkup:
         InlineKeyboardButton("📣 Рассылка", callback_data="admin_cast"),
     )
     kb.add(InlineKeyboardButton("🎯 Рефералы", callback_data="admin_ref"))
+    kb.add(InlineKeyboardButton("🎟 Промокоды", callback_data="admin_promo"))
     kb.add(InlineKeyboardButton("💾 Бэкап БД", callback_data="admin_backup"))
     return kb
 
@@ -40,6 +45,18 @@ async def _safe_edit_text(message: types.Message, text: str, **kwargs) -> None:
 
 # message_id -> целевой user_id для точечной рассылки
 _CAST_TARGETS: dict[int, int] = {}
+
+
+class PromoCreateForm(StatesGroup):
+    waiting_code = State()
+    waiting_bonus = State()
+    waiting_period = State()
+    waiting_limit = State()
+    confirm = State()
+
+
+class PromoSearchForm(StatesGroup):
+    waiting_query = State()
 
 
 def _users_page(page: int, q: str | None = None) -> Tuple[str, InlineKeyboardMarkup]:
@@ -244,6 +261,397 @@ async def cb_referral_reject(call: types.CallbackQuery):
     if ok:
         await cb_referral_card(call)
 
+# -------- промокоды --------
+def _promo_home_text() -> str:
+    return "🎟 <b>Промокоды</b>\nВыберите действие."
+
+
+def _kb_promo_home() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("➕ Создать промокод", callback_data="admin_promo_create"))
+    kb.add(InlineKeyboardButton("📊 Статистика", callback_data="admin_promo_stats:1"))
+    kb.add(InlineKeyboardButton("🔎 Найти код", callback_data="admin_promo_search"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="admin_home"))
+    return kb
+
+
+def _format_period(starts_at: Optional[datetime], expires_at: Optional[datetime]) -> str:
+    if not starts_at and not expires_at:
+        return "без срока"
+    parts: List[str] = []
+    if starts_at:
+        parts.append(f"с {starts_at:%Y-%m-%d}")
+    if expires_at:
+        parts.append(f"до {expires_at:%Y-%m-%d}")
+    return " ".join(parts)
+
+
+def _format_limit(promo) -> str:
+    limit = "∞" if promo.max_redemptions is None else str(promo.max_redemptions)
+    return f"{promo.redemptions_count}/{limit}"
+
+
+def _promo_stats_page(page: int, search: str | None = None) -> Tuple[str, InlineKeyboardMarkup]:
+    total = promo_repo.count_codes(search)
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(1, min(page, pages))
+    codes = promo_repo.list_codes(offset=(page - 1) * PAGE_SIZE, limit=PAGE_SIZE, search=search)
+
+    title = "📊 Промокоды"
+    if search:
+        title += f" по запросу «{search}»"
+    title += f" — страница {page}/{pages} (всего: {total})"
+
+    lines = [title]
+    kb = InlineKeyboardMarkup(row_width=1)
+    for item in codes:
+        status = "🟢" if item.is_active else "🔴"
+        expires = item.expires_at.strftime("%Y-%m-%d") if item.expires_at else "—"
+        lines.append(
+            f"{status} {item.code} • +{item.bonus_credits} • активировано: {_format_limit(item)} • до: {expires}"
+        )
+        kb.add(InlineKeyboardButton(item.code[:64], callback_data=f"admin_promo_view:{item.code}"))
+
+    if not codes:
+        lines.append("Коды не найдены.")
+
+    nav: List[InlineKeyboardButton] = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"admin_promo_stats:{page-1}"))
+    nav.append(InlineKeyboardButton("🔄", callback_data=f"admin_promo_stats:{page}"))
+    if page < pages:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"admin_promo_stats:{page+1}"))
+    if nav:
+        kb.row(*nav)
+
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="admin_promo"))
+    return "\n".join(lines), kb
+
+
+def _promo_card_text(promo) -> str:
+    counts = promo_repo.redemption_counts(promo)
+    lines = [
+        "🎟 <b>Промокод</b>",
+        f"Код: <code>{promo.code}</code>",
+        f"Бонус: +{promo.bonus_credits} кредитов",
+        f"Статус: {'активен' if promo.is_active else 'выключен'}",
+        f"Период: {_format_period(promo.starts_at, promo.expires_at)}",
+        f"Лимит: {_format_limit(promo)}",
+        f"Всего активаций: {counts['total']}",
+        f"За 7 дней: {counts['last7']}, за 30 дней: {counts['last30']}",
+        f"Создан: {promo.created_at:%Y-%m-%d %H:%M} UTC",
+        f"Создал: <code>{promo.created_by}</code>",
+    ]
+    if promo.title:
+        lines.insert(1, f"Название: {promo.title}")
+    return "\n".join(lines)
+
+
+def _kb_promo_card(promo) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    toggle_text = "🔴 Выключить" if promo.is_active else "🟢 Включить"
+    kb.add(InlineKeyboardButton(toggle_text, callback_data=f"admin_promo_toggle:{promo.code}"))
+    kb.add(InlineKeyboardButton("🗑 Удалить", callback_data=f"admin_promo_delete:{promo.code}"))
+    kb.add(InlineKeyboardButton("📊 К списку", callback_data="admin_promo_stats:1"))
+    kb.add(InlineKeyboardButton("⬅️ Меню", callback_data="admin_promo"))
+    return kb
+
+
+async def cb_promo_home(call: types.CallbackQuery):
+    if not _guard(call.from_user.id):
+        return
+    await _safe_edit_text(call.message, _promo_home_text(), reply_markup=_kb_promo_home(), parse_mode="HTML")
+    if not await safe_answer(call):
+        return
+
+
+async def cb_promo_stats(call: types.CallbackQuery):
+    if not _guard(call.from_user.id):
+        return
+    parts = call.data.split(":", 1)
+    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+    text, kb = _promo_stats_page(page)
+    await _safe_edit_text(call.message, text, reply_markup=kb)
+    if not await safe_answer(call):
+        return
+
+
+async def cb_promo_view(call: types.CallbackQuery):
+    if not _guard(call.from_user.id):
+        return
+    _, code = call.data.split(":", 1)
+    promo = promo_repo.get_by_code(code)
+    if not promo:
+        await safe_answer(call, "Промокод не найден", show_alert=True)
+        return
+    await _safe_edit_text(call.message, _promo_card_text(promo), reply_markup=_kb_promo_card(promo), parse_mode="HTML")
+    if not await safe_answer(call):
+        return
+
+
+async def cb_promo_toggle(call: types.CallbackQuery):
+    if not _guard(call.from_user.id):
+        return
+    _, code = call.data.split(":", 1)
+    promo = promo_repo.get_by_code(code)
+    if not promo:
+        await safe_answer(call, "Промокод не найден", show_alert=True)
+        return
+    new_state = not promo.is_active
+    promo_repo.set_active(code, new_state)
+    log_event(
+        "promo_toggle",
+        message="Promo toggled",
+        code=code,
+        active=new_state,
+        actor=call.from_user.id,
+    )
+    promo = promo_repo.get_by_code(code)
+    await _safe_edit_text(call.message, _promo_card_text(promo), reply_markup=_kb_promo_card(promo), parse_mode="HTML")
+    if not await safe_answer(call, "Статус обновлён", show_alert=False):
+        return
+
+
+async def cb_promo_delete(call: types.CallbackQuery):
+    if not _guard(call.from_user.id):
+        return
+    _, code = call.data.split(":", 1)
+    promo = promo_repo.get_by_code(code)
+    if not promo:
+        await safe_answer(call, "Промокод не найден", show_alert=True)
+        return
+    ok = promo_repo.delete_code(code)
+    if not ok:
+        await safe_answer(call, "Можно только выключить", show_alert=True)
+        return
+    log_event("promo_deleted", message="Promo deleted", code=code, actor=call.from_user.id)
+    await _safe_edit_text(call.message, _promo_home_text(), reply_markup=_kb_promo_home(), parse_mode="HTML")
+    if not await safe_answer(call, "Удалено", show_alert=False):
+        return
+
+
+async def cb_promo_search(call: types.CallbackQuery, state: FSMContext):
+    if not _guard(call.from_user.id):
+        return
+    await state.set_state(PromoSearchForm.waiting_query.state)
+    await call.message.answer("Введите часть кода или «отмена» для выхода.")
+    if not await safe_answer(call):
+        return
+
+
+async def promo_search_query(message: types.Message, state: FSMContext):
+    query = (message.text or "").strip()
+    if not query or query.lower() in {"отмена", "/cancel"}:
+        await state.finish()
+        await message.reply("Поиск отменён.")
+        return
+    results = promo_repo.search_codes(query, limit=10)
+    kb = InlineKeyboardMarkup(row_width=1)
+    if results:
+        text_lines = [f"Найдено {len(results)} код(ов):"]
+        for item in results:
+            status = "🟢" if item.is_active else "🔴"
+            text_lines.append(f"{status} {item.code} — +{item.bonus_credits} кредитов")
+            kb.add(InlineKeyboardButton(item.code[:64], callback_data=f"admin_promo_view:{item.code}"))
+    else:
+        text_lines = ["Коды не найдены."]
+    kb.add(InlineKeyboardButton("⬅️ Меню", callback_data="admin_promo"))
+    await message.reply("\n".join(text_lines), reply_markup=kb)
+    await state.finish()
+
+
+async def cb_promo_create(call: types.CallbackQuery, state: FSMContext):
+    if not _guard(call.from_user.id):
+        return
+    await state.update_data(created_by=call.from_user.id)
+    await state.set_state(PromoCreateForm.waiting_code.state)
+    await call.message.answer("Введите CODE (латиница/цифры/дефис, до 24 символов).")
+    if not await safe_answer(call):
+        return
+
+
+async def promo_create_code(message: types.Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if raw.lower() in {"/cancel", "отмена"}:
+        await state.finish()
+        await message.reply("Создание промокода отменено.")
+        return
+    try:
+        code = promo_service.normalize_code(raw)
+    except ValueError:
+        await message.reply("Код должен содержать латиницу, цифры или дефис без пробелов (до 24 символов).")
+        return
+    if len(code) > 24:
+        await message.reply("Максимальная длина кода — 24 символа.")
+        return
+    if promo_repo.get_by_code(code):
+        await message.reply("Такой код уже существует. Введите другой.")
+        return
+    await state.update_data(code=code, normalized=code)
+    await state.set_state(PromoCreateForm.waiting_bonus.state)
+    await message.reply("Введите бонус (целое число > 0).")
+
+
+async def promo_create_bonus(message: types.Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if raw.lower() in {"/cancel", "отмена"}:
+        await state.finish()
+        await message.reply("Создание промокода отменено.")
+        return
+    if not raw.isdigit() or int(raw) <= 0:
+        await message.reply("Бонус должен быть целым числом больше 0.")
+        return
+    await state.update_data(bonus=int(raw))
+    await state.set_state(PromoCreateForm.waiting_period.state)
+    await message.reply(
+        "Введите период действия: «без срока» или даты в формате YYYY-MM-DD YYYY-MM-DD. "
+        "Можно указать «-» для пропуска начала или конца."
+    )
+
+
+def _parse_period_input(value: str) -> Tuple[Optional[datetime], Optional[datetime]]:
+    cleaned = value.strip().lower()
+    if cleaned in {"", "без срока"}:
+        return None, None
+    parts = value.replace("\u2014", "-").replace("—", "-").split()
+    if len(parts) == 1:
+        start_raw, end_raw = parts[0], parts[0]
+    else:
+        start_raw, end_raw = parts[0], parts[1]
+
+    def _parse(part: str) -> Optional[datetime]:
+        token = part.strip()
+        if not token or token in {"-", "без", "нет"}:
+            return None
+        try:
+            dt = datetime.strptime(token, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("bad_date") from exc
+        if len(parts) == 1:
+            return datetime(dt.year, dt.month, dt.day, 0, 0, 0)
+        return datetime(dt.year, dt.month, dt.day, 0, 0, 0)
+
+    start = _parse(start_raw)
+    end = _parse(end_raw)
+    if start and end and end < start:
+        raise ValueError("range")
+    if end:
+        end = end.replace(hour=23, minute=59, second=59)
+    return start, end
+
+
+async def promo_create_period(message: types.Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if raw.lower() in {"/cancel", "отмена"}:
+        await state.finish()
+        await message.reply("Создание промокода отменено.")
+        return
+    try:
+        starts, ends = _parse_period_input(raw)
+    except ValueError:
+        await message.reply(
+            "Не удалось разобрать период. Используйте формат YYYY-MM-DD YYYY-MM-DD или «без срока»."
+        )
+        return
+    await state.update_data(starts_at=starts, expires_at=ends)
+    await state.set_state(PromoCreateForm.waiting_limit.state)
+    await message.reply("Введите лимит активаций (число) или «без лимита».")
+
+
+async def promo_create_limit(message: types.Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if raw.lower() in {"/cancel", "отмена"}:
+        await state.finish()
+        await message.reply("Создание промокода отменено.")
+        return
+    if raw.lower() in {"без лимита", "без", "нет"}:
+        limit = None
+    else:
+        if not raw.isdigit() or int(raw) <= 0:
+            await message.reply("Лимит должен быть целым числом > 0 или «без лимита».")
+            return
+        limit = int(raw)
+    data = await state.get_data()
+    data.update({"max_redemptions": limit})
+    await state.update_data(max_redemptions=limit)
+    await state.set_state(PromoCreateForm.confirm.state)
+    preview = _build_promo_preview(data)
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton("Создать", callback_data="admin_promo_create_confirm"))
+    kb.add(InlineKeyboardButton("Отмена", callback_data="admin_promo_create_cancel"))
+    await message.reply(preview, reply_markup=kb, parse_mode="HTML")
+
+
+def _build_promo_preview(data: Dict[str, object]) -> str:
+    code = data.get("code")
+    bonus = data.get("bonus")
+    starts_at = data.get("starts_at")
+    expires_at = data.get("expires_at")
+    limit = data.get("max_redemptions")
+    period = _format_period(starts_at, expires_at)
+    limit_text = "∞" if limit is None else str(limit)
+    return (
+        "🎟 <b>Создание промокода</b>\n"
+        f"Код: <code>{code}</code>\n"
+        f"Бонус: +{bonus} кредитов\n"
+        f"Период: {period}\n"
+        f"Лимит активаций: {limit_text}"
+    )
+
+
+async def cb_promo_create_confirm(call: types.CallbackQuery, state: FSMContext):
+    if not _guard(call.from_user.id):
+        return
+    data = await state.get_data()
+    code = data.get("code")
+    bonus = data.get("bonus")
+    starts_at = data.get("starts_at")
+    expires_at = data.get("expires_at")
+    limit = data.get("max_redemptions")
+    created_by = data.get("created_by", call.from_user.id)
+    if not code or not bonus:
+        await safe_answer(call, "Данные промокода неполные. Начните заново.", show_alert=True)
+        await state.finish()
+        return
+    try:
+        promo_repo.create_code(
+            code=code,
+            normalized_code=code,
+            bonus_credits=int(bonus),
+            title=None,
+            starts_at=starts_at,
+            expires_at=expires_at,
+            max_redemptions=limit,
+            created_by=created_by,
+            meta=None,
+        )
+    except IntegrityError as exc:
+        await safe_answer(call, f"Не удалось создать: {exc}", show_alert=True)
+        return
+    await state.finish()
+    log_event(
+        "promo_created",
+        message="Promo created",
+        code=code,
+        bonus=bonus,
+        limit=limit,
+        starts_at=starts_at.isoformat() if starts_at else None,
+        expires_at=expires_at.isoformat() if expires_at else None,
+        actor=call.from_user.id,
+    )
+    await _safe_edit_text(call.message, _promo_home_text(), reply_markup=_kb_promo_home(), parse_mode="HTML")
+    if not await safe_answer(call, "Промокод создан", show_alert=False):
+        return
+
+
+async def cb_promo_create_cancel(call: types.CallbackQuery, state: FSMContext):
+    if not _guard(call.from_user.id):
+        return
+    await state.finish()
+    await _safe_edit_text(call.message, _promo_home_text(), reply_markup=_kb_promo_home(), parse_mode="HTML")
+    if not await safe_answer(call, "Отменено", show_alert=False):
+        return
+
 # -------- действия: безлимит/кредиты --------
 async def cb_unlim(call: types.CallbackQuery):
     if not _guard(call.from_user.id): return
@@ -423,6 +831,15 @@ def register(dp: Dispatcher):
     dp.register_callback_query_handler(cb_referral_card, lambda c: c.data and c.data.startswith("admin_referral:"))
     dp.register_callback_query_handler(cb_referral_activate, lambda c: c.data and c.data.startswith("admin_referral_activate:"))
     dp.register_callback_query_handler(cb_referral_reject, lambda c: c.data and c.data.startswith("admin_referral_reject:"))
+    dp.register_callback_query_handler(cb_promo_home, lambda c: c.data == "admin_promo")
+    dp.register_callback_query_handler(cb_promo_stats, lambda c: c.data and c.data.startswith("admin_promo_stats:"))
+    dp.register_callback_query_handler(cb_promo_view, lambda c: c.data and c.data.startswith("admin_promo_view:"))
+    dp.register_callback_query_handler(cb_promo_toggle, lambda c: c.data and c.data.startswith("admin_promo_toggle:"))
+    dp.register_callback_query_handler(cb_promo_delete, lambda c: c.data and c.data.startswith("admin_promo_delete:"))
+    dp.register_callback_query_handler(cb_promo_create, lambda c: c.data == "admin_promo_create", state="*")
+    dp.register_callback_query_handler(cb_promo_create_confirm, lambda c: c.data == "admin_promo_create_confirm", state=PromoCreateForm.confirm)
+    dp.register_callback_query_handler(cb_promo_create_cancel, lambda c: c.data == "admin_promo_create_cancel", state="*")
+    dp.register_callback_query_handler(cb_promo_search, lambda c: c.data == "admin_promo_search", state="*")
 
     # рассылки
     dp.register_callback_query_handler(cb_cast_menu,  lambda c: c.data == "admin_cast")
@@ -442,6 +859,11 @@ def register(dp: Dispatcher):
         content_types=types.ContentTypes.TEXT,
     )
     dp.register_message_handler(catch_reply_cast_user,     content_types=types.ContentTypes.TEXT)
+    dp.register_message_handler(promo_search_query, state=PromoSearchForm.waiting_query, content_types=types.ContentTypes.TEXT)
+    dp.register_message_handler(promo_create_code, state=PromoCreateForm.waiting_code, content_types=types.ContentTypes.TEXT)
+    dp.register_message_handler(promo_create_bonus, state=PromoCreateForm.waiting_bonus, content_types=types.ContentTypes.TEXT)
+    dp.register_message_handler(promo_create_period, state=PromoCreateForm.waiting_period, content_types=types.ContentTypes.TEXT)
+    dp.register_message_handler(promo_create_limit, state=PromoCreateForm.waiting_limit, content_types=types.ContentTypes.TEXT)
 
     # команда точечной рассылки
     dp.register_message_handler(cast_cmd, commands=["cast"])
