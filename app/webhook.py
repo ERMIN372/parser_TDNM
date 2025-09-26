@@ -10,7 +10,7 @@ from aiogram import Bot, Dispatcher, types
 from fastapi import FastAPI, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from .config import settings
+from .config import get_runtime_port, settings
 from .utils.logging import log_event, setup_logging
 
 
@@ -59,21 +59,15 @@ def set_dispatcher(dp: Dispatcher):
 
 @app.get("/")
 async def root_status():
-    return {
-        "status": "ok",
-        "message": "Telegram Bot Server is running",
-        "mode": settings.MODE,
-        "dispatcher_ready": _dp is not None,
-    }
+    return {"status": "ok"}
 
 
 @app.get("/health")
 async def health_check():
-    port = os.getenv("PORT") or str(settings.WEBAPP_PORT)
     return {
         "status": "ok",
         "mode": settings.MODE,
-        "port": port,
+        "port": get_runtime_port(),
         "time": datetime.now(timezone.utc).isoformat(),
     }
 
