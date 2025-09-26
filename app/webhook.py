@@ -16,13 +16,7 @@ def set_dispatcher(dp: Dispatcher):
 
 @app.get("/")
 async def health_check():
-    """Health check endpoint for deployment verification"""
-    return {
-        "status": "ok",
-        "message": "Telegram Bot Server is running",
-        "mode": "webhook",
-        "dispatcher_ready": _dp is not None
-    }
+    return {"status": "ok"}
 
 @app.post("/webhook")
 async def handle_update(request: Request):

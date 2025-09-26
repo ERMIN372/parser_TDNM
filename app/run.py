@@ -107,12 +107,15 @@ def main() -> None:
             # Start the server regardless of webhook setup status
             config = uvicorn.Config(
                 webhook.app,
-                host=settings.WEBAPP_HOST,
+                host="0.0.0.0",
                 port=settings.WEBAPP_PORT,
                 log_level="info",
             )
             server = uvicorn.Server(config)
-            log_event("server_start", message=f"Starting server on {settings.WEBAPP_HOST}:{settings.WEBAPP_PORT}")
+            log_event(
+                "server_start",
+                message=f"Starting server on 0.0.0.0:{settings.WEBAPP_PORT}",
+            )
             await server.serve()
         finally:
             # Only try to remove webhook if it was successfully set
