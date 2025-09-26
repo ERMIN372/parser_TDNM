@@ -27,12 +27,14 @@ PAGE_SIZE = 10
 
 def _kb_admin_home() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
+    kb.row(
         InlineKeyboardButton("👥 Пользователи", callback_data="admin_users:1"),
         InlineKeyboardButton("📣 Рассылка", callback_data="admin_cast"),
     )
-    kb.add(InlineKeyboardButton("🎯 Рефералы", callback_data="admin_ref"))
-    kb.add(InlineKeyboardButton("🎟 Промокоды", callback_data="admin_promo"))
+    kb.row(
+        InlineKeyboardButton("🎯 Рефералы", callback_data="admin_ref"),
+        InlineKeyboardButton("🎟 Промокоды", callback_data="admin_promo"),
+    )
     kb.add(InlineKeyboardButton("💾 Бэкап БД", callback_data="admin_backup"))
     return kb
 
