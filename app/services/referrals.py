@@ -100,7 +100,7 @@ def handle_start(
             inviter_id=inviter_id,
             invitee_id=invitee_id,
         )
-        return StartResult(status="rejected", message="Реферальная программа недоступна для этой пары пользователей.")
+        return StartResult(status="rejected", message="Реферальная программа недоступна для этой пары пользователей")
 
     existing = referrals_repo.get_referral_by_invitee(invitee_id)
     if existing:
