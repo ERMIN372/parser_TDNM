@@ -82,7 +82,14 @@ def _parse_shift_len_value(val):
     return None
 
 def _workdays_per_month(schedule_str: str):
-    g=(schedule_str or "").lower()
+    if schedule_str is None:
+        return None
+    try:
+        if pd.isna(schedule_str):
+            return None
+    except TypeError:
+        pass
+    g = str(schedule_str).lower()
     if "5/2" in g: return 21.0
     if "6/1" in g: return 26.0
     m=re.search(r"\b([1-7])\s*[/\-–]\s*([1-7])\b", g)
